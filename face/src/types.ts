@@ -88,6 +88,8 @@ export interface Settings {
   stale_minutes: number;
   quiet_hours: string[];
   quiet_kinds: ItemKind[];
+  /** 승인·병합 대기를 소리(interrupt)까지 올리는지(§13.3). 옛 데몬이 보내지 않으면 false 로 본다. */
+  approval_interrupt: boolean;
 }
 
 export interface Budget {

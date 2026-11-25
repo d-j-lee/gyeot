@@ -12,7 +12,11 @@
     곁의 승인 대기를 닫는 신호입니다(-NoActivityHook 으로 뺄 수 있음).
 
     얼굴은 셸 트레이의 "곁 열기" 또는 `gyeotd --open`(기본 브라우저)으로 엽니다. 얼굴 주소에는
-    토큰이 없고, 일회용 부트 코드로 받은 세션 쿠키로 데몬에 붙습니다.
+    토큰이 없고, 얼굴이 일회용 부트 코드를 세션 열쇠로 바꿔 데몬에 붙습니다.
+
+    설치 폴더나 데이터 폴더(GYEOT_HOME)가 %LOCALAPPDATA% 밖이면(-InstallRoot C:\gyeot 등) 그 폴더의 상속을
+    끊고 지금 사용자와 SYSTEM만 모든 권한을 갖게 좁힌 뒤(icacls) 결과를 보여 줍니다. 다른 사용자가 token을
+    읽거나 gyeot-hook.exe를 바꿔치지 못하게 하려는 것입니다. 폴더 주인이 다른 사용자면 설치하지 않습니다.
 
     zip 배포본(bin\, face\, scripts\, examples\)에서도, 빌드한 저장소(target\release 등)에서도 돌아갑니다.
 
@@ -21,6 +25,7 @@
 
 .PARAMETER InstallRoot
     설치·데이터 폴더. 기본값은 $env:GYEOT_HOME, 없으면 %LOCALAPPDATA%\gyeot.
+    %LOCALAPPDATA% 밖이면 그 사용자와 SYSTEM만 쓸 수 있게 권한을 좁힙니다.
 
 .PARAMETER DryRun
     아무것도 바꾸지 않고 할 일과 조각만 보여 줍니다.
@@ -210,7 +215,43 @@ try {
     if ($running.Count -eq 0) { Write-GyeotInfo '설치 폴더에서 실행 중인 곁이 없어요.' }
     elseif (-not $DryRun) { Start-Sleep -Milliseconds 500 }
 
-    # ── 3. 복사 ──
+    # ── 3. 폴더 권한(Windows, docs/contracts.md §13.4) ──
+    # 복사하기 전에 좁혀서 새로 만드는 bin\ · token 등이 좁힌 권한을 이어받게 한다.
+    Write-GyeotStep '폴더 권한 확인(설치·데이터 폴더)'
+    $privatePlan = @(Get-GyeotPrivateFolderPlan @($InstallRoot, $env:GYEOT_HOME))
+    if ($privatePlan.Count -eq 0) {
+        Write-GyeotInfo '설치·데이터 폴더가 %LOCALAPPDATA% 안이라 그 사용자 전용 권한을 이어받아요(바꾸지 않음).'
+    } elseif (-not (Test-GyeotWindowsHost)) {
+        foreach ($f in $privatePlan) { Write-GyeotInfo "Windows가 아니라 권한을 바꾸지 않아요: $f" }
+    } else {
+        $userSid = Get-GyeotCurrentUserSid
+        $userName = Get-GyeotSidName $userSid
+        foreach ($f in $privatePlan) {
+            Write-GyeotInfo "%LOCALAPPDATA% 밖이에요: $f → 상속을 끊고 $userName 와 SYSTEM만 남겨요."
+            if (Test-Path -LiteralPath $f) {
+                $owner = (Get-GyeotAclSummary $f).Owner
+                if (-not (Test-GyeotTrustedOwner $owner $userSid)) {
+                    throw "$f 의 주인이 다른 사용자($(Get-GyeotSidName $owner))예요. 그 사용자는 권한을 다시 넓힐 수 있으니 새 폴더를 고르거나 %LOCALAPPDATA% 에 설치하세요."
+                }
+            }
+            $icaclsLine = (Get-GyeotIcaclsArgument $f $userSid | ForEach-Object { if ($_ -match '[\s()]') { "`"$_`"" } else { $_ } }) -join ' '
+            if ($DryRun) {
+                Write-GyeotPlan "icacls $icaclsLine"
+                Write-GyeotPlan '(남은 다른 주체의 직접 항목은 빼고, 이미 있던 하위 항목은 이 폴더를 이어받게 다시 맞춤)'
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $f)) { New-Item -ItemType Directory -Path $f -Force | Out-Null }
+            Write-GyeotInfo "icacls $icaclsLine"
+            $summary = Set-GyeotFolderPrivate -Folder $f -UserSid $userSid
+            $problems = @(Get-GyeotAclProblem -Summary $summary -UserSid $userSid)
+            if ($problems.Count -gt 0) {
+                throw "$f 의 권한을 좁히지 못했어요: $($problems -join '; ') (지금: $(Format-GyeotAclSummary $summary))"
+            }
+            Write-GyeotOk "권한을 좁혔어요: $f — $(Format-GyeotAclSummary $summary)"
+        }
+    }
+
+    # ── 4. 복사 ──
     Write-GyeotStep "파일 복사 → $BinDir"
     $plan = @()
     foreach ($k in @('Daemon', 'Hook', 'Shell', 'Channel')) {
@@ -239,7 +280,7 @@ try {
         Write-GyeotOk "scripts\uninstall.ps1 (나중에 지울 때)"
     }
 
-    # ── 4. gyeotd --init ──
+    # ── 5. gyeotd --init ──
     if ($NoInit) {
         Write-GyeotStep 'gyeotd --init 건너뜀(-NoInit)'
     } elseif ($DryRun) {
@@ -252,7 +293,7 @@ try {
         else { Write-GyeotWarn "토큰 파일이 아직 없어요($InstallRoot\token). 데몬이 처음 뜰 때 만들어요." }
     }
 
-    # ── 5. 연결 조각 ──
+    # ── 6. 연결 조각 ──
     $hookExe = $dst.Hook
     $channelJs = $dst.Channel
     $noActivity = [bool]$NoActivityHook
@@ -339,7 +380,7 @@ try {
         Write-GyeotOk "조각을 파일로도 저장했어요: $SnippetDir"
     }
 
-    # ── 6. Claude Code 훅 적용(선택) ──
+    # ── 7. Claude Code 훅 적용(선택) ──
     if ($ApplyClaudeHooks) {
         Write-GyeotStep "Claude Code 훅 적용 → $claudeSettings"
         $res = Update-GyeotJsonFile -Path $claudeSettings -DryRun:$DryRun -Mutate {
@@ -360,7 +401,7 @@ try {
         }
     }
 
-    # ── 7. 로그인 시 데몬 시작(선택) ──
+    # ── 8. 로그인 시 데몬 시작(선택) ──
     if ($RegisterStartup) {
         Write-GyeotStep "로그인 시 곁 데몬 시작 등록(작업 이름 $script:GyeotTaskName)"
         $probe = $dst.Daemon
@@ -403,7 +444,7 @@ try {
         }
     }
 
-    # ── 8. 멈췄던 것 다시 띄우기 ──
+    # ── 9. 멈췄던 것 다시 띄우기 ──
     if (-not $DryRun) {
         if ($wasDaemon -and -not (Get-GyeotProcessesUnder @('gyeotd') $BinDir).Count) {
             Start-GyeotDaemonHidden $dst.Daemon

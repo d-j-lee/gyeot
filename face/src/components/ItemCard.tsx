@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { DismissReason, Item, ItemAction } from '../types.ts';
-import { agentLabel, DISMISS_REASONS, isTerminalOnly, kindLabel, TERMINAL_ONLY_NOTE } from '../lib/labels.ts';
+import { agentLabel, ASK_NOT_APPROVAL_NOTE, DISMISS_REASONS, isTerminalOnly, kindLabel, TERMINAL_ONLY_NOTE } from '../lib/labels.ts';
 import { formatScore, isLongBody } from '../lib/items.ts';
 import { calendarDateKo, clockKo, relativeKo } from '../lib/time.ts';
-import { IconChevron, IconTerminal } from './Icons.tsx';
+import { IconChat, IconChevron, IconTerminal } from './Icons.tsx';
 
 export interface ItemCardProps {
   item: Item;
@@ -31,7 +31,9 @@ export function ItemCard({ item, now, seen = false, highlighted = false, onActio
   const terminalOnly = isTerminalOnly(item.kind);
   const long = isLongBody(item.body);
   const domId = `card-${item.id}`;
-  const hasChoices = item.kind === 'decision' && !!item.decision_id && !!item.options && item.options.length > 0;
+  // §13.5: 선택지가 있는 결정 카드는 Claude 의 질문이지 권한 승인이 아니다 — 질문 위에 늘 밝힌다.
+  const asksChoice = item.kind === 'decision' && !!item.options && item.options.length > 0;
+  const hasChoices = asksChoice && !!item.decision_id;
 
   const choose = async (choice: string) => {
     if (!onDecide || !item.decision_id || decision.state === 'sending') return;
@@ -87,6 +89,13 @@ export function ItemCard({ item, now, seen = false, highlighted = false, onActio
         </button>
       </header>
 
+      {asksChoice && (
+        <p class="card__ask" id={`${domId}-ask`}>
+          <IconChat size={14} />
+          <span>{ASK_NOT_APPROVAL_NOTE}</span>
+        </p>
+      )}
+
       <h3 class="card__title" id={`${domId}-title`}>
         {item.title || kindLabel(item.kind)}
         {seen && <span class="card__seen">봤음</span>}
@@ -117,14 +126,14 @@ export function ItemCard({ item, now, seen = false, highlighted = false, onActio
       )}
 
       {hasChoices && (
-        <div class="choices" role="group" aria-label="고를 수 있는 답">
+        <div class="choices" role="group" aria-label="고를 수 있는 답" aria-describedby={`${domId}-ask`}>
           {item.options!.map((opt) => {
             const sending = decision.state === 'sending' && decision.choice === opt;
             return (
               <button
                 key={opt}
                 type="button"
-                class={`chip${sending ? ' chip--sending' : ''}`}
+                class={`chip chip--choice${sending ? ' chip--sending' : ''}`}
                 disabled={decision.state === 'sending'}
                 aria-busy={sending || undefined}
                 onClick={() => void choose(opt)}

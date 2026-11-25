@@ -155,7 +155,10 @@ describe('등록과 메시지', () => {
     await connected();
     const stream = daemon.of('/v1/channel/stream')[0]!;
     expect(stream.query.get('cid')).toBe('ch_1');
-    expect(stream.query.get('t')).toBe(token);
+    expect(stream.headers.authorization).toBe(`Bearer ${token}`);
+    // 토큰은 머리로만 보낸다(contracts §7: 쿼리 ?t= 는 받지 않고, URL에 비밀을 싣지 않는다).
+    expect(stream.query.get('t')).toBeNull();
+    for (const q of daemon.requests) expect(q.query.toString()).not.toContain(token);
   });
 
   it('데몬 message를 notifications/claude/channel로 보낸다(content·meta)', async () => {
@@ -294,14 +297,16 @@ describe('데몬이 없거나 설정이 틀렸을 때', () => {
     expect(textOf(res)).toContain('GYEOT_URL');
   });
 
-  it('토큰이 틀리면 isError이고, stderr·오류 문구에 토큰이 나오지 않는다', async () => {
+  it('토큰 파일이 데몬의 것과 다르면 확인에서 걸러 토큰을 보내지 않고, stderr·오류 문구에 토큰이 나오지 않는다', async () => {
     const wrong = newToken();
     await writeFile(path.join(home, 'token'), wrong);
     const r = await startChannel();
     const res = await call(r, 'reply', { chat_id: 'c', text: 'x' });
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain('토큰');
-    await waitFor(() => daemon.of('/v1/channel/register').length >= 2);
+    await waitFor(() => daemon.of('/v1/hello').length >= 3, 5000, '확인 재시도');
+    expect(daemon.of('/v1/channel/register')).toHaveLength(0);
+    expect(daemon.sawToken(wrong)).toBe(false);
     expect(textOf(res)).not.toContain(wrong);
     expect(r.stderr()).not.toContain(wrong);
     expect(r.stderr()).not.toContain(token);
@@ -320,6 +325,80 @@ describe('데몬이 없거나 설정이 틀렸을 때', () => {
     } finally {
       await r.client.close();
       await late.stop();
+    }
+  });
+});
+
+describe('데몬 확인(contracts §13.1) — 토큰을 보내기 전에', () => {
+  it('register 전에 /v1/hello로 확인하고, 확인 요청에는 토큰이 없다', async () => {
+    await startChannel();
+    await connected();
+    const [first, second] = daemon.requests;
+    expect(first?.method).toBe('GET');
+    expect(first?.path).toBe('/v1/hello');
+    expect(first?.query.get('n')).toMatch(/^[0-9a-f]{64}$/);
+    expect(first?.headers.authorization).toBeUndefined();
+    expect(JSON.stringify(first?.headers)).not.toContain(token);
+    expect(second?.path).toBe('/v1/channel/register');
+    expect(second?.headers.authorization).toBe(`Bearer ${token}`);
+    // 난수는 확인마다 새로 만든다
+    daemon.dropStreams();
+    await waitFor(() => daemon.of('/v1/hello').length >= 2 && daemon.streamCount('ch_1') === 1, 5000, '재확인');
+    const nonces = daemon.of('/v1/hello').map((q) => q.query.get('n'));
+    expect(new Set(nonces).size).toBe(nonces.length);
+  });
+
+  it.each(['wrong', 'other-port', 'missing', 'garbage'] as const)(
+    '확인에 실패하면(%s) 토큰이 담긴 요청을 보내지 않고, stderr에 이유를 적고, 같은 간격으로 다시 시도한다',
+    async (mode) => {
+      daemon.helloMode = mode;
+      const r = await startChannel();
+      await waitFor(() => daemon.of('/v1/hello').length >= 3, 5000, '확인 재시도');
+      const res = await call(r, 'reply', { chat_id: 'c_1', text: '비밀 이야기' });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toMatch(/^곁 데몬에 닿지 않음: 이 포트의 서버는 내 곁 데몬이 아니에요/);
+      expect(daemon.requests.every((q) => q.path === '/v1/hello')).toBe(true);
+      expect(daemon.sawToken(token)).toBe(false);
+      expect(JSON.stringify(daemon.requests.map((q) => q.body))).not.toContain('비밀');
+      expect(r.stderr()).toContain('이 포트의 서버는 내 곁 데몬이 아니에요');
+      expect(r.stderr()).not.toContain(token);
+      // 같은 문제는 한 번만 적는다(재시도마다 stderr를 채우지 않는다)
+      expect(r.stderr().split('곁 연결 실패').length - 1).toBe(1);
+    },
+  );
+
+  it('스트림이 끊겨 다시 연결할 때마다 다시 확인한다', async () => {
+    await startChannel();
+    await connected();
+    daemon.dropStreams();
+    await waitFor(() => daemon.of('/v1/channel/stream').length >= 2 && daemon.streamCount('ch_1') === 1, 5000, '재연결');
+    const order = daemon.requests.map((q) => q.path);
+    const s1 = order.indexOf('/v1/channel/stream');
+    const s2 = order.indexOf('/v1/channel/stream', s1 + 1);
+    expect(order.slice(s1 + 1, s2)).toContain('/v1/hello');
+  });
+
+  it('데몬이 사라진 뒤 다른 사용자의 서버가 그 포트를 잡으면 토큰도 페이로드도 보내지 않는다', async () => {
+    const r = await startChannel();
+    await connected();
+    const port = daemon.port;
+    await daemon.stop();
+    // 다른 사용자의 곁 데몬: 자기 토큰으로는 맞는 증명을 낸다.
+    const impostor = new FakeDaemon(newToken());
+    await impostor.start(port);
+    try {
+      await waitFor(() => impostor.of('/v1/hello').length >= 1, 8000, '사칭 서버에 확인');
+      const res = await call(r, 'reply', { chat_id: 'c_1', text: '비밀 이야기' });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toMatch(/^곁 데몬에 닿지 않음: 이 포트의 서버는 내 곁 데몬이 아니에요/);
+      const dec = await call(r, 'request_decision', { question: '병합할까요?', options: ['예', '아니오'] });
+      expect(dec.isError).toBe(true);
+      expect(impostor.requests.every((q) => q.path === '/v1/hello')).toBe(true);
+      expect(impostor.sawToken(token)).toBe(false);
+      expect(JSON.stringify(impostor.requests.map((q) => q.body))).not.toContain('비밀');
+    } finally {
+      await r.client.close();
+      await impostor.stop();
     }
   });
 });

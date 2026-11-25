@@ -1,6 +1,8 @@
 import { defineConfig } from 'vitest/config';
 
-// 곁 데몬(또는 mock)의 주소. dev 서버는 /v1·/health 와 부트 주소(?boot=)를 여기로 넘긴다.
+// 곁 데몬(또는 mock)의 주소. dev 서버는 /v1·/health 를 여기로 넘긴다(같은 출처로 보이게).
+// 부트 주소(http://127.0.0.1:5173/?boot=<코드>)는 넘기지 않는다 — 개발 서버의 얼굴이 주소에서 boot 를 지우고
+// POST /v1/session(이 프록시)으로 세션 열쇠를 받아 그 탭의 sessionStorage 에 둔다(§12.1-3). 쿠키는 쓰지 않는다.
 const daemon = process.env.GYEOT_URL ?? 'http://127.0.0.1:47321';
 
 export default defineConfig({
@@ -20,9 +22,6 @@ export default defineConfig({
     proxy: {
       '/v1': { target: daemon, changeOrigin: true },
       '/health': { target: daemon, changeOrigin: true },
-      // §12.1: 부트 코드는 데몬이 세션 쿠키로 바꾸고 303 으로 boot 만 뺀 주소(이 개발 서버)로 돌려보낸다.
-      // 쿠키는 포트를 가리지 않으므로 그 뒤 /v1 프록시 요청에도 실린다. ^ 로 시작하면 vite 가 경로+쿼리에 정규식으로 맞춘다.
-      '^/[^?#]*\\?(?:[^#]*&)?boot=': { target: daemon, changeOrigin: true },
     },
   },
   test: {

@@ -39,7 +39,9 @@ export type UrlResult = { ok: true; origin: string } | { ok: false; error: strin
 
 /**
  * 데몬 주소. 토큰을 실어 보내므로 이 컴퓨터의 루프백(http://127.0.0.1, http://localhost)만 받는다.
- * 데몬은 127.0.0.1에만 묶인다(contracts §7).
+ * 데몬은 127.0.0.1에만 묶인다(contracts §7). `localhost`는 127.0.0.1로 바꿔 잇는다: `localhost`가 `::1`로
+ * 풀리면 `[::1]`의 같은 포트를 잡은 다른 사용자의 서버가 127.0.0.1의 진짜 데몬에 확인(§13.1)을 중계해
+ * 증명을 통과할 수 있다(증명에는 포트만 들어 있다).
  */
 export function resolveDaemonUrl(env: Env): UrlResult {
   const raw = nonEmpty(env['GYEOT_URL']) ?? DEFAULT_URL;
@@ -58,7 +60,7 @@ export function resolveDaemonUrl(env: Env): UrlResult {
   if (url.username || url.password) {
     return { ok: false, error: 'GYEOT_URL에 사용자 정보를 넣을 수 없습니다' };
   }
-  return { ok: true, origin: url.origin };
+  return { ok: true, origin: `http://127.0.0.1${url.port ? `:${url.port}` : ''}` };
 }
 
 /** 시험용: 재연결 대기의 기본 단위(ms). 기본 1000. */

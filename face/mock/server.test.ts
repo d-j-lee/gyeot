@@ -1,8 +1,9 @@
 // @vitest-environment node
-// 가짜 데몬(npm run mock)을 실제로 띄우고 HTTP 로만 본다 — 얼굴 개발이 배포와 같은 열쇠 흐름(§12.1)을 타는지.
+// 가짜 데몬(npm run mock)을 실제로 띄우고 HTTP 로만 본다 — 얼굴 개발이 배포와 같은 열쇠 흐름(§7·§12.1·§13.1)을 타는지.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer, request } from 'node:http';
+import { createHmac } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -67,25 +68,30 @@ async function newCode(): Promise<string> {
   return ((await r.json()) as { code: string }).code;
 }
 
-async function redeem(code: string, pathAndQuery = '/') {
-  const sep = pathAndQuery.includes('?') ? '&' : '?';
-  const r = await fetch(`${base()}${pathAndQuery}${sep}boot=${code}`, { redirect: 'manual' });
-  const cookie = r.headers.getSetCookie()[0] ?? '';
-  return { r, location: r.headers.get('location'), setCookie: cookie, cookie: cookie.split(';')[0]! };
+async function exchange(code: unknown, headers: Record<string, string> = {}) {
+  return fetch(`${base()}/v1/session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify({ code }),
+  });
 }
 
+/** 부트 코드 → 세션 열쇠(얼굴이 하는 일) */
 async function session(): Promise<string> {
-  const { cookie } = await redeem(await newCode());
-  expect(cookie).toMatch(/^gyeot_session=[0-9a-f]{64}$/);
-  return cookie;
+  const r = await exchange(await newCode());
+  expect(r.status).toBe(200);
+  const { session: key } = (await r.json()) as { session: string };
+  expect(key).toMatch(HEX64);
+  return key;
 }
+const asKey = (key: string) => ({ Authorization: `Bearer ${key}` });
 
-/** 요청줄·Host 를 그대로 보낸다(fetch 는 Host 를 바꿀 수 없고, 경로의 . 조각을 먼저 접는다). */
-function raw(path: string, headers: Record<string, string> = {}): Promise<{ status: number; location: string | undefined }> {
+/** 요청줄·Host 를 그대로 보낸다(fetch 는 Host 를 바꿀 수 없다). */
+function raw(path: string, headers: Record<string, string> = {}): Promise<{ status: number }> {
   return new Promise((resolve, reject) => {
     const req = request({ host: '127.0.0.1', port, path, method: 'GET', headers }, (res) => {
       res.resume();
-      resolve({ status: res.statusCode ?? 0, location: res.headers.location });
+      resolve({ status: res.statusCode ?? 0 });
     });
     req.on('error', reject);
     req.end();
@@ -94,11 +100,15 @@ function raw(path: string, headers: Record<string, string> = {}): Promise<{ stat
 const rawGet = async (path: string, headers: Record<string, string>) => (await raw(path, headers)).status;
 
 describe('부트 코드(POST /v1/boot, §12.1-1)', () => {
-  it('토큰(Bearer)으로만 받는다 — 없음·틀림·?t=·쿠키는 401', async () => {
+  it('토큰(Bearer)으로만 받는다 — 없음·틀림·?t=·쿠키는 401, 세션 열쇠는 403', async () => {
     expect((await boot({})).status).toBe(401);
     expect((await boot({ Authorization: `Bearer ${'cd'.repeat(32)}` })).status).toBe(401);
     expect((await fetch(`${base()}/v1/boot?t=${TOKEN}`, { method: 'POST' })).status).toBe(401);
-    expect((await boot({ Cookie: await session() })).status).toBe(401);
+    const key = await session();
+    expect((await boot({ Cookie: `gyeot_session=${key}` })).status).toBe(401);
+    const r = await boot(asKey(key));
+    expect(r.status).toBe(403);
+    expect(await r.json()).toEqual({ ok: false, error: '이 열쇠로는 쓸 수 없어요' });
   });
 
   it('코드는 32바이트 hex, 주소와 120초 만료를 돌려준다', async () => {
@@ -113,60 +123,37 @@ describe('부트 코드(POST /v1/boot, §12.1-1)', () => {
   });
 });
 
-describe('GET /?boot= → 쿠키 + 303(§12.1-2)', () => {
-  it('쿠키를 달고 같은 경로·쿼리에서 boot 만 뺀 주소로 보낸다', async () => {
-    const { r, location, setCookie } = await redeem(await newCode(), '/?mode=overlay&tab=chat');
-    expect(r.status).toBe(303);
-    expect(location).toBe('/?mode=overlay&tab=chat');
-    expect(setCookie).toMatch(/^gyeot_session=[0-9a-f]{64}; HttpOnly; SameSite=Strict; Path=\/; Max-Age=2592000$/);
+describe('POST /v1/session — 부트 코드를 세션 열쇠로(§12.1-3)', () => {
+  it('인증 없이 코드만으로 {session, expires_ms(7일)}, 쿠키 없음', async () => {
+    const before = Date.now();
+    const r = await exchange(await newCode());
+    expect(r.status).toBe(200);
+    expect(r.headers.get('set-cookie')).toBeNull();
     expect(r.headers.get('cache-control')).toBe('no-store');
+    const body = (await r.json()) as { session: string; expires_ms: number };
+    expect(Object.keys(body).sort()).toEqual(['expires_ms', 'session']);
+    expect(body.session).toMatch(HEX64);
+    const week = 7 * 86_400_000;
+    expect(body.expires_ms).toBeGreaterThanOrEqual(before + week - 1_000);
+    expect(body.expires_ms).toBeLessThanOrEqual(Date.now() + week + 1_000);
   });
 
-  it('boot 만 있으면 / 로', async () => {
-    const { r, location } = await redeem(await newCode());
-    expect(r.status).toBe(303);
-    expect(location).toBe('/');
-  });
-
-  it('코드는 한 번만 — 두 번째는 안내 쪽(401)', async () => {
+  it('코드는 한 번만 — 두 번째·모르는 코드·빈 본문은 401', async () => {
     const code = await newCode();
-    expect((await redeem(code)).r.status).toBe(303);
-    const again = await redeem(code);
-    expect(again.r.status).toBe(401);
-    expect(again.setCookie).toBe('');
-    expect(again.r.headers.get('content-type')).toMatch(/text\/html/);
-    expect(await again.r.text()).toContain('gyeotd --open');
-  });
-
-  it('모르는 코드도 안내 쪽(401), 쿠키 없음', async () => {
-    const r = await redeem('ef'.repeat(32));
-    expect(r.r.status).toBe(401);
-    expect(r.setCookie).toBe('');
-  });
-
-  it('경로가 // 로 접혀도 다른 호스트로 보내지 않는다(열린 넘겨주기 없음)', async () => {
-    // '/.//x' 와 '/a/..//x' 는 URL 해석 뒤 경로가 '//x' 가 된다. 그대로 Location 에 실으면 //x 는 다른 호스트다.
-    for (const path of ['/.//evil.example/', '/a/..//evil.example/', '//evil.example/']) {
-      const r = await raw(`${path}?mode=overlay&boot=${await newCode()}`, { Host: `127.0.0.1:${port}` });
-      expect(r.status, path).toBe(303);
-      expect(r.location, path).toMatch(/^\/(?!\/)/);
-      expect(r.location, path).not.toContain('//');
-    }
+    expect((await exchange(code)).status).toBe(200);
+    expect((await exchange(code)).status).toBe(401);
+    expect((await exchange('ef'.repeat(32))).status).toBe(401);
+    expect((await exchange(undefined)).status).toBe(401);
+    expect((await exchange(12)).status).toBe(401);
+    const bad = await fetch(`${base()}/v1/session`, { method: 'POST', body: '{oops' });
+    expect(bad.status).toBe(400);
+    expect((await fetch(`${base()}/v1/session`)).status).toBe(405);
   });
 });
 
 describe('얼굴과 정적 파일(§7)', () => {
-  it('쿠키가 없으면 / 는 한국어 안내 쪽(401)', async () => {
-    const r = await fetch(`${base()}/`);
-    expect(r.status).toBe(401);
-    const html = await r.text();
-    expect(html).toContain('곁 열기');
-    expect(html).toContain('gyeotd --open');
-    expect(r.headers.get('content-security-policy')).toBe(CSP);
-  });
-
-  it('쿠키가 있으면 index.html 을 그대로(토큰을 싣지 않는다), 보안 머리글과 함께', async () => {
-    const r = await fetch(`${base()}/?mode=overlay`, { headers: { Cookie: await session() } });
+  it('GET / 는 인증 없이 index.html 을 그대로(비밀 없음), 보안 머리글과 함께', async () => {
+    const r = await fetch(`${base()}/?mode=overlay`);
     expect(r.status).toBe(200);
     expect(await r.text()).toBe(INDEX);
     expect(r.headers.get('content-security-policy')).toBe(CSP);
@@ -174,6 +161,17 @@ describe('얼굴과 정적 파일(§7)', () => {
     expect(r.headers.get('referrer-policy')).toBe('no-referrer');
     expect(r.headers.get('x-content-type-options')).toBe('nosniff');
     expect(r.headers.get('cache-control')).toBe('no-store');
+    expect(r.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('서버는 ?boot= 를 읽지 않는다 — 넘겨주기·쿠키 없이 index, 코드는 그대로 남아 얼굴이 쓴다', async () => {
+    const code = await newCode();
+    const r = await fetch(`${base()}/?mode=overlay&boot=${code}`, { redirect: 'manual' });
+    expect(r.status).toBe(200);
+    expect(r.headers.get('location')).toBeNull();
+    expect(r.headers.get('set-cookie')).toBeNull();
+    expect(await r.text()).toBe(INDEX);
+    expect((await exchange(code)).status).toBe(200);
   });
 
   it('/assets/* 는 열쇠 없이', async () => {
@@ -183,20 +181,24 @@ describe('얼굴과 정적 파일(§7)', () => {
   });
 });
 
-describe('API·SSE 인증(§7) — 쿠키 또는 Bearer, ?t= 는 받지 않는다', () => {
-  it('GET /v1/state', async () => {
+describe('API·SSE 인증(§7) — Authorization: Bearer <토큰|세션 열쇠> 하나', () => {
+  it('GET /v1/state: 없음·?t=·쿠키는 401, 토큰·세션 열쇠는 200', async () => {
+    const key = await session();
     expect((await fetch(`${base()}/v1/state`)).status).toBe(401);
     expect((await fetch(`${base()}/v1/state?t=${TOKEN}`)).status).toBe(401);
+    expect((await fetch(`${base()}/v1/state`, { headers: { Cookie: `gyeot_session=${key}` } })).status).toBe(401);
     expect((await fetch(`${base()}/v1/state`, { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
-    const r = await fetch(`${base()}/v1/state`, { headers: { Cookie: await session() } });
+    const r = await fetch(`${base()}/v1/state`, { headers: asKey(key) });
     expect(r.status).toBe(200);
-    expect(((await r.json()) as { version: string }).version).toMatch(/mock/);
+    const snap = (await r.json()) as { version: string; settings: { approval_interrupt: boolean } };
+    expect(snap.version).toMatch(/mock/);
+    expect(snap.settings.approval_interrupt).toBe(false);
   });
 
-  it('GET /v1/stream: ?t= 는 401, 쿠키면 snapshot 부터', async () => {
+  it('GET /v1/stream: ?t= 는 401, 세션 열쇠면 snapshot 부터', async () => {
     expect((await fetch(`${base()}/v1/stream?t=${TOKEN}`)).status).toBe(401);
     const ctrl = new AbortController();
-    const r = await fetch(`${base()}/v1/stream`, { headers: { Cookie: await session() }, signal: ctrl.signal });
+    const r = await fetch(`${base()}/v1/stream`, { headers: asKey(await session()), signal: ctrl.signal });
     expect(r.status).toBe(200);
     expect(r.headers.get('content-type')).toMatch(/text\/event-stream/);
     const reader = r.body!.getReader();
@@ -210,18 +212,54 @@ describe('API·SSE 인증(§7) — 쿠키 또는 Bearer, ?t= 는 받지 않는�
     ctrl.abort();
   });
 
-  it('얼굴의 동작(POST)도 쿠키로, 같은 출처 Origin 이면 받는다', async () => {
+  it('얼굴의 동작(POST)도 세션 열쇠로, 같은 출처 Origin 이면 받는다', async () => {
     const r = await fetch(`${base()}/v1/focus`, {
       method: 'POST',
-      headers: { Cookie: await session(), Origin: base(), 'Content-Type': 'application/json' },
+      headers: { ...asKey(await session()), Origin: base(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ on: false }),
     });
     expect(r.status).toBe(200);
   });
 
-  it('/mock/trigger 도 ?t= 로는 안 되고 Bearer 로', async () => {
+  it('세션 열쇠의 범위(G-031): ingest·channel·boot·mock 조작은 403, 토큰은 403 이 아니다', async () => {
+    const key = await session();
+    const paths: [string, string][] = [
+      ['POST', '/v1/ingest/claude-code'],
+      ['POST', '/v1/channel/register'],
+      ['GET', '/v1/channel/stream?cid=ch_1'],
+      ['POST', '/v1/channel/reply'],
+      ['POST', '/v1/boot'],
+      ['GET', '/mock/trigger?what=nudge'],
+    ];
+    for (const [method, p] of paths) {
+      const init = (h: Record<string, string>) => ({ method, headers: { ...h, 'Content-Type': 'application/json' }, ...(method === 'POST' ? { body: '{}' } : {}) });
+      const asSession = await fetch(`${base()}${p}`, init(asKey(key)));
+      expect(asSession.status, `${method} ${p}`).toBe(403);
+      expect(await asSession.json()).toEqual({ ok: false, error: '이 열쇠로는 쓸 수 없어요' });
+      expect((await fetch(`${base()}${p}`, init({}))).status, `${method} ${p} 열쇠 없음`).toBe(401);
+      expect((await fetch(`${base()}${p}`, init({ Authorization: `Bearer ${TOKEN}` }))).status, `${method} ${p} 토큰`).not.toBe(403);
+    }
+  });
+
+  it('/mock/trigger 는 ?t= 로는 안 되고 토큰으로', async () => {
     expect((await fetch(`${base()}/mock/trigger?what=nudge&t=${TOKEN}`)).status).toBe(401);
     expect((await fetch(`${base()}/mock/trigger?what=nudge`, { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
+  });
+});
+
+describe('데몬 확인(GET /v1/hello, §13.1)', () => {
+  it('인증 없이 토큰·포트·n 의 HMAC 을 준다', async () => {
+    const n = 'a1'.repeat(32);
+    const r = await fetch(`${base()}/v1/hello?n=${n}`);
+    expect(r.status).toBe(200);
+    const want = createHmac('sha256', TOKEN).update(`gyeot-hello/v1|${port}|${n}`).digest('hex');
+    expect(await r.json()).toEqual({ v: 1, proof: want });
+  });
+
+  it('n 이 16–128자 hex 가 아니면 400', async () => {
+    for (const q of ['', '?n=', '?n=zz', `?n=${'a'.repeat(15)}`, `?n=${'a'.repeat(129)}`]) {
+      expect((await fetch(`${base()}/v1/hello${q}`)).status, q).toBe(400);
+    }
   });
 });
 
@@ -249,7 +287,8 @@ describe('시작 안내', () => {
     expect(direct?.[1]).toMatch(HEX64);
     expect(dev?.[1]).toMatch(HEX64);
     expect(direct![1]).not.toBe(dev![1]);
-    expect((await redeem(direct![1]!)).r.status).toBe(303);
+    expect((await exchange(direct![1]!)).status).toBe(200);
     expect(out).not.toMatch(/[?&]t=/);
+    expect(out).not.toMatch(/쿠키/);
   });
 });

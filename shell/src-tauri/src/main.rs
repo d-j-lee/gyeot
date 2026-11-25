@@ -3,8 +3,8 @@
 //! UI만 맡는 얇은 껍데기다(G-002). 서버는 따로 사는 `gyeotd`가 맡고, 셸은
 //!
 //! - 데몬이 없으면 창 없이 띄우고,
-//! - 토큰으로 일회용 부트 코드를 받아 데몬이 서빙하는 얼굴(`/?mode=overlay`)을 투명·항상 위 창에
-//!   띄우고(세션 쿠키, docs/contracts.md §12.1),
+//! - 그 포트의 서버가 내 곁 데몬인지 확인한 연결로(§13.1) 토큰을 보내 일회용 부트 코드를 받고,
+//!   데몬이 서빙하는 얼굴(`/?mode=overlay`)을 투명·항상 위 창에 띄우고(얼굴이 세션 열쇠로 바꾼다, §12.1),
 //! - 얼굴이 알려 준 영역에서만 클릭을 받으며,
 //! - 트레이·전역 단축키(Ctrl+Alt+Space)를 제공한다.
 
@@ -14,11 +14,14 @@
 mod acl_tests;
 mod daemon;
 mod geometry;
+mod hello;
 mod http;
 mod logging;
 mod overlay;
 mod paths;
 mod platform;
+#[cfg(test)]
+mod testing;
 mod tray;
 
 use tauri::{Manager, RunEvent};

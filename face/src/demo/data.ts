@@ -232,6 +232,7 @@ export const DEMO_SETTINGS: Settings = {
   stale_minutes: 30,
   quiet_hours: ['22:00-08:00'],
   quiet_kinds: ['context'],
+  approval_interrupt: false,
 };
 
 export function demoSnapshot(now: number, mood: Mood = 'waiting', offsetMin = 540): Snapshot {

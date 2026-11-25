@@ -1,8 +1,11 @@
 //! 투명 오버레이 창: 만들기, 오른쪽 아래 고정, 선택적 클릭 통과, 데몬 연결.
 //!
-//! 얼굴 열기(docs/contracts.md §12.1): 데몬이 건강해지면 토큰으로 `POST /v1/boot` 해서 일회용 코드를
-//! 받고 `http://127.0.0.1:<port>/?mode=overlay&boot=<code>`를 연다. 데몬은 `303` + 세션 쿠키로
-//! `boot`를 뺀 주소로 보내고, 얼굴은 그 뒤 같은 출처 쿠키로 API를 부른다. 페이지에는 토큰이 없다.
+//! 얼굴 열기(docs/contracts.md §12.1·§13.1): 포트의 서버가 내 곁 데몬임을 확인한 연결로 토큰을 실어
+//! `POST /v1/boot` 해서 일회용 코드를 받고 `http://127.0.0.1:<port>/?mode=overlay&boot=<code>`를 연다.
+//! 서버는 `index.html`을 그대로 주고, 얼굴 스크립트가 `history.replaceState`로 `boot`를 지운 뒤
+//! `POST /v1/session`으로 세션 열쇠를 받는다(`sessionStorage`). 교환이 실패하거나 `401`이면 얼굴이
+//! `renew_session`을 부른다. 셸은 교환이 성공했는지 직접 알 수 없으므로 주소로 판단하지 않는다.
+//! 페이지에는 토큰이 없다.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -17,8 +20,9 @@ use tauri::{
     WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 
+use crate::daemon::{self, Failure, Probe};
 use crate::geometry::{self, HitRect, WorkArea};
-use crate::{daemon, paths, platform};
+use crate::{paths, platform};
 
 pub const MAIN: &str = "main";
 /// 접힌 창(논리 px).
@@ -36,6 +40,9 @@ const ANCHOR_EVERY: u64 = 90;
 const WATCH_PERIOD: Duration = Duration::from_secs(10);
 /// 얼굴이 `renew_session`을 부를 수 있는 간격(401 고리에 빠져도 데몬을 두드리지 않게).
 pub const RENEW_EVERY: Duration = Duration::from_secs(30);
+/// `renew_session`으로 다시 연 얼굴이 이 안에 또 `renew_session`을 부르면 다시 열지 않는다
+/// (새 코드로도 열쇠를 받지 못했다 = 되풀이해도 같다). 그때는 트레이의 "곁 열기"가 연다.
+pub const RENEW_CHAIN: Duration = Duration::from_secs(600);
 /// `renew_session` 오류의 머리. ACL 거절과 구분된다.
 pub const RENEW_ERR: &str = "곁 열쇠를 새로 받지 못했어요";
 
@@ -44,7 +51,7 @@ pub struct AppConfig {
     pub data_dir: Option<PathBuf>,
 }
 
-/// 부트 코드를 실은 얼굴 주소. 데몬이 코드를 받으면 `boot`만 뺀 `/?mode=overlay`로 보낸다.
+/// 부트 코드를 실은 얼굴 주소. 얼굴 스크립트가 `boot`를 주소에서 지우고 세션 열쇠로 바꾼다.
 pub fn face_boot_url(port: u16, code: &str) -> Url {
     let mut url = Url::parse(&format!("http://127.0.0.1:{port}/")).expect("얼굴 주소");
     url.query_pairs_mut()
@@ -53,8 +60,8 @@ pub fn face_boot_url(port: u16, code: &str) -> Url {
     url
 }
 
-/// 토큰으로 새 부트 코드를 받아 얼굴 주소를 만든다(서버가 준 `url`은 쓰지 않는다).
-pub fn boot_url(port: u16, data_dir: Option<&std::path::Path>) -> Result<Url, String> {
+/// 확인한 데몬에 토큰으로 새 부트 코드를 받아 얼굴 주소를 만든다(서버가 준 `url`은 쓰지 않는다).
+pub fn boot_url(port: u16, data_dir: Option<&std::path::Path>) -> Result<Url, Failure> {
     daemon::request_boot(port, data_dir).map(|boot| face_boot_url(port, &boot.code))
 }
 
@@ -64,24 +71,72 @@ struct Geom {
     scale: f64,
 }
 
-/// `renew_session`을 30초에 한 번으로 묶는다.
+/// `renew_session`이 다시 열지 않는 까닭.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenewDenied {
+    /// 30초에 한 번까지. 남은 시간.
+    TooSoon(Duration),
+    /// `renew_session`으로 다시 연 얼굴이 곧 또 불렀다(새 코드로도 열쇠를 받지 못했다).
+    Chained,
+}
+
+impl std::fmt::Display for RenewDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenewDenied::TooSoon(wait) => write!(
+                f,
+                "{}초에 한 번만 다시 열 수 있어요. {}초 뒤에 다시 시도하세요",
+                RENEW_EVERY.as_secs(),
+                wait.as_millis().div_ceil(1000)
+            ),
+            RenewDenied::Chained => f.write_str(
+                "방금 새 열쇠로 다시 열었는데도 열쇠를 받지 못했어요. 트레이의 \"곁 열기\"로 다시 여세요",
+            ),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RenewInner {
+    /// 마지막으로 허락한 시각.
+    last: Option<Instant>,
+    /// 지금 창을 `renew_session`으로 연 시각(셸·사람이 새로 열면 지운다).
+    renewed_open: Option<Instant>,
+}
+
+/// `renew_session`을 30초에 한 번으로 묶고, 다시 연 얼굴이 또 부르는 고리를 끊는다.
 #[derive(Default)]
 pub struct RenewGate {
-    last: Mutex<Option<Instant>>,
+    inner: Mutex<RenewInner>,
 }
 
 impl RenewGate {
-    /// 지난번 허락에서 30초가 지났으면 지금 시각을 남기고 `Ok`. 아니면 남은 시간.
-    pub fn try_acquire(&self, now: Instant) -> Result<(), Duration> {
-        let mut last = lock(&self.last);
-        if let Some(prev) = *last {
-            let since = now.saturating_duration_since(prev);
-            if since < RENEW_EVERY {
-                return Err(RENEW_EVERY - since);
+    /// 허락하면 지금 시각을 남기고 `Ok`. 거절된 시도는 시각을 늦추지 않는다.
+    pub fn try_acquire(&self, now: Instant) -> Result<(), RenewDenied> {
+        let mut g = lock(&self.inner);
+        if let Some(opened) = g.renewed_open {
+            if now.saturating_duration_since(opened) < RENEW_CHAIN {
+                return Err(RenewDenied::Chained);
             }
         }
-        *last = Some(now);
+        if let Some(prev) = g.last {
+            let since = now.saturating_duration_since(prev);
+            if since < RENEW_EVERY {
+                return Err(RenewDenied::TooSoon(RENEW_EVERY - since));
+            }
+        }
+        g.last = Some(now);
         Ok(())
+    }
+
+    /// `renew_session`이 이 창을 새 코드로 다시 열었다.
+    pub fn note_renewed_open(&self, now: Instant) {
+        lock(&self.inner).renewed_open = Some(now);
+    }
+
+    /// 셸·사람이 이 창을 새 코드로 열었다(시작·감시·"곁 열기"): 고리를 끊는다.
+    pub fn note_fresh_open(&self) {
+        lock(&self.inner).renewed_open = None;
     }
 }
 
@@ -99,10 +154,11 @@ pub struct OverlayState {
     /// 사람이 숨겼으면 페이지가 다시 읽혀도 저절로 보이지 않는다.
     user_hidden: AtomicBool,
     on_face: AtomicBool,
-    /// 데몬이 부트 코드를 거절했거나 얼굴의 `renew_session`이 실패했다.
+    /// 얼굴이 `renew_session`을 불렀다(열쇠 교환 실패·401). 셸은 교환이 성공했는지 알 수 없으므로
+    /// 셸·사람이 새 코드로 다시 열 때까지 남긴다("곁 열기"가 다시 연다). 감시는 이것으로 다시 열지 않는다.
     auth_failed: AtomicBool,
-    /// 지금 페이지가 셸 명령(`set_hit_rect`·`set_expanded`)을 불렀다 = 쿠키로 붙은 얼굴이 떴다.
-    /// 데몬의 안내 쪽(401)은 부르지 않는다. 새 페이지를 읽기 시작하면 지운다.
+    /// 지금 페이지가 셸 명령(`set_hit_rect`·`set_expanded`)을 불렀다 = 얼굴 스크립트가 돌았다.
+    /// 새 페이지를 읽기 시작하면 지운다.
     face_alive: AtomicBool,
     renew: RenewGate,
     connecting: AtomicBool,
@@ -147,10 +203,8 @@ impl OverlayState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
-    /// 데몬이 서빙하는 얼굴
+    /// 데몬이 서빙하는 얼굴(주소에 `boot`가 남았든 아니든: 얼굴 스크립트가 지운다)
     Face,
-    /// 데몬 페이지인데 주소에 `boot`가 남아 있다(코드를 거절당함)
-    Unauthorized,
     /// 셸에 든 대체 화면(깨우는 중)
     Loading,
     /// 셸에 든 대체 화면(연결 실패)
@@ -176,11 +230,7 @@ pub fn is_app_url(url: &Url) -> bool {
 
 pub fn classify(url: &Url, port: u16) -> Page {
     if is_daemon_url(url, port) {
-        if url.query_pairs().any(|(k, _)| k == "boot") {
-            Page::Unauthorized
-        } else {
-            Page::Face
-        }
+        Page::Face
     } else if is_app_url(url) {
         if url.query_pairs().any(|(k, v)| k == "state" && v == "error") {
             Page::Error
@@ -292,12 +342,7 @@ fn on_page_load(win: &WebviewWindow, url: &Url, event: PageLoadEvent, port: u16)
             st.geom_dirty.store(true, SeqCst);
             // 주소에는 부트 코드가 있을 수 있어 남기지 않는다.
             crate::info!("페이지 읽음: {page:?}");
-            if page == Page::Unauthorized {
-                crate::warn!("곁 데몬이 부트 코드를 받지 않았어요(안내 쪽). 트레이의 \"곁 열기\"로 다시 열 수 있어요");
-            }
-            if matches!(page, Page::Face | Page::Unauthorized | Page::Error)
-                && !st.user_hidden.load(SeqCst)
-            {
+            if matches!(page, Page::Face | Page::Error) && !st.user_hidden.load(SeqCst) {
                 show_window(win, &st);
             }
         }
@@ -313,16 +358,21 @@ fn page_started(st: &OverlayState) {
     }
 }
 
-/// 다 읽은 페이지로 상태를 맞춘다. 거절된 부트(데몬의 안내 쪽)도 데몬 페이지로 쳐서 감시가 10초마다
-/// 다시 열지 않게 하고(고리 방지), "곁 열기"·얼굴의 `renew_session`이 새 코드로 다시 연다.
+/// 다 읽은 페이지로 상태를 맞춘다. 열쇠 교환이 실패한 얼굴도 데몬 페이지로 쳐서 감시가 10초마다
+/// 다시 열지 않게 한다(고리 방지). 그 얼굴은 `renew_session`(30초에 한 번, 고리 제한)이나 "곁 열기"가 연다.
 fn note_page(st: &OverlayState, page: Page) {
-    st.on_face
-        .store(matches!(page, Page::Face | Page::Unauthorized), SeqCst);
-    st.auth_failed.store(page == Page::Unauthorized, SeqCst);
+    st.on_face.store(page == Page::Face, SeqCst);
 }
 
-/// "곁 열기"가 새 부트 코드로 다시 열어야 하는지: 얼굴이 아니거나, 코드를 거절당했거나 갱신에
-/// 실패했거나, 데몬 페이지인데 셸 명령을 부른 적이 없을 때(boot 없는 주소의 안내 쪽일 수 있다).
+/// 셸·사람이 새 부트 코드로 연다(시작·감시·"곁 열기"·다시 시도): 열쇠 청함 표시와 renew 고리를 지운다.
+/// 이번 교환이 실패하면 얼굴이 다시 청한다.
+fn note_fresh_open(st: &OverlayState) {
+    st.auth_failed.store(false, SeqCst);
+    st.renew.note_fresh_open();
+}
+
+/// "곁 열기"가 새 부트 코드로 다시 열어야 하는지: 얼굴이 아니거나, 얼굴이 열쇠를 청했거나
+/// (교환 실패·401), 얼굴 스크립트가 셸 명령을 부른 적이 없을 때.
 pub fn needs_reconnect(st: &OverlayState) -> bool {
     !st.on_face.load(SeqCst) || st.auth_failed.load(SeqCst) || !st.face_alive.load(SeqCst)
 }
@@ -357,8 +407,8 @@ pub fn hide(app: &AppHandle) {
     }
 }
 
-/// 트레이 "곁 열기"·두 번째 실행: 창을 보이고 앞으로 가져온다. 얼굴이 아니거나 부트 코드를
-/// 거절당했으면 새 코드로 다시 연다(데몬이 없으면 띄운다).
+/// 트레이 "곁 열기"·두 번째 실행: 창을 보이고 앞으로 가져온다. 얼굴이 아니거나 얼굴이 열쇠를
+/// 청했으면 새 코드로 다시 연다(데몬이 없으면 띄운다). 사람이 누른 것이라 30초 제한이 없다.
 pub fn open(app: &AppHandle) {
     show(app);
     if let Some(win) = app.get_webview_window(MAIN) {
@@ -468,8 +518,10 @@ pub fn set_expanded<R: Runtime>(
     }
 }
 
-/// 얼굴이 `401`을 받았을 때(세션 쿠키 만료·삭제) 부른다. 새 부트 코드를 받아 같은 창을 다시 연다.
-/// 코드와 주소는 페이지에 돌려주지 않는다. 30초에 한 번까지(그보다 잦으면 오류 글).
+/// 얼굴이 세션 열쇠를 받지 못했을 때(부트 코드 교환 실패) 또는 `401`을 받았을 때(열쇠 만료) 부른다.
+/// 데몬을 §13.1로 확인한 뒤 새 부트 코드를 받아 같은 창을 다시 연다. 코드와 주소는 페이지에 돌려주지
+/// 않는다. 30초에 한 번까지이고, 이것으로 다시 연 얼굴이 10분 안에 또 부르면 다시 열지 않는다(고리 방지).
+/// 이 포트의 서버가 내 곁 데몬이 아니면 그 포트의 페이지를 닫고 대체 화면에 이유를 보인다.
 /// 데몬 얼굴(capabilities/overlay-remote.json)만 부를 수 있다.
 #[tauri::command]
 pub async fn renew_session<R: Runtime>(
@@ -480,28 +532,39 @@ pub async fn renew_session<R: Runtime>(
     if window.label() != MAIN {
         return Err(format!("{RENEW_ERR}: 곁 창이 아니에요"));
     }
-    // 얼굴이 401을 받았다. 여기서 다시 열지 못하면 트레이의 "곁 열기"가 새 코드로 연다.
+    // 얼굴이 열쇠를 받지 못했다. 여기서 다시 열어도 성공했는지는 알 수 없으니 "곁 열기"가 새 코드로 열게 남긴다.
     state.auth_failed.store(true, SeqCst);
-    if let Err(wait) = state.renew.try_acquire(Instant::now()) {
-        let secs = wait.as_millis().div_ceil(1000);
-        return Err(format!(
-            "{RENEW_ERR}: {}초에 한 번만 다시 열 수 있어요. {secs}초 뒤에 다시 시도하세요",
-            RENEW_EVERY.as_secs()
-        ));
+    let now = Instant::now();
+    if let Err(why) = state.renew.try_acquire(now) {
+        if why == RenewDenied::Chained {
+            crate::warn!("얼굴이 다시 연 뒤에도 열쇠를 받지 못했어요. 저절로 다시 열지 않아요(트레이의 \"곁 열기\")");
+        }
+        return Err(format!("{RENEW_ERR}: {why}"));
     }
     let port = cfg.port;
     let data_dir = cfg.data_dir.clone();
-    let url = tauri::async_runtime::spawn_blocking(move || boot_url(port, data_dir.as_deref()))
+    let opened = tauri::async_runtime::spawn_blocking(move || boot_url(port, data_dir.as_deref()))
         .await
-        .map_err(|e| format!("{RENEW_ERR}: {e}"))?
-        .map_err(|reason| {
-            crate::warn!("얼굴이 청한 세션 갱신 실패: {reason}");
-            format!("{RENEW_ERR}: {reason}")
-        })?;
-    crate::info!("얼굴이 세션을 새로 청해서 새 부트 코드로 다시 엽니다");
-    window
-        .navigate(url)
-        .map_err(|e| format!("{RENEW_ERR}: {e}"))
+        .map_err(|e| format!("{RENEW_ERR}: {e}"))?;
+    match opened {
+        Ok(url) => {
+            crate::info!("얼굴이 열쇠를 새로 청해서 새 부트 코드로 다시 엽니다");
+            state.renew.note_renewed_open(now);
+            window
+                .navigate(url)
+                .map_err(|e| format!("{RENEW_ERR}: {e}"))
+        }
+        Err(failure) => {
+            crate::warn!("얼굴이 청한 열쇠 갱신 실패: {failure}");
+            if failure.is_not_mine() {
+                // 지금 창의 페이지는 확인되지 않은 서버의 출처다. 닫고 대체 화면에 이유를 보인다.
+                if let Err(e) = window.navigate(app_page(Some(&failure.to_string()))) {
+                    crate::warn!("대체 화면을 열지 못했어요: {e}");
+                }
+            }
+            Err(format!("{RENEW_ERR}: {failure}"))
+        }
+    }
 }
 
 /// 대체 화면의 "다시 시도"(셸에 든 페이지만 부를 수 있다. capabilities/overlay-local.json).
@@ -602,6 +665,7 @@ pub fn connect_async(app: AppHandle, restart: bool) {
 
 fn connect(app: &AppHandle, restart: bool) -> bool {
     let cfg = app.state::<AppConfig>();
+    let st = app.state::<OverlayState>();
     let result = if restart {
         daemon::restart(cfg.port, cfg.data_dir.as_deref())
     } else {
@@ -615,10 +679,14 @@ fn connect(app: &AppHandle, restart: bool) -> bool {
         boot_url(cfg.port, cfg.data_dir.as_deref())
     });
     let (target, ok) = match opened {
-        Ok(url) => (url, true),
-        Err(reason) => {
-            crate::warn!("곁 얼굴을 열지 못했어요: {reason}");
-            (app_page(Some(&reason)), false)
+        Ok(url) => {
+            note_fresh_open(&st);
+            (url, true)
+        }
+        Err(failure) => {
+            // 확인되지 않은 포트의 페이지는 열지 않는다. 대체 화면과 shell.log에 이유를 적는다.
+            crate::warn!("곁 얼굴을 열지 못했어요: {failure}");
+            (app_page(Some(&failure.to_string())), false)
         }
     };
     if let Err(e) = win.navigate(target) {
@@ -627,16 +695,83 @@ fn connect(app: &AppHandle, restart: bool) -> bool {
     ok
 }
 
+/// 감시가 데몬을 한 번 본 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probed {
+    Mine,
+    NotMine,
+    Down,
+}
+
+impl From<&Probe> for Probed {
+    fn from(p: &Probe) -> Self {
+        match p {
+            Probe::Mine => Probed::Mine,
+            Probe::NotMine(_) => Probed::NotMine,
+            Probe::Down(_) => Probed::Down,
+        }
+    }
+}
+
+/// 감시의 상태(지수 대기). 결정만 하고 부르지는 않는다(시험할 수 있게).
+#[derive(Debug, Clone)]
+pub struct Watch {
+    failures: u32,
+    next_attempt: Instant,
+    /// 데몬은 확인되는데 얼굴을 못 연 채(부트 코드를 못 받음 등) 남았을 때 다시 여는 횟수.
+    reopens: u32,
+    next_reopen: Instant,
+}
+
+impl Watch {
+    pub fn new(now: Instant) -> Self {
+        Watch {
+            failures: 0,
+            next_attempt: now,
+            reopens: 0,
+            next_reopen: now,
+        }
+    }
+
+    /// 이번에 `connect`를 불러야 하는지.
+    /// - 내 데몬이 확인되면: 얼굴이면 그대로(열쇠 문제로 다시 열지 않는다 — 고리 방지), 대체 화면이면 다시 연다
+    ///   (처음은 바로, 그 뒤로는 20초부터 두 배씩).
+    /// - 이 포트의 서버가 내 데몬이 아닌데 그 포트의 페이지가 창에 있으면: 바로 대체 화면으로 바꾼다.
+    /// - 그 밖(닿지 않음·내 데몬이 아님): 두 번 연속이면 다시 띄워 본다(20초부터 두 배씩, 최대 10분).
+    pub fn step(&mut self, seen: Probed, on_face: bool, now: Instant) -> bool {
+        if seen == Probed::Mine {
+            self.failures = 0;
+            if on_face {
+                self.reopens = 0;
+                return false;
+            }
+            if now < self.next_reopen {
+                return false;
+            }
+            self.reopens = self.reopens.saturating_add(1);
+            self.next_reopen = now + backoff_after(self.reopens.saturating_add(1));
+            return true;
+        }
+        self.failures = self.failures.saturating_add(1);
+        if seen == Probed::NotMine && on_face {
+            self.next_attempt = now + backoff_after(self.failures.max(2));
+            return true;
+        }
+        if self.failures >= 2 && now >= self.next_attempt {
+            self.next_attempt = now + backoff_after(self.failures);
+            return true;
+        }
+        false
+    }
+}
+
 /// 데몬이 죽으면 다시 띄우고(지수 대기), 다른 경로로 살아나면(작업 스케줄러 등) 얼굴을 연다.
+/// 볼 때마다 §13.1로 확인한다(다시 시작·다른 서버로 바뀜을 알아챈다).
 pub fn start_watchdog(app: AppHandle) {
     let spawned = thread::Builder::new()
         .name("gyeot-watchdog".into())
         .spawn(move || {
-            let mut failures: u32 = 0;
-            let mut next_attempt = Instant::now();
-            // 데몬은 건강한데 얼굴을 못 연 채(부트 코드를 못 받음 등) 남았을 때 다시 여는 횟수.
-            let mut reopens: u32 = 0;
-            let mut next_reopen = Instant::now();
+            let mut watch = Watch::new(Instant::now());
             loop {
                 thread::sleep(WATCH_PERIOD);
                 let st = app.state::<OverlayState>();
@@ -646,27 +781,24 @@ pub fn start_watchdog(app: AppHandle) {
                 if st.connecting.load(SeqCst) {
                     continue;
                 }
-                let port = app.state::<AppConfig>().port;
-                if daemon::is_healthy(port) {
-                    failures = 0;
-                    if st.on_face.load(SeqCst) {
-                        reopens = 0;
-                    } else if Instant::now() >= next_reopen {
-                        // 처음은 바로, 그 뒤로도 못 열면 20초부터 두 배씩(최대 10분) 기다린다.
-                        reopens = reopens.saturating_add(1);
-                        next_reopen = Instant::now() + backoff_after(reopens.saturating_add(1));
-                        crate::info!("곁 데몬이 응답해요. 얼굴을 엽니다");
-                        connect_async(app.clone(), false);
-                    }
+                let cfg = app.state::<AppConfig>();
+                let probe = daemon::probe(cfg.port, cfg.data_dir.as_deref());
+                let seen = Probed::from(&probe);
+                let on_face = st.on_face.load(SeqCst);
+                if !watch.step(seen, on_face, Instant::now()) {
                     continue;
                 }
-                failures = failures.saturating_add(1);
-                if failures >= 2 && Instant::now() >= next_attempt {
-                    let backoff = backoff_after(failures);
-                    next_attempt = Instant::now() + backoff;
-                    crate::warn!("곁 데몬이 응답하지 않아요({failures}번째). 다시 띄워 봅니다(다음 시도까지 {}초)", backoff.as_secs());
-                    connect_async(app.clone(), false);
+                match &probe {
+                    Probe::Mine => crate::info!("곁 데몬을 확인했어요. 얼굴을 엽니다"),
+                    Probe::NotMine(why) if on_face => {
+                        crate::warn!("{why}. 그 포트의 얼굴을 닫습니다")
+                    }
+                    Probe::NotMine(why) => crate::warn!("{why}. 다시 확인해 봅니다"),
+                    Probe::Down(e) => {
+                        crate::warn!("곁 데몬이 응답하지 않아요({e}). 다시 띄워 봅니다")
+                    }
                 }
+                connect_async(app.clone(), false);
             }
         });
     if let Err(e) = spawned {
@@ -716,16 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn page_with_boot_left_in_address_is_unauthorized() {
-        // 맞는 코드면 데몬이 303으로 boot를 뺀 주소로 보낸다. 다 읽은 뒤에도 남아 있으면 거절된 것.
-        assert_eq!(
-            classify(&face_boot_url(47321, CODE), 47321),
-            Page::Unauthorized
-        );
-        assert_eq!(
-            classify(&u("http://localhost:47321/?boot="), 47321),
-            Page::Unauthorized
-        );
+    fn daemon_pages_are_the_face_other_ports_are_not() {
         assert_eq!(
             classify(&u("http://127.0.0.1:47321/?mode=overlay"), 47321),
             Page::Face
@@ -746,42 +869,76 @@ mod tests {
         assert!(needs_reconnect(&st), "아직 얼굴이 아니다(깨우는 중)");
         page_started(&st);
         note_page(&st, Page::Face);
-        // 데몬 페이지지만 셸 명령을 부른 적이 없다 = 안내 쪽(401)일 수 있다(boot 없는 주소에서도).
+        // 데몬 페이지지만 셸 명령을 부른 적이 없다 = 얼굴 스크립트가 돌지 않았다.
         assert!(needs_reconnect(&st), "명령을 부르지 않은 데몬 페이지");
         st.face_alive.store(true, SeqCst); // 얼굴이 set_hit_rect를 불렀다
         assert!(!needs_reconnect(&st));
-        st.auth_failed.store(true, SeqCst); // 얼굴의 renew_session이 실패했다
+        st.auth_failed.store(true, SeqCst); // 얼굴이 renew_session을 불렀다
         assert!(
             needs_reconnect(&st),
-            "갱신에 실패한 얼굴은 곁 열기로 다시 연다"
+            "열쇠를 청한 얼굴은 곁 열기로 다시 연다"
         );
+        // 셸·사람이 새 코드로 열면(connect) 풀린다.
+        note_fresh_open(&st);
         page_started(&st);
         assert!(!st.face_alive.load(SeqCst), "새 페이지는 다시 알려야 한다");
         note_page(&st, Page::Face);
         st.face_alive.store(true, SeqCst);
-        assert!(!needs_reconnect(&st), "다시 연 얼굴이 뜨면 풀린다");
+        assert!(!needs_reconnect(&st), "새로 연 얼굴이 뜨면 풀린다");
     }
 
     #[test]
-    fn rejected_boot_reopens_on_request_but_not_in_a_loop() {
+    fn renew_request_reopens_on_request_but_watchdog_does_not() {
         let st = OverlayState::default();
-        assert!(needs_reconnect(&st), "아직 얼굴이 아니다(깨우는 중)");
         note_page(&st, Page::Face);
         st.face_alive.store(true, SeqCst);
         assert!(!needs_reconnect(&st));
-        page_started(&st);
-        note_page(&st, Page::Unauthorized);
+        st.auth_failed.store(true, SeqCst); // 얼굴이 renew_session을 불렀다
         assert!(needs_reconnect(&st), "곁 열기는 새 코드로 다시 연다");
-        assert!(
-            st.on_face.load(SeqCst),
-            "감시는 거절된 안내 쪽을 10초마다 다시 열지 않는다"
-        );
-        note_page(&st, Page::Face);
-        st.face_alive.store(true, SeqCst);
-        assert!(!needs_reconnect(&st));
-        assert!(!st.auth_failed.load(SeqCst));
+        let mut watch = Watch::new(Instant::now());
+        let t = Instant::now();
+        for i in 0..10 {
+            assert!(
+                !watch.step(Probed::Mine, st.on_face.load(SeqCst), t + WATCH_PERIOD * i),
+                "감시는 열쇠를 받지 못한 얼굴을 10초마다 다시 열지 않는다"
+            );
+        }
         note_page(&st, Page::Error);
         assert!(needs_reconnect(&st));
+    }
+
+    #[test]
+    fn boot_left_in_the_address_is_still_the_face() {
+        // 서버는 303 없이 index.html을 주고, 얼굴 스크립트가 replaceState로 boot를 지운다(§12.1-3).
+        // 다 읽은 때의 주소에 boot가 남았는지는 교환 성공과 상관없다.
+        assert_eq!(classify(&face_boot_url(47321, CODE), 47321), Page::Face);
+        assert_eq!(
+            classify(&u("http://localhost:47321/?boot="), 47321),
+            Page::Face
+        );
+    }
+
+    #[test]
+    fn renew_request_keeps_open_reconnecting_after_the_face_reloads() {
+        let st = OverlayState::default();
+        page_started(&st);
+        note_page(&st, Page::Face);
+        st.face_alive.store(true, SeqCst);
+        assert!(!needs_reconnect(&st));
+        // 얼굴이 교환에 실패해(또는 401) renew_session을 불렀다.
+        st.auth_failed.store(true, SeqCst);
+        // 셸이 새 코드로 다시 열었고, 새 얼굴이 떠서 클릭 영역을 알렸다(안내를 보이는 중일 수도 있다).
+        page_started(&st);
+        note_page(&st, Page::Face);
+        st.face_alive.store(true, SeqCst);
+        assert!(
+            needs_reconnect(&st),
+            "셸은 교환이 성공했는지 알 수 없다: 곁 열기는 새 코드로 다시 연다"
+        );
+        assert!(
+            st.on_face.load(SeqCst),
+            "감시는 얼굴을 저절로 다시 열지 않는다"
+        );
     }
 
     #[test]
@@ -793,13 +950,70 @@ mod tests {
         assert!(gate.try_acquire(t0 + Duration::from_millis(100)).is_err());
         assert_eq!(
             gate.try_acquire(t0 + Duration::from_secs(29)),
-            Err(Duration::from_secs(1))
+            Err(RenewDenied::TooSoon(Duration::from_secs(1)))
         );
         // 거절된 시도는 시각을 늦추지 않는다
         assert!(gate.try_acquire(t0 + RENEW_EVERY).is_ok());
         assert!(gate
             .try_acquire(t0 + RENEW_EVERY + Duration::from_secs(1))
             .is_err());
+        assert!(RenewDenied::TooSoon(Duration::from_millis(1500))
+            .to_string()
+            .contains("30초"));
+    }
+
+    #[test]
+    fn renewed_face_that_asks_again_is_not_reopened() {
+        let gate = RenewGate::default();
+        let t0 = Instant::now();
+        // 얼굴이 교환에 실패 → 셸이 새 코드로 다시 열었다.
+        assert!(gate.try_acquire(t0).is_ok());
+        gate.note_renewed_open(t0);
+        // 다시 연 얼굴도 열쇠를 받지 못했다: 30초가 지나도 10분 안에는 다시 열지 않는다(무한 재열기 없음).
+        for later in [
+            Duration::from_secs(1),
+            RENEW_EVERY,
+            Duration::from_secs(599),
+        ] {
+            assert_eq!(
+                gate.try_acquire(t0 + later),
+                Err(RenewDenied::Chained),
+                "{later:?}"
+            );
+        }
+        assert!(RenewDenied::Chained.to_string().contains("곁 열기"));
+        // 다시 연 얼굴이 한참 잘 쓰다가(열쇠 만료) 부르면 다시 연다.
+        assert!(gate.try_acquire(t0 + RENEW_CHAIN).is_ok());
+        // 셸·사람이 새로 열면 고리가 끊긴다.
+        let gate = RenewGate::default();
+        assert!(gate.try_acquire(t0).is_ok());
+        gate.note_renewed_open(t0);
+        gate.note_fresh_open();
+        assert!(gate.try_acquire(t0 + RENEW_EVERY).is_ok());
+    }
+
+    #[test]
+    fn watchdog_leaves_a_port_that_is_not_mine_at_once() {
+        let t = Instant::now();
+        // 얼굴이 떠 있는데 그 포트를 다른 서버가 잡았다: 두 번 기다리지 않고 바로 대체 화면으로.
+        let mut w = Watch::new(t);
+        assert!(w.step(Probed::NotMine, true, t));
+        // 대체 화면으로 바뀐 뒤에는 보통의 지수 대기
+        assert!(!w.step(Probed::NotMine, false, t + WATCH_PERIOD));
+        assert!(w.step(Probed::NotMine, false, t + WATCH_PERIOD * 3));
+        // 데몬이 닿지 않으면 두 번째부터 다시 띄워 본다(얼굴은 그대로 둔다)
+        let mut w = Watch::new(t);
+        assert!(!w.step(Probed::Down, true, t));
+        assert!(w.step(Probed::Down, true, t + WATCH_PERIOD));
+        assert!(
+            !w.step(Probed::Down, true, t + WATCH_PERIOD * 2),
+            "20초 대기"
+        );
+        // 내 데몬이 확인되면 대체 화면을 다시 연다(처음은 바로)
+        let mut w = Watch::new(t);
+        assert!(w.step(Probed::Mine, false, t));
+        assert!(!w.step(Probed::Mine, false, t + WATCH_PERIOD));
+        assert!(!w.step(Probed::Mine, true, t + WATCH_PERIOD * 2));
     }
 
     #[test]

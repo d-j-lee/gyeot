@@ -280,7 +280,7 @@ export function App({ ctl, config }: { ctl: Controller; config: AppConfig }) {
   const avatarMood: Mood = offline ? 'idle' : mood;
 
   if (overlay) {
-    const label = `곁 — ${authLost ? '열쇠가 만료됐어요' : moodLabel(avatarMood)}${blockingCount ? `, 막힌 일 ${blockingCount}건` : ''}${unread ? `, 안 읽은 답 ${unread}개` : ''}. 패널 ${open ? '접기' : '열기'}`;
+    const label = `곁 — ${authLost ? '열쇠가 없거나 만료됐어요' : moodLabel(avatarMood)}${blockingCount ? `, 막힌 일 ${blockingCount}건` : ''}${unread ? `, 안 읽은 답 ${unread}개` : ''}. 패널 ${open ? '접기' : '열기'}`;
     return (
       <div class="ov">
         <LiveAnnouncer bubble={bubble} />

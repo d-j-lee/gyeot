@@ -33,6 +33,9 @@ export function isTerminalOnly(kind: string): boolean {
 
 export const TERMINAL_ONLY_NOTE = '승인은 터미널에서 직접 하세요';
 
+/** 선택지가 있는 결정 카드(§13.5). Claude 가 "승인할까요?"처럼 물어도 권한 승인 단추로 읽히지 않게 늘 밝힌다. */
+export const ASK_NOT_APPROVAL_NOTE = 'Claude가 묻는 거예요 — 권한 승인이 아니에요';
+
 export const MOOD_LABELS: Record<Mood, string> = {
   idle: '지켜보는 중',
   working: '에이전트가 작업 중',

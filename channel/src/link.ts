@@ -1,4 +1,5 @@
-// 곁 데몬과의 연결: 등록(cid) → SSE 스트림 → 끊기면 1→2→4…최대 30단위로 다시(contracts §10).
+// 곁 데몬과의 연결: 확인(§13.1) → 등록(cid) → SSE 스트림 → 끊기면 1→2→4…최대 30단위로 다시(contracts §10).
+// 확인에 실패하면 연결하지 않고 stderr에 이유를 적은 뒤 같은 간격으로 다시 시도한다.
 
 import { DaemonClient, DaemonError } from './daemon.js';
 import { describeError, log } from './log.js';
@@ -192,6 +193,8 @@ export class Link {
       return { kind: 'ended', healthy: healthy || Date.now() - openedAt >= STABLE_MS };
     } finally {
       if (this.streamAbort === abort) this.streamAbort = null;
+      // 다시 연결할 때마다 다시 확인한다(§13.1): 끊긴 사이에 그 포트의 주인이 바뀌었을 수 있다.
+      this.opts.client.forgetVerification();
     }
   }
 

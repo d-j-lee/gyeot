@@ -1,5 +1,6 @@
-// 시험용 가짜 곁 데몬: contracts §7의 channel 끝점만 흉내 낸다(토큰·Host 검사 포함).
+// 시험용 가짜 곁 데몬: contracts §7의 channel 끝점과 §13.1 데몬 확인(/v1/hello)만 흉내 낸다(토큰·Host 검사 포함).
 
+import { createHmac } from 'node:crypto';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 
@@ -11,6 +12,21 @@ export interface Recorded {
   readonly body: unknown;
 }
 
+/**
+ * `/v1/hello`에 어떻게 답할지.
+ * - ok: 이 데몬의 토큰과 실제 포트로 계산한 맞는 증명
+ * - wrong: 아무 값(토큰을 모르는 서버)
+ * - other-port: 맞는 토큰, 하지만 다른 포트(+1)로 계산(다른 포트의 데몬으로 중계하는 서버)
+ * - missing: 404(/v1/hello를 모르는 옛 판·다른 프로그램)
+ * - garbage: 200이지만 증명 모양이 아님
+ */
+export type HelloMode = 'ok' | 'wrong' | 'other-port' | 'missing' | 'garbage';
+
+/** 서버 쪽 증명 계산(contracts §13.1). channel 코드와 따로 둔다. */
+export function proofOf(token: string, port: number, nonce: string): string {
+  return createHmac('sha256', Buffer.from(token, 'utf8')).update(`gyeot-hello/v1|${port}|${nonce}`).digest('hex');
+}
+
 export class FakeDaemon {
   readonly requests: Recorded[] = [];
   private readonly server: http.Server;
@@ -20,7 +36,10 @@ export class FakeDaemon {
   private nextDecision = 1;
   port = 0;
 
-  constructor(readonly token: string) {
+  constructor(
+    readonly token: string,
+    public helloMode: HelloMode = 'ok',
+  ) {
     this.server = http.createServer((req, res) => void this.handle(req, res));
   }
 
@@ -76,9 +95,34 @@ export class FakeDaemon {
     this.cids.clear();
   }
 
-  private authorized(req: http.IncomingMessage, query: URLSearchParams): boolean {
-    const auth = req.headers.authorization;
-    return auth === `Bearer ${this.token}` || query.get('t') === this.token;
+  /** 이 토큰이 실린 요청이 하나라도 왔는지(머리·주소·본문 어디든). */
+  sawToken(token: string): boolean {
+    return this.requests.some(
+      (r) =>
+        JSON.stringify(r.headers).includes(token) || r.query.toString().includes(token) || JSON.stringify(r.body ?? '').includes(token),
+    );
+  }
+
+  /** 토큰은 Authorization 머리로만 받는다(contracts §7: 쿼리 ?t= 는 받지 않는다). */
+  private authorized(req: http.IncomingMessage): boolean {
+    return req.headers.authorization === `Bearer ${this.token}`;
+  }
+
+  private hello(url: URL, res: http.ServerResponse): void {
+    const n = url.searchParams.get('n') ?? '';
+    if (!/^[0-9a-fA-F]{16,128}$/.test(n)) return json(res, 400, { error: 'n' });
+    switch (this.helloMode) {
+      case 'ok':
+        return json(res, 200, { v: 1, proof: proofOf(this.token, this.port, n) });
+      case 'wrong':
+        return json(res, 200, { v: 1, proof: '7'.repeat(64) });
+      case 'other-port':
+        return json(res, 200, { v: 1, proof: proofOf(this.token, this.port + 1, n) });
+      case 'missing':
+        return json(res, 404, { error: 'not found' });
+      case 'garbage':
+        return json(res, 200, { ok: true, version: '0.1.0' });
+    }
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -96,7 +140,8 @@ export class FakeDaemon {
 
     const host = req.headers.host;
     if (host !== `127.0.0.1:${this.port}` && host !== `localhost:${this.port}`) return json(res, 421, { error: 'host' });
-    if (!this.authorized(req, url.searchParams)) return json(res, 401, { error: 'unauthorized' });
+    if (req.method === 'GET' && url.pathname === '/v1/hello') return this.hello(url, res);
+    if (!this.authorized(req)) return json(res, 401, { error: 'unauthorized' });
 
     const b = (body ?? {}) as Record<string, unknown>;
     const route = `${req.method} ${url.pathname}`;

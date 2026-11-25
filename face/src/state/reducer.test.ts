@@ -48,7 +48,7 @@ function snap(over: Partial<Snapshot> = {}): Snapshot {
     sessions: [{ id: 's1', agent: 'claude-code', project: 'proj', cwd: 'C:\\work\\proj', state: 'waiting', last_ms: NOW, channel: 'ch_1' }],
     proposals: [],
     budget: { nudge: 4, interrupt: 1 },
-    settings: { nudge_min: 80, interrupt_min: 95, stale_minutes: 30, quiet_hours: [], quiet_kinds: [] },
+    settings: { nudge_min: 80, interrupt_min: 95, stale_minutes: 30, quiet_hours: [], quiet_kinds: [], approval_interrupt: false },
     ...over,
   };
 }
@@ -66,6 +66,17 @@ describe('applyEvent — snapshot', () => {
     expect(s.sessions).toHaveLength(1);
     expect(s.settings?.nudge_min).toBe(80);
     expect(s.clockOffsetMs).toBe(250);
+  });
+
+  it('settings.approval_interrupt(§13.3): 참일 때만 켜짐, 없거나 이상하면 꺼짐으로 본다', () => {
+    const withSettings = (settings: unknown) =>
+      applyEvent(initialState(), ev({ event: 'snapshot', data: snap({ settings: settings as Snapshot['settings'] }) })).settings;
+    expect(withSettings({ ...snap().settings, approval_interrupt: true })?.approval_interrupt).toBe(true);
+    expect(withSettings({ ...snap().settings, approval_interrupt: false })?.approval_interrupt).toBe(false);
+    const { approval_interrupt: _drop, ...old } = snap().settings; // 필드가 없는 옛 데몬
+    expect(withSettings(old)?.approval_interrupt).toBe(false);
+    expect(withSettings({ ...old, approval_interrupt: 'true' })?.approval_interrupt).toBe(false);
+    expect(withSettings({ ...old, approval_interrupt: 1 })?.approval_interrupt).toBe(false);
   });
 
   it('열린 항목만 받고 모양이 깨진 항목은 버린다', () => {

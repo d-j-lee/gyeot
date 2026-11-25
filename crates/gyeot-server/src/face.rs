@@ -1,4 +1,4 @@
-//! 얼굴 정적 파일과 안내 쪽(계약 §7·§12.1). 얼굴 쪽 응답에는 토큰을 싣지 않고 보안 머리를 붙인다.
+//! 얼굴 정적 파일(계약 §7·§12.1). 얼굴 쪽은 인증 없이 주고(비밀이 없다), 보안 머리를 붙인다.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// 얼굴 쪽 응답의 `Content-Security-Policy`(계약 §7).
 pub const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
-/// 얼굴 쪽 보안 머리. `no_store`면 `Cache-Control: no-store`도(index·안내 쪽·되돌려 보내기).
+/// 얼굴 쪽 보안 머리. `no_store`면 `Cache-Control: no-store`도(index·얼굴 없음 안내 쪽).
 pub fn secure_headers(h: &mut HeaderMap, no_store: bool) {
     h.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -39,57 +39,6 @@ fn html_response(status: StatusCode, body: String) -> Response {
     r
 }
 
-const GUIDE_STYLE: &str = r#"<style>
-body{font-family:system-ui,-apple-system,"Malgun Gothic","Apple SD Gothic Neo",sans-serif;background:#F4EFE6;color:#3A3530;max-width:40rem;margin:3rem auto;padding:0 1.25rem;line-height:1.6}
-code{background:#E6DDCF;border-radius:6px;padding:.1rem .35rem}
-</style>"#;
-
-/// 안내 쪽의 까닭.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Guide {
-    /// 세션 쿠키가 없거나 지났다.
-    NoSession,
-    /// 부트 코드가 틀렸거나 지났거나 이미 썼다.
-    BadBootCode,
-}
-
-/// 한국어 안내 쪽(`401`). 토큰·얼굴을 싣지 않는다.
-pub fn guidance(kind: Guide) -> Response {
-    let (title, lead) = match kind {
-        Guide::NoSession => (
-            "곁 — 열쇠가 필요해요",
-            "곁의 얼굴은 보안을 위해 이 주소만으로는 열리지 않아요. 열쇠(세션)가 없거나 30일이 지났어요.",
-        ),
-        Guide::BadBootCode => (
-            "곁 — 열기 코드가 맞지 않아요",
-            "열기 코드가 틀렸거나, 120초가 지났거나, 이미 쓴 코드예요. 코드는 한 번만 쓸 수 있어요.",
-        ),
-    };
-    let body = format!(
-        r#"<!doctype html>
-<html lang="ko">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-{GUIDE_STYLE}
-</head>
-<body>
-<h1>{title}</h1>
-<p>{lead}</p>
-<p>이렇게 열어 주세요.</p>
-<ul>
-<li>트레이(알림 영역)의 곁 아이콘에서 <strong>곁 열기</strong>를 누르세요.</li>
-<li>또는 터미널에서 <code>gyeotd --open</code>을 실행하세요(주소만 보려면 <code>gyeotd --open --print</code>).</li>
-</ul>
-<p>한 번 열면 이 브라우저에 열쇠가 30일 동안 남아요.</p>
-</body>
-</html>
-"#
-    );
-    html_response(StatusCode::UNAUTHORIZED, body)
-}
-
 /// 얼굴이 없을 때 보이는 안내 쪽.
 pub const BUILTIN_PAGE: &str = r#"<!doctype html>
 <html lang="ko">
@@ -118,7 +67,7 @@ npm run build</pre>
 </html>
 "#;
 
-/// `GET /`(세션 쿠키를 확인한 뒤): 얼굴의 `index.html` 그대로, 없으면 얼굴 없음 안내 쪽. 토큰을 싣지 않는다.
+/// `GET /`·`/index.html`(인증 없음): 얼굴의 `index.html` 그대로, 없으면 얼굴 없음 안내 쪽. 토큰을 싣지 않는다.
 pub async fn index_response(face_dir: Option<&Path>) -> Response {
     if let Some(dir) = face_dir {
         match tokio::fs::read(dir.join("index.html")).await {
@@ -199,8 +148,8 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-/// 얼굴 폴더의 정적 파일 하나(쿠키 없이 받는다, 비밀 없음). 맨 위 `index.html`은 쿠키를 보는
-/// `GET /`·`GET /index.html`로만 보낸다(인코딩한 경로로 돌아 들어오지 못하게 여기서는 404).
+/// 얼굴 폴더의 정적 파일 하나(인증 없음, 비밀 없음). 맨 위 `index.html`은 `no-store`를 붙이는
+/// `GET /`·`GET /index.html`로만 보낸다(인코딩한 경로로는 여기서 404).
 pub async fn static_response(face_dir: Option<&Path>, url_path: &str) -> Response {
     let not_found = || {
         let mut r = (StatusCode::NOT_FOUND, "없는 파일이에요").into_response();
@@ -248,16 +197,15 @@ pub async fn static_response(face_dir: Option<&Path>, url_path: &str) -> Respons
 mod tests {
     use super::*;
 
-    #[test]
-    fn guidance_pages_are_korean_401_without_secrets() {
-        for g in [Guide::NoSession, Guide::BadBootCode] {
-            let r = guidance(g);
-            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
-            let h = r.headers();
-            assert_eq!(h[header::CONTENT_SECURITY_POLICY], CSP);
-            assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
-            assert_eq!(h[header::CACHE_CONTROL], "no-store");
-        }
+    #[tokio::test]
+    async fn builtin_page_has_secure_headers_and_no_secret() {
+        let r = index_response(None).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let h = r.headers();
+        assert_eq!(h[header::CONTENT_SECURITY_POLICY], CSP);
+        assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        assert!(h.get(header::SET_COOKIE).is_none());
     }
 
     #[test]

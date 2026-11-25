@@ -16,7 +16,9 @@ afterEach(() => {
 });
 
 describe('백엔드 고르기(main.tsx)', () => {
-  it('meta·?t= 에 토큰이 있어도 읽지 않는다 — 요청은 같은 출처 쿠키로만', async () => {
+  it('meta·?t= 에 토큰이 있어도 읽지 않는다 — 요청에는 sessionStorage 의 세션 열쇠만, 쿠키 없이', async () => {
+    const KEY = 'cd'.repeat(32);
+    sessionStorage.setItem('gyeot.session', JSON.stringify({ session: KEY, expires_ms: Date.now() + 60_000 }));
     const meta = document.createElement('meta');
     meta.name = 'gyeot-token';
     meta.content = 'a'.repeat(64);
@@ -26,20 +28,37 @@ describe('백엔드 고르기(main.tsx)', () => {
     const href = `http://127.0.0.1:47321/?mode=overlay&t=${'b'.repeat(64)}`;
     const b = createBackend(parseBoot(new URL(href).search), loc(href));
     expect(b).toBeInstanceOf(HttpBackend);
-    expect((b as HttpBackend).api.streamUrl()).toBe('/v1/stream');
     await b.focus(true, 30);
     const [url, init] = fetchSpy.mock.calls[0]!;
     expect(url).toBe('/v1/focus');
-    expect(init!.credentials).toBe('same-origin');
+    expect(init!.credentials).toBe('omit');
+    expect(init!.headers).toEqual({ Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' });
     const sent = JSON.stringify(init);
     expect(sent).not.toContain('a'.repeat(64));
     expect(sent).not.toContain('b'.repeat(64));
-    expect(sent).not.toMatch(/authorization/i);
+    sessionStorage.clear();
+  });
+
+  it('부트 코드를 넘기면 그 코드로 열쇠를 받는다', async () => {
+    const CODE = 'ef'.repeat(32);
+    const fetchSpy = vi.fn(async (u: string, _i?: RequestInit) =>
+      u === '/v1/session'
+        ? new Response(JSON.stringify({ session: 'ab'.repeat(32), expires_ms: Date.now() + 60_000 }))
+        : new Response('{"ok":true,"until_ms":null}'),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+    const href = 'http://127.0.0.1:47321/?mode=overlay';
+    const b = createBackend(parseBoot(new URL(href).search), loc(href), CODE);
+    await b.focus(false);
+    expect(fetchSpy.mock.calls.map(([u]) => u)).toEqual(['/v1/session', '/v1/focus']);
+    expect(JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string)).toEqual({ code: CODE });
+    expect(fetchSpy.mock.calls[1]![1]!.headers).toMatchObject({ Authorization: `Bearer ${'ab'.repeat(32)}` });
+    sessionStorage.clear();
   });
 });
 
 describe('데모(?demo=)는 열쇠 없이 돈다', () => {
-  it('네트워크(fetch·EventSource)도 셸 IPC 도 쓰지 않는다', async () => {
+  it('부트 코드가 와도 네트워크(fetch·EventSource)도 셸 IPC 도 쓰지 않는다', async () => {
     vi.useFakeTimers();
     const fetchSpy = vi.fn();
     const esSpy = vi.fn();
@@ -49,7 +68,7 @@ describe('데모(?demo=)는 열쇠 없이 돈다', () => {
     (window as Window & { __TAURI__?: unknown }).__TAURI__ = { core: { invoke } };
     for (const q of ['?demo=panel', '?demo=sleep&mode=overlay', '?demo=reply', '?demo=bubble&t=x&api=http://127.0.0.1:1']) {
       const href = `http://127.0.0.1:47321/${q}`;
-      const b = createBackend(parseBoot(new URL(href).search), loc(href));
+      const b = createBackend(parseBoot(new URL(href).search), loc(href), 'ef'.repeat(32));
       expect(b).toBeInstanceOf(DemoBackend);
       const statuses: ConnState[] = [];
       const events: SseEvent[] = [];
@@ -73,5 +92,6 @@ describe('데모(?demo=)는 열쇠 없이 돈다', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(esSpy).not.toHaveBeenCalled();
     expect(invoke).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem('gyeot.session')).toBeNull();
   });
 });

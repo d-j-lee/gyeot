@@ -89,6 +89,143 @@ function Get-GyeotShortPath([string]$Path) {
     return $Path
 }
 
+# ───────────────────────── 폴더 권한(Windows, docs/contracts.md §13.4) ─────────────────────────
+# %LOCALAPPDATA% 아래는 그 사용자 전용 권한을 이어받는다. 그 밖(C:\gyeot 등)은 Authenticated Users가
+# 수정 권한을 물려받을 수 있어서, 다른 사용자가 token을 읽거나 Claude Code가 실행하는 gyeot-hook.exe를
+# 바꿔칠 수 있다(R3 M4). 그런 폴더는 상속을 끊고 그 사용자와 SYSTEM만 남긴다.
+
+$script:GyeotSystemSid = 'S-1-5-18'
+$script:GyeotAdminsSid = 'S-1-5-32-544'
+
+# Windows인지(Windows PowerShell 5.1에는 $IsWindows 가 없다).
+function Test-GyeotWindowsHost {
+    return ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+}
+
+# %LOCALAPPDATA% 아래인지. LOCALAPPDATA를 모르면 밖으로 본다(좁히는 쪽).
+# 8.3 짧은 이름(RUNNER~1 등)은 펼치지 않으므로 안쪽이어도 밖으로 볼 수 있다(그때도 좁히기만 한다).
+function Test-GyeotUnderLocalAppData([string]$Path) {
+    if (-not $env:LOCALAPPDATA) { return $false }
+    return (Test-GyeotPathUnder $Path $env:LOCALAPPDATA)
+}
+
+# 좁힐 폴더: 주어진 폴더(설치 폴더·데이터 폴더) 가운데 %LOCALAPPDATA% 밖인 것. 빈 값·중복은 뺀다.
+function Get-GyeotPrivateFolderPlan([string[]]$Folders) {
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $Folders) {
+        if (-not $f) { continue }
+        $full = (Get-GyeotFullPath $f).TrimEnd('\', '/')
+        if (Test-GyeotUnderLocalAppData $full) { continue }
+        $dup = $false
+        foreach ($o in $out) { if ($o.Equals($full, [StringComparison]::OrdinalIgnoreCase)) { $dup = $true } }
+        if (-not $dup) { $out.Add($full) }
+    }
+    # 호출하는 쪽이 @(...)로 감싼다(빈 목록도 그대로 빈 배열이 되게).
+    return $out.ToArray()
+}
+
+function Get-GyeotCurrentUserSid {
+    return [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+
+function Get-GyeotSidName([string]$Sid) {
+    try {
+        return (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+    } catch {
+        return $Sid
+    }
+}
+
+function Get-GyeotIcaclsPath {
+    $sysRoot = $env:SystemRoot
+    if (-not $sysRoot) { $sysRoot = 'C:\Windows' }
+    return ($sysRoot.TrimEnd('\') + '\System32\icacls.exe')
+}
+
+# icacls 인자(§13.4): 상속을 끊고(/inheritance:r) 그 사용자와 SYSTEM에 모든 권한(하위 폴더·파일로 이어짐).
+function Get-GyeotIcaclsArgument([string]$Folder, [string]$UserSid) {
+    return @($Folder, '/inheritance:r', '/grant:r', "*$($UserSid):(OI)(CI)F", '/grant:r', "*$($script:GyeotSystemSid):(OI)(CI)F")
+}
+
+# 폴더(파일) ACL 요약: 상속이 끊겼는지, 항목(SID·허용/거부·권한·물려받음), 주인 SID.
+function Get-GyeotAclSummary([string]$Path) {
+    $acl = Get-Acl -LiteralPath $Path
+    $rules = @()
+    foreach ($r in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        $rules += [pscustomobject]@{
+            Sid       = $r.IdentityReference.Value
+            Type      = [string]$r.AccessControlType
+            Rights    = [string]$r.FileSystemRights
+            Inherited = [bool]$r.IsInherited
+        }
+    }
+    return [pscustomobject]@{
+        Protected = [bool]$acl.AreAccessRulesProtected
+        Rules     = $rules
+        Owner     = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    }
+}
+
+# 주인이 그 사용자·SYSTEM·Administrators가 아니면 그 주인은 언제든 권한을 다시 넓힐 수 있다.
+function Test-GyeotTrustedOwner([string]$OwnerSid, [string]$UserSid) {
+    return ($OwnerSid -eq $UserSid -or $OwnerSid -eq $script:GyeotSystemSid -or $OwnerSid -eq $script:GyeotAdminsSid)
+}
+
+# 요약이 §13.4를 지키는지. 지키면 아무것도, 아니면 까닭들을 내보낸다.
+# 지킬 것: 상속이 끊김(폴더만), 항목은 허용뿐이고 주체는 그 사용자·SYSTEM뿐, 둘 다 모든 권한, 주인이 믿을 만함.
+function Get-GyeotAclProblem($Summary, [string]$UserSid, [switch]$Child) {
+    $problems = @()
+    if (-not $Child -and -not $Summary.Protected) { $problems += '상속이 끊기지 않았어요' }
+    foreach ($r in $Summary.Rules) {
+        if ($r.Sid -ne $UserSid -and $r.Sid -ne $script:GyeotSystemSid) {
+            $problems += "다른 주체가 남았어요: $(Get-GyeotSidName $r.Sid) ($($r.Type) $($r.Rights))"
+        } elseif ($r.Type -ne 'Allow') {
+            $problems += "거부 항목이 있어요: $(Get-GyeotSidName $r.Sid)"
+        }
+    }
+    foreach ($sid in @($UserSid, $script:GyeotSystemSid)) {
+        $full = @($Summary.Rules | Where-Object { $_.Sid -eq $sid -and $_.Type -eq 'Allow' -and $_.Rights -match 'FullControl' })
+        if ($full.Count -eq 0) { $problems += "$(Get-GyeotSidName $sid) 에게 모든 권한이 없어요" }
+    }
+    if (-not (Test-GyeotTrustedOwner $Summary.Owner $UserSid)) {
+        $problems += "주인이 다른 사용자예요: $(Get-GyeotSidName $Summary.Owner)"
+    }
+    # 호출하는 쪽이 @(...)로 감싼다.
+    return $problems
+}
+
+function Format-GyeotAclSummary($Summary) {
+    $parts = @()
+    foreach ($r in $Summary.Rules) {
+        $how = '물려받음'
+        if (-not $r.Inherited) { $how = '직접' }
+        $parts += "$(Get-GyeotSidName $r.Sid) [$($r.Sid)] $($r.Type) $($r.Rights) ($how)"
+    }
+    $inherit = '상속 이어받음'
+    if ($Summary.Protected) { $inherit = '상속 끊김' }
+    return "$inherit; 허용: $($parts -join ', '); 주인: $(Get-GyeotSidName $Summary.Owner)"
+}
+
+# §13.4대로 좁힌다: icacls 로 상속을 끊고 그 사용자·SYSTEM만 남긴 뒤, 남은 다른 주체의 직접 항목을 빼고,
+# 이미 있던 하위 항목은 이 폴더만 이어받게 다시 맞춘다. 결과 요약을 돌려준다.
+function Set-GyeotFolderPrivate([string]$Folder, [string]$UserSid) {
+    $icacls = Get-GyeotIcaclsPath
+    $icaclsArgs = Get-GyeotIcaclsArgument $Folder $UserSid
+    $out = & $icacls @icaclsArgs
+    if ($LASTEXITCODE -ne 0) { throw "icacls 가 종료 코드 $LASTEXITCODE 로 끝났어요($Folder): $($out -join ' ')" }
+    $others = @((Get-GyeotAclSummary $Folder).Rules | Where-Object { $_.Sid -ne $UserSid -and $_.Sid -ne $script:GyeotSystemSid } |
+            ForEach-Object { $_.Sid } | Sort-Object -Unique)
+    foreach ($sid in $others) {
+        $out = & $icacls $Folder '/remove' "*$sid"
+        if ($LASTEXITCODE -ne 0) { throw "icacls /remove 가 종료 코드 $LASTEXITCODE 로 끝났어요($Folder, $sid): $($out -join ' ')" }
+    }
+    if (@(Get-ChildItem -LiteralPath $Folder -Force).Count -gt 0) {
+        $out = & $icacls (Join-Path $Folder '*') '/reset' '/T' '/C' '/Q'
+        if ($LASTEXITCODE -ne 0) { Write-GyeotWarn "하위 항목 일부의 권한을 다시 맞추지 못했어요(icacls 종료 코드 $LASTEXITCODE): $($out -join ' ')" }
+    }
+    return (Get-GyeotAclSummary $Folder)
+}
+
 # ───────────────────────── JSON ─────────────────────────
 # ConvertTo-Json은 PowerShell 판마다 들여쓰기·이스케이프가 달라서, 사용자의 settings.json을
 # 다시 쓸 때는 같은 모양을 내는 직렬화기를 쓴다(2칸 들여쓰기, UTF-8 그대로).

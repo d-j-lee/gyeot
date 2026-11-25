@@ -11,6 +11,7 @@ use tauri::webview::InvokeRequest;
 use tauri::{App, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::overlay::{self, AppConfig, OverlayState, RENEW_ERR};
+use crate::testing::{self, FakeDaemon, Hello};
 
 /// 대체 화면용 명령의 가짜(실제는 Wry 전용). ACL은 명령 이름과 출처로만 판정한다.
 #[tauri::command]
@@ -19,13 +20,15 @@ fn retry_connect(restart: Option<bool>) -> bool {
 }
 
 fn app() -> App<MockRuntime> {
+    // 데이터 폴더가 없으니 renew_session은 토큰을 읽는 데서 멈춘다(네트워크에 나가지 않는다).
+    app_with(47321, None)
+}
+
+/// 셸 설정(데몬 포트·데이터 폴더)을 준 가짜 앱. ACL은 페이지 출처로 판정하고, 명령은 이 설정으로 데몬에 묻는다.
+fn app_with(port: u16, data_dir: Option<std::path::PathBuf>) -> App<MockRuntime> {
     mock_builder()
         .manage(OverlayState::default())
-        // 데이터 폴더가 없으니 renew_session은 토큰을 읽는 데서 멈춘다(네트워크에 나가지 않는다).
-        .manage(AppConfig {
-            port: 47321,
-            data_dir: None,
-        })
+        .manage(AppConfig { port, data_dir })
         .invoke_handler(tauri::generate_handler![
             overlay::set_hit_rect,
             overlay::set_expanded,
@@ -291,4 +294,60 @@ fn empty_rect_clears_hit_area() {
         json!({ "x": 0, "y": 0, "width": 0, "height": 0 })
     ));
     assert!(app.state::<OverlayState>().hit_rect().is_none());
+}
+
+#[test]
+fn renew_session_sends_no_token_to_a_server_that_is_not_mine() {
+    let token = "8b".repeat(32);
+    let dir = testing::data_dir_with_token("acl-renew-notmine", &token);
+    for hello in [
+        Hello::Wrong,
+        Hello::OtherPort(token.clone()),
+        Hello::Status(404),
+    ] {
+        let fake = FakeDaemon::start(hello.clone());
+        let app = app_with(fake.port, Some(dir.clone()));
+        let win = window(&app, overlay::MAIN);
+        let e = renew_reached(&win, FACE).expect("얼굴은 부를 수 있다");
+        let seen = fake.finish();
+        assert!(
+            e.contains("이 포트의 서버는 내 곁 데몬이 아니에요"),
+            "{hello:?}: {e}"
+        );
+        assert!(!testing::token_sent(&seen, &token), "{hello:?}: {seen:?}");
+        assert!(app.state::<OverlayState>().auth_failed());
+        // 그 포트의 페이지를 닫고 셸의 대체 화면에 이유를 보인다.
+        let now = win.url().unwrap();
+        assert_eq!(
+            overlay::classify(&now, 47321),
+            overlay::Page::Error,
+            "{now}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn renewed_face_cannot_loop_through_renew_session() {
+    let token = "9c".repeat(32);
+    let dir = testing::data_dir_with_token("acl-renew-chain", &token);
+    let fake = FakeDaemon::start(Hello::Correct(token.clone()));
+    let app = app_with(fake.port, Some(dir.clone()));
+    let win = window(&app, overlay::MAIN);
+    // 확인한 데몬에서 새 코드를 받아 같은 창을 다시 연다.
+    assert_eq!(renew_reached(&win, FACE), Ok(String::new()));
+    // 다시 연 얼굴이 또 열쇠를 받지 못했다고 불러도 저절로 다시 열지 않는다.
+    let again = renew_reached(&win, FACE).unwrap();
+    assert!(again.contains("곁 열기"), "{again}");
+    let seen = fake.finish();
+    let boots = seen
+        .iter()
+        .filter(|s| s.first_line().starts_with("POST /v1/boot "))
+        .count();
+    assert_eq!(boots, 1, "부트 코드는 한 번만 받았다: {seen:?}");
+    assert!(
+        app.state::<OverlayState>().auth_failed(),
+        "곁 열기가 새 코드로 연다"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
