@@ -1733,7 +1733,11 @@ async fn rejections_read_body_before_answering() {
     let d = tempfile::tempdir().unwrap();
     let srv = TestServer::start(d.path()).await;
     let cases = [
-        ("Authorization: Bearer nope\r\n".to_owned(), srv.host(), "401"),
+        (
+            "Authorization: Bearer nope\r\n".to_owned(),
+            srv.host(),
+            "401",
+        ),
         (String::new(), "evil.example".to_owned(), "421"),
     ];
     for (auth, host, want) in cases {
@@ -1755,7 +1759,10 @@ async fn rejections_read_body_before_answering() {
         let _ = s.write_all(b"{}").await;
         let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
         let text = String::from_utf8_lossy(&buf);
-        assert!(text.starts_with(&format!("HTTP/1.1 {want}")), "응답: {text}");
+        assert!(
+            text.starts_with(&format!("HTTP/1.1 {want}")),
+            "응답: {text}"
+        );
     }
     srv.stop().await;
 }
