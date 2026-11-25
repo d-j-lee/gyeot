@@ -3,22 +3,26 @@
 //! 지키는 것: stdout에 아무것도 쓰지 않는다. 언제나 exit 0. 패닉하지 않는다(해도 삼킨다).
 //! 데몬과 주고받는 시간은 모두 합쳐 400ms 안이다.
 
+use gyeot_core::Source;
 use gyeot_core::paths::{HomeEnv, resolve_home, spool_file_name};
+use gyeot_core::sanitize_payload;
 use serde_json::{Map, Value, json};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 mod ppid;
 
 /// 읽는 입력의 최대 크기.
 const INPUT_MAX: usize = 1024 * 1024;
-/// 데몬 본문 한도(1 MiB)에 봉투 자리를 남긴 크기.
-const SEND_MAX: usize = INPUT_MAX - 4096;
 /// 데몬과 주고받는 데 쓰는 전체 시간.
 const NET_BUDGET: Duration = Duration::from_millis(400);
+/// 연결 단계에 쓰는 최대 시간. 살아 있는 루프백 연결은 1ms 안에 끝난다. Windows는 닫힌 루프백 포트로의
+/// 연결이 곧바로 실패하지 않아서(재시도) 이것이 없으면 데몬이 없을 때 [`NET_BUDGET`]을 다 쓴다.
+const CONNECT_BUDGET: Duration = Duration::from_millis(100);
 /// stdin이 닫히지 않을 때 기다리는 최대 시간(호스트가 잘못됐을 때만 걸린다).
 const STDIN_DEADLINE: Duration = Duration::from_millis(1000);
 /// 성공한 뒤 이어서 보내는 스풀 파일 수.
@@ -49,28 +53,38 @@ fn valid_source(s: &str) -> bool {
 }
 
 fn run(args: Vec<OsString>) {
+    let started = Instant::now();
     let Some(source) = args.first().and_then(|a| a.to_str()).map(str::to_owned) else {
         return;
     };
     if !valid_source(&source) {
         return;
     }
-    let payload = if source == "codex-notify" {
+    // 데몬이 받지 않는 source는 보낼 것도 스풀에 둘 것도 없다.
+    let Some(src) = Source::parse(&source).filter(|s| s.is_ingestible()) else {
+        return;
+    };
+    // 넘친 stdin은 이 값이 사라질 때(함수 끝) 마감 시각까지 끝까지 읽어 버린다.
+    let _stdin;
+    let raw = if src == Source::CodexNotify {
         match args.get(1..).and_then(<[OsString]>::last) {
             Some(a) => payload_from_arg(&a.to_string_lossy()),
             None => return,
         }
     } else {
-        match read_stdin(INPUT_MAX, STDIN_DEADLINE) {
-            Some((bytes, truncated)) if !bytes.is_empty() => {
-                match payload_from_bytes(&bytes, truncated) {
-                    Some(p) => p,
-                    None => return,
-                }
-            }
-            _ => return,
+        let input = read_stdin(INPUT_MAX, started + STDIN_DEADLINE);
+        let parsed = match &input.head {
+            Some((bytes, truncated)) if !bytes.is_empty() => payload_from_bytes(bytes, *truncated),
+            _ => None,
+        };
+        _stdin = input;
+        match parsed {
+            Some(p) => p,
+            None => return,
         }
     };
+    // 보내기 전·스풀에 쓰기 전에 줄인다(계약 §12.5).
+    let payload = sanitize_payload(src, &raw);
     let envelope = json!({
         "payload": payload,
         "pid_hint": ppid::agent_pid(),
@@ -123,23 +137,55 @@ fn read_token(path: &Path) -> Option<String> {
     (t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())).then(|| t.to_owned())
 }
 
-/// stdin을 `max`바이트까지 읽는다. (읽은 것, 넘쳐서 잘렸는가). 기한 안에 끝나지 않으면 `None`.
-fn read_stdin(max: usize, deadline: Duration) -> Option<(Vec<u8>, bool)> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
+/// 읽은 stdin. 사라질 때 나머지를 다 읽어 버릴 때까지(또는 마감 시각까지) 기다린다.
+struct StdinInput {
+    /// (앞 `max`바이트, 넘쳤는가). 마감 시각 안에 읽지 못했으면 `None`.
+    head: Option<(Vec<u8>, bool)>,
+    drained: Option<mpsc::Receiver<()>>,
+    deadline: Instant,
+}
+
+impl Drop for StdinInput {
+    fn drop(&mut self) {
+        if let Some(rx) = self.drained.take() {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            let _ = rx.recv_timeout(left);
+        }
+    }
+}
+
+/// stdin을 `max`바이트까지 읽는다. 넘치면 나머지는 EOF까지 읽어 버린다(호스트가 EPIPE를 받지 않게).
+fn read_stdin(max: usize, deadline: Instant) -> StdinInput {
+    let (tx, rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
         .name("stdin".into())
         .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut lock = stdin.lock();
             let mut buf = Vec::new();
-            let r = std::io::stdin()
-                .lock()
-                .take(max as u64 + 1)
-                .read_to_end(&mut buf);
+            let r = lock.by_ref().take(max as u64 + 1).read_to_end(&mut buf);
             let truncated = buf.len() > max;
             buf.truncate(max);
             let _ = tx.send(r.ok().map(|_| (buf, truncated)));
-        })
-        .ok()?;
-    rx.recv_timeout(deadline).ok().flatten()
+            if truncated {
+                let _ = std::io::copy(&mut lock, &mut std::io::sink());
+            }
+            let _ = done_tx.send(());
+        });
+    if spawned.is_err() {
+        return StdinInput {
+            head: None,
+            drained: None,
+            deadline,
+        };
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    StdinInput {
+        head: rx.recv_timeout(left).ok().flatten(),
+        drained: Some(done_rx),
+        deadline,
+    }
 }
 
 fn payload_from_arg(s: &str) -> Value {
@@ -149,18 +195,15 @@ fn payload_from_arg(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_owned()))
 }
 
-/// stdin 바이트 → 페이로드. 너무 크거나 잘렸으면 정규화에 쓰는 필드만 남긴다.
+/// stdin 바이트 → 원본 페이로드. 잘렸으면 최상위 문자열 필드를 건진다(줄이기는 그 뒤 [`sanitize_payload`]).
 fn payload_from_bytes(bytes: &[u8], truncated: bool) -> Option<Value> {
     if !truncated && let Ok(v) = serde_json::from_slice::<Value>(bytes) {
-        if bytes.len() <= SEND_MAX {
-            return Some(v);
-        }
-        return v.as_object().map(slim_object);
+        return Some(v);
     }
     salvage(bytes)
 }
 
-/// 정규화(코어 `normalize`)가 읽는 최상위 필드.
+/// 잘린 입력에서 건지는 최상위 문자열 필드(정규화가 읽는 것).
 const KEEP: [&str; 28] = [
     "session_id",
     "cwd",
@@ -191,66 +234,13 @@ const KEEP: [&str; 28] = [
     "command",
     "result",
 ];
-const KEEP_STR_MAX: usize = 8000;
-
-fn keep_tail(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        s.to_owned()
-    } else {
-        s.chars().skip(n - max).collect()
-    }
-}
-
-fn keep_head(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
-}
-
-fn slim_value(key: &str, v: &Value) -> Value {
-    match v {
-        // 마지막 응답은 끝(마지막 줄)이 질문 판단에 쓰이므로 뒤를 남긴다.
-        Value::String(s) if key.contains("last") => Value::String(keep_tail(s, KEEP_STR_MAX)),
-        // 프롬프트는 길이만 쓰인다. 본문 대신 같은 길이의 자리표시를 둔다.
-        Value::String(s) if key == "prompt" => {
-            Value::String("·".repeat(s.chars().count().min(100_000)))
-        }
-        Value::String(s) => Value::String(keep_head(s, KEEP_STR_MAX)),
-        Value::Object(o) => {
-            let mut m = Map::new();
-            for (k, x) in o.iter().take(20) {
-                match x {
-                    Value::String(s) => {
-                        m.insert(k.clone(), Value::String(keep_head(s, 2000)));
-                    }
-                    Value::Number(_) | Value::Bool(_) => {
-                        m.insert(k.clone(), x.clone());
-                    }
-                    _ => {}
-                }
-            }
-            Value::Object(m)
-        }
-        other => other.clone(),
-    }
-}
-
-fn slim_object(o: &Map<String, Value>) -> Value {
-    let mut m = Map::new();
-    for k in KEEP {
-        if let Some(v) = o.get(k) {
-            m.insert(k.to_owned(), slim_value(k, v));
-        }
-    }
-    Value::Object(m)
-}
-
 /// 잘린 JSON에서 최상위 문자열 필드를 건진다. `hook_event_name`이나 `type`이 없으면 버린다.
 fn salvage(bytes: &[u8]) -> Option<Value> {
     let text = String::from_utf8_lossy(bytes);
     let mut m = Map::new();
     for k in KEEP {
         if let Some(v) = find_string_field(&text, k) {
-            m.insert(k.to_owned(), slim_value(k, &Value::String(v)));
+            m.insert(k.to_owned(), Value::String(v));
         }
     }
     (m.contains_key("hook_event_name") || m.contains_key("type")).then_some(Value::Object(m))
@@ -301,17 +291,23 @@ impl Ctx {
     }
 }
 
-fn post(ctx: &Ctx, source: &str, body: &[u8]) -> bool {
-    let (Some(base), Some(token), Some(left)) = (&ctx.base, &ctx.token, ctx.remaining()) else {
-        return false;
-    };
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+/// 남은 시간 `left` 안에서만 기다리는 HTTP 손잡이. 연결 단계는 [`CONNECT_BUDGET`]까지만.
+fn agent_for(left: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
         .timeout_global(Some(left))
+        .timeout_connect(Some(left.min(CONNECT_BUDGET)))
         .proxy(None)
         .http_status_as_error(false)
         .max_redirects(0)
         .build()
-        .into();
+        .into()
+}
+
+fn post(ctx: &Ctx, source: &str, body: &[u8]) -> bool {
+    let (Some(base), Some(token), Some(left)) = (&ctx.base, &ctx.token, ctx.remaining()) else {
+        return false;
+    };
+    let agent = agent_for(left);
     let url = format!("{base}/v1/ingest/{source}");
     match agent
         .post(&url)
@@ -335,9 +331,25 @@ fn deliver(ctx: &Ctx, source: &str, envelope: &Value) {
     }
 }
 
-/// 스풀 파일로 쓴다(임시 파일 → 이름 바꾸기). 스풀이 가득 찼으면 버린다.
+/// 스풀 폴더를 만들고 사용자 전용으로 좁힌다(Unix 0700. Windows는 `%LOCALAPPDATA%` 권한을 이어받는다).
+fn ensure_private_dir(dir: &Path) -> Option<()> {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        b.mode(0o700);
+        b.create(dir).ok()?;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    b.create(dir).ok()?;
+    Some(())
+}
+
+/// 스풀 파일로 쓴다(임시 파일 → 이름 바꾸기, Unix 0600). 스풀이 가득 찼으면 버린다.
 fn spool(dir: &Path, source: &str, envelope: &Value) -> Option<PathBuf> {
-    fs::create_dir_all(dir).ok()?;
+    ensure_private_dir(dir)?;
     if fs::read_dir(dir).ok()?.take(SPOOL_CAP).count() >= SPOOL_CAP {
         return None;
     }
@@ -353,11 +365,14 @@ fn spool(dir: &Path, source: &str, envelope: &Value) -> Option<PathBuf> {
             continue;
         }
         let tmp = dir.join(format!("{name}.tmp"));
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .ok()?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp).ok()?;
         std::io::Write::write_all(&mut f, &bytes).ok()?;
         drop(f);
         if fs::rename(&tmp, &path).is_ok() {
@@ -481,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn big_payload_is_slimmed() {
+    fn big_payload_is_sanitized() {
         let big = "x".repeat(INPUT_MAX);
         let v = json!({
             "hook_event_name": "PostToolUse",
@@ -489,17 +504,25 @@ mod tests {
             "cwd": "/w",
             "tool_name": "Read",
             "tool_input": {"file_path": "/w/a.rs", "content": big.clone(), "n": 3, "arr": [1]},
-            "tool_response": {"content": big},
+            "tool_response": {"content": big.clone()},
         });
         let b = serde_json::to_vec(&v).unwrap();
-        let p = payload_from_bytes(&b, false).unwrap();
-        assert_eq!(p["hook_event_name"], "PostToolUse");
-        assert_eq!(p["tool_name"], "Read");
-        assert_eq!(p["tool_input"]["file_path"], "/w/a.rs");
-        assert_eq!(p["tool_input"]["n"], 3);
-        assert!(p.get("tool_response").is_none());
-        assert!(p["tool_input"].get("arr").is_none());
-        assert!(serde_json::to_vec(&p).unwrap().len() < SEND_MAX);
+        let raw = payload_from_bytes(&b, false).unwrap();
+        let p = sanitize_payload(Source::ClaudeCode, &raw);
+        assert_eq!(
+            p,
+            json!({"hook_event_name": "PostToolUse", "session_id": "s1", "cwd": "/w", "tool_name": "Read"})
+        );
+        let v = json!({
+            "hook_event_name": "PermissionRequest",
+            "session_id": "s1",
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/w/a.rs", "content": big},
+        });
+        let raw = payload_from_bytes(&serde_json::to_vec(&v).unwrap(), false).unwrap();
+        let p = sanitize_payload(Source::ClaudeCode, &raw);
+        assert_eq!(p["tool_input"], json!({"file_path": "/w/a.rs"}));
+        assert!(serde_json::to_vec(&p).unwrap().len() < 1000);
     }
 
     #[test]
@@ -513,18 +536,23 @@ mod tests {
         assert_eq!(p["cwd"], "C:\\work\\proj");
         assert_eq!(p["hook_event_name"], "Stop");
         assert_eq!(p["last_assistant_message"], "끝\n할까요?");
+        let clean = sanitize_payload(Source::ClaudeCode, &p);
+        assert!(clean.get("transcript_path").is_none());
+        assert_eq!(clean["last_assistant_message"], "끝\n할까요?");
         // 이름이 없으면 버린다
         assert_eq!(payload_from_bytes(br#"{"session_id":"abc"#, true), None);
     }
 
+    /// 연결 단계는 100ms(남은 시간이 더 짧으면 그만큼)까지만 기다린다.
     #[test]
-    fn last_message_keeps_tail_prompt_keeps_length() {
-        let long = format!("{}마지막 질문인가요?", "가".repeat(10_000));
-        let v = slim_value("last_assistant_message", &Value::String(long));
-        assert!(v.as_str().unwrap().ends_with("마지막 질문인가요?"));
-        let p = slim_value("prompt", &Value::String("비밀 프롬프트".into()));
-        assert_eq!(p.as_str().unwrap().chars().count(), 7);
-        assert!(!p.as_str().unwrap().contains("비밀"));
+    fn connect_phase_has_its_own_budget() {
+        assert_eq!(CONNECT_BUDGET, Duration::from_millis(100));
+        let t = agent_for(NET_BUDGET).config().timeouts();
+        assert_eq!(t.connect, Some(CONNECT_BUDGET));
+        assert_eq!(t.global, Some(NET_BUDGET));
+        let t = agent_for(Duration::from_millis(30)).config().timeouts();
+        assert_eq!(t.connect, Some(Duration::from_millis(30)));
+        assert_eq!(t.global, Some(Duration::from_millis(30)));
     }
 
     #[test]

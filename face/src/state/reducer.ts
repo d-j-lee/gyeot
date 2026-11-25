@@ -66,6 +66,8 @@ export interface AppState {
   budget: Budget | null;
   settings: Settings | null;
   chat: ChatMessage[];
+  /** 집중 모드·sleep 이라 말풍선 없이 들어온 Claude 답의 수(§12.4). 대화 탭을 보면 0. */
+  unreadReplies: number;
   lastDelivery: Delivery | null;
   deliverySeq: number;
 }
@@ -97,9 +99,20 @@ export function initialState(conn: ConnStatus = 'connecting'): AppState {
     budget: null,
     settings: null,
     chat: [],
+    unreadReplies: 0,
     lastDelivery: null,
     deliverySeq: 0,
   };
+}
+
+/**
+ * Claude 의 답을 조용히 받을 때인가(§12.4): 집중 모드가 아직 끝나지 않았거나(서버 시계로 잰다) 기분이 sleep.
+ * 그때 답은 말풍선을 띄우지 않고 대화 기록과 배지로만 보인다.
+ */
+export function quietReplies(state: AppState, localNowMs: number): boolean {
+  if (state.presence.mood === 'sleep') return true;
+  const until = state.presence.focus_mode_until_ms;
+  return until !== null && until > localNowMs + state.clockOffsetMs;
 }
 
 // ── 들어온 값 검사(데몬이 이상한 값을 보내도 화면이 무너지지 않게) ─────────
@@ -269,7 +282,8 @@ export function applyEvent(state: AppState, ev: SseEvent, receivedLocalMs: numbe
               : m,
           )
         : state.chat;
-      return { ...state, chat: capChat([...chat, msg]) };
+      const unreadReplies = quietReplies(state, receivedLocalMs) ? state.unreadReplies + 1 : state.unreadReplies;
+      return { ...state, chat: capChat([...chat, msg]), unreadReplies };
     }
     case 'proposal': {
       if (!isProposal(ev.data)) return state;
@@ -334,6 +348,7 @@ export type LocalAction =
   | { type: 'removeProposal'; id: string }
   | { type: 'chatAdd'; msg: ChatMessage }
   | { type: 'chatUpdate'; id: string; patch: Partial<ChatMessage> }
+  | { type: 'chatSeen' }
   | { type: 'focusUntil'; until_ms: number | null };
 
 export type Action = { type: 'sse'; ev: SseEvent; at?: number } | LocalAction;
@@ -379,6 +394,8 @@ export function reduce(state: AppState, action: Action): AppState {
         ...state,
         chat: state.chat.map((m) => (m.id === action.id ? { ...m, ...action.patch } : m)),
       };
+    case 'chatSeen':
+      return state.unreadReplies === 0 ? state : { ...state, unreadReplies: 0 };
     case 'focusUntil':
       return { ...state, presence: { ...state.presence, focus_mode_until_ms: action.until_ms } };
     default:

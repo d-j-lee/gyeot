@@ -570,6 +570,18 @@ kbd {
     0 0 0 2px #fff,
     var(--shadow-1);
 }
+/* 안 읽은 답(§12.4): 아바타 오른쪽 위의 작은 점 */
+.ov-unread {
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px #fff;
+  pointer-events: none;
+}
 
 .ov-bubble {
   position: absolute;
@@ -812,6 +824,41 @@ kbd {
   color: inherit;
 }
 
+/* 열쇠 만료(401) 안내 — 탭 위, 패널 폭 전체 */
+.auth-notice {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  margin: var(--s-2) var(--s-3) 0;
+  padding: 10px 12px;
+  border: 1px solid var(--warn-border);
+  border-radius: var(--r-lg);
+  background: var(--warn-soft);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.auth-notice > .icon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--warn);
+}
+.auth-notice__text {
+  flex: 1 1 14em;
+  margin: 0;
+}
+.auth-notice__text code {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0 4px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+.auth-notice .btn {
+  flex: none;
+}
+
 .tabs {
   display: flex;
   gap: 4px;
@@ -865,6 +912,11 @@ kbd {
 .tab__count--hot {
   background: #f2b544;
   color: #3d2a00;
+}
+/* 집중 모드에 말풍선 없이 들어온 답(§12.4) — 눈에 띄지 않게 */
+.tab__count--unread {
+  background: var(--accent-soft);
+  color: var(--accent-text);
 }
 
 .panel__body {

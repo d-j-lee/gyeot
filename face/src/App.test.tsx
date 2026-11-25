@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/preact';
 import { App } from './App.tsx';
 import { Controller } from './app/controller.ts';
 import { DemoBackend } from './demo/backend.ts';
 import { DEFAULT_PREFS } from './lib/prefs.ts';
-import { demoInterrupt } from './demo/data.ts';
+import { demoInterrupt, demoReply, demoSnapshot } from './demo/data.ts';
 import { resetTauriMemo } from './lib/tauri.ts';
 
 type TauriWin = Window & { __TAURI__?: { core: { invoke: ReturnType<typeof vi.fn> } } };
@@ -100,6 +100,81 @@ describe('오버레이', () => {
       await new Promise((r) => setTimeout(r, 5));
     });
     expect(screen.getByRole('tablist')).toBeTruthy();
+  });
+});
+
+describe('집중 모드의 답(§12.4)', () => {
+  const quiet = (ctl: Controller) =>
+    act(() => ctl.onEvent({ event: 'presence', data: { ...demoSnapshot(Date.now()).presence, mood: 'waiting', focus_mode_until_ms: Date.now() + 30 * 60_000 } }));
+  const LINE = 'vitest 설치 승인이 나면 바로 시험을 돌릴게요.';
+
+  it('오버레이: 말풍선 없이 아바타와 대화 탭에 배지, 대화 탭을 열면 지운다', () => {
+    const { ctl } = mount('overlay');
+    quiet(ctl);
+    act(() => ctl.onEvent({ event: 'reply', data: demoReply(Date.now()) }));
+    expect(screen.queryByText(LINE)).toBeNull();
+    const avatar = document.querySelector('.ov-avatar')!;
+    expect(avatar.querySelector('.ov-unread')).not.toBeNull();
+    expect(avatar.getAttribute('aria-label')).toContain('안 읽은 답 1개');
+    fireEvent.click(avatar);
+    const chatTab = screen.getByRole('tab', { name: /대화/ });
+    expect(chatTab.querySelector('.tab__count--unread')?.textContent).toBe('1');
+    expect(document.querySelector('.ov-unread')).toBeNull(); // 펼치면 아바타 점은 거둔다(탭에 있다)
+    fireEvent.click(chatTab);
+    expect(chatTab.querySelector('.tab__count--unread')).toBeNull();
+    expect(ctl.state.get().unreadReplies).toBe(0);
+    expect(screen.getByText(/vitest 설치 승인이 나면/)).toBeTruthy(); // 기록에는 있다
+  });
+
+  it('기본 화면: 대화 탭에 배지, 집중이 아니면 전처럼 말풍선', () => {
+    const { ctl } = mount('default');
+    quiet(ctl);
+    act(() => ctl.onEvent({ event: 'reply', data: demoReply(Date.now()) }));
+    expect(document.querySelector('.bubble')).toBeNull();
+    expect(screen.getByRole('tab', { name: /대화/ }).querySelector('.tab__count--unread')?.textContent).toBe('1');
+    act(() => ctl.onEvent({ event: 'presence', data: { ...demoSnapshot(Date.now()).presence, mood: 'idle', focus_mode_until_ms: null } }));
+    act(() => ctl.onEvent({ event: 'reply', data: { ...demoReply(Date.now()), chat_id: 'm99', text: '두 번째 답' } }));
+    expect(screen.getAllByText('두 번째 답').length).toBeGreaterThan(0);
+    expect(document.querySelector('.bubble')).not.toBeNull();
+  });
+
+  it('대화 탭을 보고 있을 때 온 답은 배지를 남기지 않는다', () => {
+    const { ctl } = mount('default');
+    fireEvent.click(screen.getByRole('tab', { name: /대화/ }));
+    quiet(ctl);
+    act(() => ctl.onEvent({ event: 'reply', data: demoReply(Date.now()) }));
+    expect(document.querySelector('.tab__count--unread')).toBeNull();
+  });
+});
+
+const AUTH = { status: 'auth', attempt: 1, retryAt: null } as const;
+const AUTH_TEXT = '열쇠가 만료됐어요 — 트레이의 ‘곁 열기’를 누르거나 터미널에서 gyeotd --open을 실행하세요.';
+
+describe('열쇠가 만료됐을 때(§12.1-4)', () => {
+  it('기본 화면: 안내를 보이고, 명령은 코드로, 다시 확인은 다시 잇는다', () => {
+    const { ctl, backend } = mount('default');
+    const retry = vi.spyOn(backend, 'retryNow');
+    expect(screen.queryByText(/열쇠가 만료됐어요/)).toBeNull();
+    act(() => ctl.dispatch({ type: 'conn', conn: AUTH }));
+    const notice = document.querySelector('.auth-notice') as HTMLElement;
+    expect(notice).not.toBeNull();
+    expect(notice.getAttribute('role')).toBe('alert');
+    expect(notice.querySelector('.auth-notice__text')!.textContent).toBe(AUTH_TEXT);
+    expect(notice.querySelector('code')!.textContent).toBe('gyeotd --open');
+    fireEvent.click(within(notice).getByRole('button', { name: '다시 확인' }));
+    expect(retry).toHaveBeenCalledTimes(1);
+    act(() => ctl.dispatch({ type: 'conn', conn: { status: 'open', attempt: 0, retryAt: null } }));
+    expect(document.querySelector('.auth-notice')).toBeNull();
+  });
+
+  it('오버레이: 접혀 있어도 아바타가 오프라인으로 보이고 이름에 알린다, 펼치면 안내', () => {
+    const { ctl } = mount('overlay');
+    act(() => ctl.dispatch({ type: 'conn', conn: AUTH }));
+    const avatar = document.querySelector('.ov-avatar')!;
+    expect(avatar.classList.contains('ov-avatar--offline')).toBe(true);
+    expect(avatar.getAttribute('aria-label')).toContain('열쇠가 만료됐어요');
+    fireEvent.click(avatar);
+    expect(document.querySelector('.auth-notice .auth-notice__text')!.textContent).toBe(AUTH_TEXT);
   });
 });
 

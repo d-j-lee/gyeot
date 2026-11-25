@@ -294,6 +294,8 @@ struct SessionRec {
     last_prompt_ms: Option<i64>,
     ended: bool,
     channel: Option<String>,
+    /// 한 번이라도 `activity`를 냈는가(계약 §12.3). 내지 않은 세션은 승인 여부를 알 수 없다.
+    seen_activity: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1038,6 +1040,9 @@ impl Engine {
                 self.signal(&sid, sig, now, fx);
             }
             EventBody::Activity { tool } => {
+                if let Some(s) = self.sessions.get_mut(&sid) {
+                    s.seen_activity = true;
+                }
                 self.on_activity(&sid, tool.as_deref(), ts, now, fx);
             }
             EventBody::TaskDone { .. } => {
@@ -1437,6 +1442,7 @@ impl Engine {
                 last_prompt_ms: None,
                 ended: false,
                 channel: None,
+                seen_activity: false,
             },
         );
     }
@@ -1820,6 +1826,18 @@ impl Engine {
             return (Level::Ambient, why);
         }
         if s >= self.policy.interrupt_min && it.blocking && wait > INTERRUPT_WAIT_MS {
+            // 작업 신호가 없는 세션은 사람이 이미 승인했는지 알 수 없다(§12.3). 말풍선까지만.
+            if matches!(it.kind, ItemKind::Approval | ItemKind::Merge)
+                && !self
+                    .sessions
+                    .get(&it.session)
+                    .is_some_and(|x| x.seen_activity)
+            {
+                why.push(
+                    "이 세션은 작업 신호가 없어 승인 여부를 알 수 없어요 → 말풍선까지만".to_owned(),
+                );
+                return (Level::Nudge, why);
+            }
             why.push(format!(
                 "{}점 넘는 막힌 일이 2분 넘게 기다려요",
                 fmt_num(self.policy.interrupt_min)

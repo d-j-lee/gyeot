@@ -1,5 +1,6 @@
 //! 라우터·보안 검사·처리기(계약 §7)와 SSE(§8).
 
+use crate::auth::{self, BootCodes, Sessions};
 use crate::face;
 use crate::hub::{Channels, Hub, gyeot_event};
 use crate::store::{now_ms, random_hex};
@@ -40,6 +41,8 @@ pub const REPLY_MAX: usize = 16_000;
 pub const QUESTION_MAX: usize = 300;
 /// 결정 선택지 최대 길이(§10.1).
 pub const OPTION_MAX: usize = 60;
+/// 발급하지 않은 `chat_id`로 답했을 때(계약 §12.4).
+pub const NOT_ISSUED: &str = "발급하지 않은 chat_id";
 const RECEIVED_MAX_AGE_MS: i64 = 30 * 86_400_000;
 
 /// 처리기들이 함께 쓰는 상태.
@@ -57,6 +60,10 @@ pub struct Shared {
     pub channels: StdMutex<Channels>,
     /// 결정 id → 그 결정을 연 channel.
     pub decisions: StdMutex<HashMap<String, String>>,
+    /// 열린 부트 코드(§12.1).
+    pub boot: StdMutex<BootCodes>,
+    /// 얼굴 세션(§12.1).
+    pub sessions: StdMutex<Sessions>,
     /// 끝내기 신호.
     pub shutdown: watch::Receiver<bool>,
     chat_seq: AtomicU64,
@@ -69,6 +76,7 @@ impl Shared {
         token: String,
         face_dir: Option<PathBuf>,
         hub: Hub,
+        sessions: Sessions,
         shutdown: watch::Receiver<bool>,
     ) -> Shared {
         Shared {
@@ -78,9 +86,36 @@ impl Shared {
             hub: Mutex::new(hub),
             channels: StdMutex::new(Channels::default()),
             decisions: StdMutex::new(HashMap::new()),
+            boot: StdMutex::new(BootCodes::default()),
+            sessions: StdMutex::new(sessions),
             shutdown,
             chat_seq: AtomicU64::new(1),
         }
+    }
+
+    fn boot_codes(&self) -> std::sync::MutexGuard<'_, BootCodes> {
+        self.boot.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 세션 목록(끌 때 저장하려고 공개).
+    pub fn sessions(&self) -> std::sync::MutexGuard<'_, Sessions> {
+        self.sessions.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// `Authorization: Bearer <토큰>`이 맞는가(상수 시간 비교).
+    fn bearer_ok(&self, headers: &HeaderMap) -> bool {
+        bearer_token(headers).is_some_and(|t| ct_eq(t.as_bytes(), self.token.as_bytes()))
+    }
+
+    /// 살아 있는 세션 쿠키가 있는가(있으면 마지막 사용 시각을 갱신한다).
+    fn cookie_ok(&self, headers: &HeaderMap) -> bool {
+        let ids = auth::session_cookies(headers);
+        if ids.is_empty() {
+            return false;
+        }
+        let now = now_ms();
+        let mut s = self.sessions();
+        ids.into_iter().any(|id| s.validate(id, now))
     }
 
     fn channels(&self) -> std::sync::MutexGuard<'_, Channels> {
@@ -155,17 +190,17 @@ fn host_ok(host: Option<&str>, port: u16) -> bool {
     h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}")
 }
 
-fn is_tauri(origin: &str) -> bool {
-    matches!(
-        origin,
-        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
-    )
+/// 검사할 Host: `Host` 머리가 있으면 그것만 본다(읽을 수 없으면 `None` → 421). 없을 때만 요청줄의 주소.
+fn request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
+    match headers.get(header::HOST) {
+        Some(v) => v.to_str().ok(),
+        None => uri.authority().map(|a| a.as_str()),
+    }
 }
 
+/// 같은 출처만(계약 §7·§12.2). Tauri 출처도 받지 않는다.
 fn origin_ok(origin: &str, port: u16) -> bool {
-    origin == format!("http://127.0.0.1:{port}")
-        || origin == format!("http://localhost:{port}")
-        || is_tauri(origin)
+    origin == format!("http://127.0.0.1:{port}") || origin == format!("http://localhost:{port}")
 }
 
 /// 상수 시간 비교(길이는 숨기지 않는다. 토큰 길이는 공개된 64자다).
@@ -180,88 +215,70 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(d) == 0
 }
 
-fn presented_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    if let Some(v) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        && let Some((scheme, tok)) = v.trim().split_once(' ')
-        && scheme.eq_ignore_ascii_case("bearer")
-    {
-        out.push(tok.trim());
-    }
-    if let Some(q) = uri.query() {
-        for pair in q.split('&') {
-            if let Some(t) = pair.strip_prefix("t=") {
-                out.push(t);
-            }
-        }
-    }
-    out
+/// `Authorization: Bearer <토큰>`의 토큰. 쿼리 토큰(`?t=`)은 받지 않는다(계약 §7).
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, tok) = v.trim().split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| tok.trim())
 }
 
-fn cors(resp: &mut Response, origin: &str) {
-    let h = resp.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(origin) {
-        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
-    }
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("authorization, content-type"),
-    );
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, OPTIONS"),
-    );
-    h.insert(
-        header::ACCESS_CONTROL_MAX_AGE,
-        HeaderValue::from_static("600"),
-    );
-    h.append(header::VARY, HeaderValue::from_static("Origin"));
-}
-
-/// Host(421) → Origin(403) → 토큰(401, `/v1/*`만) 순으로 검사한다. Tauri 출처에만 CORS를 반사한다.
+/// Host(421) → Origin(403) → 인증 순으로 검사한다. CORS 헤더는 내지 않는다(같은 출처만).
+///
+/// - `/v1/boot`: Bearer만. 그 밖의 `/v1/*`: Bearer 또는 세션 쿠키(§7).
+/// - 얼굴 쪽 `GET`에 `?boot=`가 있으면 코드를 쓰고 세션을 연다(§12.1).
 async fn guard(State(st): State<St>, req: Request, next: Next) -> Response {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| req.uri().authority().map(|a| a.as_str()));
-    if !host_ok(host, st.port) {
+    if !host_ok(request_host(req.headers(), req.uri()), st.port) {
         return err(StatusCode::MISDIRECTED_REQUEST, "Host가 맞지 않아요");
     }
-    let origin = match req.headers().get(header::ORIGIN) {
-        None => None,
-        Some(v) => match v.to_str() {
-            Ok(o) if origin_ok(o, st.port) => Some(o.to_owned()),
+    if let Some(v) = req.headers().get(header::ORIGIN) {
+        match v.to_str() {
+            Ok(o) if origin_ok(o, st.port) => {}
             _ => return err(StatusCode::FORBIDDEN, "허용하지 않는 Origin이에요"),
-        },
-    };
-    let tauri = origin.as_deref().filter(|o| is_tauri(o)).map(str::to_owned);
-    if req.method() == Method::OPTIONS {
-        let mut r = StatusCode::NO_CONTENT.into_response();
-        if let Some(o) = &tauri {
-            cors(&mut r, o);
         }
-        return r;
     }
     let path = req.uri().path();
     if path == "/v1" || path.starts_with("/v1/") {
-        let authed = presented_token(req.headers(), req.uri())
-            .into_iter()
-            .any(|t| ct_eq(t.as_bytes(), st.token.as_bytes()));
+        let authed = if path == "/v1/boot" {
+            st.bearer_ok(req.headers())
+        } else {
+            st.bearer_ok(req.headers()) || st.cookie_ok(req.headers())
+        };
         if !authed {
-            let mut r = err(StatusCode::UNAUTHORIZED, "토큰이 없거나 맞지 않아요");
-            if let Some(o) = &tauri {
-                cors(&mut r, o);
-            }
-            return r;
+            return err(StatusCode::UNAUTHORIZED, "토큰이 없거나 맞지 않아요");
         }
+        return next.run(req).await;
     }
-    let mut r = next.run(req).await;
-    if let Some(o) = &tauri {
-        cors(&mut r, o);
+    if matches!(*req.method(), Method::GET | Method::HEAD)
+        && path != "/health"
+        && let Some((code, rest)) = req.uri().query().and_then(auth::take_boot)
+    {
+        return redeem_boot(&st, path, &code, &rest);
     }
+    next.run(req).await
+}
+
+/// `?boot=<코드>`: 맞으면 세션을 만들고 `Set-Cookie`와 함께 `boot`만 뺀 주소로 303. 아니면 안내 쪽(401).
+fn redeem_boot(st: &Shared, path: &str, code: &str, rest: &str) -> Response {
+    let now = now_ms();
+    if !st.boot_codes().redeem(code, now) {
+        return face::guidance(face::Guide::BadBootCode);
+    }
+    let id = match st.sessions().create(now) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!("세션을 만들지 못했어요: {e:#}");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "세션을 만들지 못했어요");
+        }
+    };
+    let mut r = StatusCode::SEE_OTHER.into_response();
+    let h = r.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&auth::redirect_location(path, rest)) {
+        h.insert(header::LOCATION, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&auth::set_cookie_value(&id)) {
+        h.insert(header::SET_COOKIE, v);
+    }
+    face::secure_headers(h, true);
     r
 }
 
@@ -271,6 +288,7 @@ pub fn router(st: St) -> Router {
         .route("/health", get(health))
         .route("/", get(index))
         .route("/index.html", get(index))
+        .route("/v1/boot", post(boot))
         .route("/v1/ingest/{source}", post(ingest))
         .route("/v1/state", get(state))
         .route("/v1/stream", get(stream))
@@ -301,8 +319,34 @@ async fn health() -> Response {
     )
 }
 
-async fn index(State(st): State<St>) -> Response {
-    face::index_response(st.face_dir.as_deref(), &st.token).await
+/// `GET /`: 세션 쿠키가 있으면 얼굴, 없으면 안내 쪽(401). 토큰은 어디에도 싣지 않는다.
+async fn index(State(st): State<St>, headers: HeaderMap) -> Response {
+    if !st.cookie_ok(&headers) {
+        return face::guidance(face::Guide::NoSession);
+    }
+    face::index_response(st.face_dir.as_deref()).await
+}
+
+/// `POST /v1/boot`(Bearer만): 120초 동안 한 번 쓸 수 있는 얼굴 열기 코드.
+async fn boot(State(st): State<St>) -> Response {
+    let now = now_ms();
+    let issued = st.boot_codes().issue(now);
+    match issued {
+        Ok((code, expires_ms)) => {
+            let url = format!("http://127.0.0.1:{}/?boot={code}", st.port);
+            let mut r = json_resp(
+                StatusCode::OK,
+                json!({ "code": code, "url": url, "expires_ms": expires_ms }),
+            );
+            r.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            r
+        }
+        Err(e) => {
+            tracing::error!("부트 코드를 만들지 못했어요: {e:#}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "코드를 만들지 못했어요")
+        }
+    }
 }
 
 async fn fallback(State(st): State<St>, method: Method, uri: Uri) -> Response {
@@ -313,7 +357,7 @@ async fn fallback(State(st): State<St>, method: Method, uri: Uri) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    face::static_response(st.face_dir.as_deref(), path, &st.token).await
+    face::static_response(st.face_dir.as_deref(), path).await
 }
 
 /// 심의 봉투 `{"payload", "pid_hint", "received_ms"}`를 벗긴다. 봉투가 아니면 본문 전체가 페이로드다.
@@ -499,7 +543,11 @@ async fn say(State(st): State<St>, body: Bytes) -> Response {
         Ok((session, cid)) => {
             let chat_id = st.new_chat_id();
             let msg = json!({ "chat_id": chat_id, "text": text, "kind": "say" }).to_string();
-            if st.channels().push(&cid, msg) {
+            let pushed = {
+                let mut ch = st.channels();
+                ch.push(&cid, msg) && ch.issue(&cid, &chat_id, now_ms())
+            };
+            if pushed {
                 json_resp(
                     StatusCode::OK,
                     json!({ "delivered_to": session, "reason": "channel에 넘겼어요", "chat_id": chat_id }),
@@ -551,7 +599,7 @@ async fn decision_choice(State(st): State<St>, Path(id): Path<String>, body: Byt
         [via_session, opener]
             .into_iter()
             .flatten()
-            .any(|cid| ch.push(&cid, msg.clone()))
+            .any(|cid| ch.push(&cid, msg.clone()) && ch.issue(&cid, &id, now))
     };
     if !delivered {
         return json_resp(
@@ -704,6 +752,10 @@ async fn ch_reply(State(st): State<St>, body: Bytes) -> Response {
     if b.text.chars().count() > REPLY_MAX {
         return err(StatusCode::BAD_REQUEST, "답 글은 16,000자까지예요");
     }
+    // 그 channel에 데몬이 발급한 chat_id만(계약 §12.4).
+    if !st.channels().was_issued(&b.cid, &b.chat_id, now_ms()) {
+        return err(StatusCode::BAD_REQUEST, NOT_ISSUED);
+    }
     let session = hub.engine.channel(&b.cid).and_then(|c| c.session);
     let project = session
         .as_deref()
@@ -774,6 +826,7 @@ async fn ch_decision(State(st): State<St>, body: Bytes) -> Response {
     );
     hub.ingest(ev, now);
     st.decisions().insert(decision_id.clone(), b.cid.clone());
+    st.channels().issue(&b.cid, &decision_id, now);
     json_resp(StatusCode::OK, json!({ "decision_id": decision_id }))
 }
 
@@ -913,12 +966,27 @@ mod tests {
         assert!(!host_ok(None, 47321));
         assert!(origin_ok("http://127.0.0.1:47321", 47321));
         assert!(origin_ok("http://localhost:47321", 47321));
-        assert!(origin_ok("tauri://localhost", 47321));
-        assert!(origin_ok("http://tauri.localhost", 47321));
-        assert!(origin_ok("https://tauri.localhost", 47321));
+        assert!(!origin_ok("tauri://localhost", 47321));
+        assert!(!origin_ok("http://tauri.localhost", 47321));
+        assert!(!origin_ok("https://tauri.localhost", 47321));
         assert!(!origin_ok("https://127.0.0.1:47321", 47321));
         assert!(!origin_ok("null", 47321));
         assert!(!origin_ok("http://evil.com", 47321));
+    }
+
+    #[test]
+    fn host_header_is_not_bypassed() {
+        let uri: Uri = "http://127.0.0.1:47321/health".parse().unwrap();
+        let mut h = HeaderMap::new();
+        // 머리가 없을 때만 요청줄의 주소
+        assert_eq!(request_host(&h, &uri), Some("127.0.0.1:47321"));
+        h.insert(
+            header::HOST,
+            HeaderValue::from_bytes(b"\xff127.0.0.1:47321").unwrap(),
+        );
+        assert_eq!(request_host(&h, &uri), None);
+        h.insert(header::HOST, HeaderValue::from_static("evil.example"));
+        assert_eq!(request_host(&h, &uri), Some("evil.example"));
     }
 
     #[test]
@@ -936,11 +1004,10 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("bearer  xyz "),
         );
-        let uri: Uri = "/v1/stream?a=1&t=qq".parse().unwrap();
-        assert_eq!(presented_token(&h, &uri), vec!["xyz", "qq"]);
-        let h = HeaderMap::new();
-        let uri: Uri = "/v1/state".parse().unwrap();
-        assert!(presented_token(&h, &uri).is_empty());
+        assert_eq!(bearer_token(&h), Some("xyz"));
+        h.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic xyz"));
+        assert_eq!(bearer_token(&h), None);
+        assert_eq!(bearer_token(&HeaderMap::new()), None);
     }
 
     #[test]

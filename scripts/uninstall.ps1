@@ -14,7 +14,7 @@
     데이터까지 모두(설치 폴더 전체) 지웁니다. 되돌릴 수 없습니다.
 
 .PARAMETER RemoveClaudeHooks
-    ~/.claude/settings.json 을 백업한 뒤 곁의 훅 항목만 뺍니다(다른 훅은 그대로).
+    ~/.claude/settings.json 을 백업한 뒤 곁의 훅 항목만 뺍니다(기본으로 넣는 PostToolBatch 포함, 다른 훅은 그대로).
 
 .PARAMETER ClaudeSettingsPath
     Claude Code 사용자 설정 파일. 기본값 ~/.claude/settings.json.

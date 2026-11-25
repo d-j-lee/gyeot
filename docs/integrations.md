@@ -5,7 +5,7 @@
 
 ## Claude Code — 훅 (구현)
 
-- 받는 이벤트: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Notification`, `PermissionRequest`, `Stop`, `StopFailure`, `SubagentStart`, `SubagentStop`, `PostToolUseFailure`, `TaskCompleted`, `PreCompact`, 그리고 선택으로 `PostToolBatch`(작업 중 표시용, 잦음).
+- 받는 이벤트(기본 13개): `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Notification`, `PermissionRequest`, `Stop`, `StopFailure`, `SubagentStart`, `SubagentStop`, `PostToolUseFailure`, `TaskCompleted`, `PreCompact`, `PostToolBatch`. `PostToolBatch`는 사람이 터미널에서 승인한 뒤 곁의 승인 대기를 닫는 신호다(G-025). 빼려면 `install.ps1 -NoActivityHook`.
 - 설정: `examples/claude-settings.hooks.json`. exec 형식이라 Windows에서 셸을 거치지 않는다. `"async": true`라 기다리지 않는다[문서: hooks 레퍼런스].
 - `Notification`의 `notification_type`으로 승인 대기(`permission_prompt`)와 입력 대기(`idle_prompt`·`agent_needs_input`·`elicitation_*`)를 가른다[문서].
 - 이미 쓰는 훅(fsmap·AOK ⑧·work-atlas)과 함께 둔다. Claude Code는 같은 이벤트의 훅을 모두 실행한다. 곁의 훅은 비동기라 다른 훅의 판정에 끼지 않는다.

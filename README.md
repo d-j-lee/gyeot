@@ -23,9 +23,10 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
    powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1           # %LOCALAPPDATA%\gyeot\bin 에 설치, 설정 조각만 출력
    ```
    - `-ApplyClaudeHooks`: `~/.claude/settings.json`을 백업한 뒤 곁의 훅만 더한다. 기존 훅(fsmap·AOK·work-atlas 등)은 그대로 두고, 여러 번 실행해도 결과가 같다.
+   - 기본 훅에는 `PostToolBatch`(도구 묶음이 끝날 때 한 번)가 들어 있다. 사람이 승인한 뒤 곁이 "아직 기다린다"고 오해하지 않게 하는 신호다. 빼려면 `-NoActivityHook`을 준다. 그러면 승인 대기는 말풍선까지만 올라가고 소리로 끼어들지 않는다.
    - `-RegisterStartup`: 로그인할 때 데몬을 창 없이 띄운다.
    - 지울 때는 `scripts\uninstall.ps1`을 쓴다. 데이터는 `-PurgeData`를 줄 때만 지운다.
-3. **띄우기**: `gyeot-shell`(투명 오버레이, 트레이, `Ctrl+Alt+Space`)을 실행한다. 셸 없이 브라우저로 `http://127.0.0.1:47321`을 열어도 된다.
+3. **띄우기**: `gyeot-shell`(투명 오버레이, 트레이, `Ctrl+Alt+Space`)을 실행한다. 셸 없이 쓰려면 `gyeotd --open`으로 브라우저에 연다(트레이 메뉴 "곁 열기"와 같다). 주소만 쳐서 열면 "열쇠가 없다"는 안내가 나온다. 얼굴 페이지는 토큰을 받지 않고, 이 명령이 만든 일회용 코드로 세션을 연다.
 
 ### Claude Code와 잇기
 
@@ -48,14 +49,15 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
 
 | 무엇 | 어디서 | 결과 |
 |---|---|---|
-| 코어·서버·데몬·훅 심 | Linux, `cargo test --workspace` | 173 통과. clippy `-D warnings` 0건, wasm32 빌드 확인 |
-| 얼굴 | Linux, vitest | 192 통과. 색 대비 WCAG AA 시험 포함 |
+| 코어·서버·데몬·훅 심 | Linux, `cargo test --workspace` | 199 통과. clippy `-D warnings` 0건(Linux·Windows 대상), wasm32 빌드 확인 |
+| 얼굴 | Linux, vitest | 252 통과. 색 대비 WCAG AA, 쿠키 인증·401 처리, 가짜 데몬(mock)의 보안 규칙 포함 |
 | channel | Linux, vitest(묶은 파일을 실제로 띄움) | 44 통과. Node 22 |
-| 셸 | Linux(WebKitGTK), cargo test | 41 통과. IPC 권한(ACL) 시험 포함. Windows 대상 clippy 0건 |
-| 설치 스크립트 | pwsh 7.4 | 87 통과 |
-| **끝-끝(가짜 없음)** | Linux, `tests/e2e/e2e.mjs` | 39/39. 실제 데몬·훅 심·channel·얼굴(Chrome)을 이음 |
-| Windows 빌드·시험·끝-끝·설치본 | GitHub Actions(windows-latest) | CI가 확인한다 |
-| 실제 Claude Code 훅·channel, WebView2 음성, 클릭 통과 체감 | 사용자 Windows | **실측 전** — `docs/roadmap.md` F1–F8 |
+| 셸 | Linux(WebKitGTK), cargo test | 54 통과. IPC 권한(ACL)·부트 흐름 시험 포함. Windows 대상 clippy 0건 |
+| 설치 스크립트 | pwsh 7.4 | 104 통과 |
+| **끝-끝(가짜 없음)** | Linux, `tests/e2e/e2e.mjs` | 53/53. 실제 데몬·훅 심·channel·얼굴(Chrome)을 이음. 부트 코드·쿠키·CSP·스풀 줄이기 포함 |
+| Windows 빌드·시험·끝-끝·설치본 | GitHub Actions(windows-latest) | v0.1(커밋 e763a11) 모두 통과, 끝-끝 39/39. 이번 판은 아래 CI 결과를 본다 |
+| 독립 적대 검증 | 작업 맥락을 모르는 에이전트 | R1 발견 12건(높음 2·중간 4) 모두 고침. 기록은 `docs/field-notes.md` |
+| 실제 Claude Code 훅·channel, WebView2 쿠키·음성, 클릭 통과 체감 | 사용자 Windows | **실측 전** — `docs/roadmap.md` F1–F11 |
 
 변이 시험(고친 동작을 되돌리면 시험이 실패하는지)을 부품마다 돌렸다. 기록은 `docs/field-notes.md`에 있다.
 

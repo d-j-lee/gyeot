@@ -7,50 +7,26 @@ import type {
   Snapshot,
 } from '../types.ts';
 
-const DEV_TOKEN_KEY = 'gyeot-dev-token';
-export const DEFAULT_DAEMON = 'http://127.0.0.1:47321';
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
 /**
- * 토큰 찾기: ① 데몬이 채운 <meta name="gyeot-token"> ② 개발용 ?t= (읽은 뒤 주소창에서 지운다)
- * ③ 같은 탭에서 앞서 받은 개발용 토큰(sessionStorage).
+ * API 주소(§12.1-5). 배포 빌드는 늘 같은 출처('')다 — 데몬이 얼굴을 직접 내보내고, 셸도 데몬 주소를 연다(§12.2).
+ * 개발 빌드(`import.meta.env.DEV`)에서만 `?api=` 를 받되, 루프백 http 주소일 때만 그 출처를 쓴다.
+ * 쿠키는 같은 출처로만 실으므로 다른 출처를 가리키면 401 이 난다. 개발 서버에서는 프록시(같은 출처)를 쓴다.
  */
-export function resolveToken(doc: Document = document, loc: Location = location, store?: Storage | null): string {
-  const storage = store === undefined ? safeSession() : store;
-  const meta = doc.querySelector('meta[name="gyeot-token"]')?.getAttribute('content')?.trim() ?? '';
-  if (meta) return meta;
-  const url = new URL(loc.href);
-  const t = url.searchParams.get('t')?.trim() ?? '';
-  if (t) {
-    try {
-      storage?.setItem(DEV_TOKEN_KEY, t);
-      url.searchParams.delete('t');
-      history.replaceState(history.state, '', url.pathname + url.search + url.hash);
-    } catch {
-      /* 저장이 막혀도 이번 화면에서는 쓴다 */
-    }
-    return t;
-  }
-  return storage?.getItem(DEV_TOKEN_KEY)?.trim() ?? '';
-}
-
-function safeSession(): Storage | null {
+export function resolveApiBase(loc: Pick<Location, 'href'> = location, dev: boolean = import.meta.env.DEV): string {
+  // 배포 빌드에서는 import.meta.env.DEV 가 false 로 박혀 아래가 통째로 빠진다(dev 를 넘겨도 못 켠다).
+  if (!import.meta.env.DEV || !dev) return '';
+  const raw = new URL(loc.href).searchParams.get('api');
+  if (!raw) return '';
+  let api: URL;
   try {
-    return typeof sessionStorage === 'undefined' ? null : sessionStorage;
+    api = new URL(raw);
   } catch {
-    return null;
+    return '';
   }
-}
-
-/**
- * API 주소: ?api= 가 있으면 그것, Tauri 묶음(tauri://, tauri.localhost)에서 열렸으면 데몬 기본 주소,
- * 그 밖에는 같은 출처(데몬이 얼굴을 직접 내보낸다).
- */
-export function resolveApiBase(loc: Location = location): string {
-  const url = new URL(loc.href);
-  const api = url.searchParams.get('api');
-  if (api) return api.replace(/\/+$/, '');
-  if (url.protocol === 'tauri:' || url.hostname === 'tauri.localhost') return DEFAULT_DAEMON;
-  return '';
+  if (api.protocol !== 'http:' || api.username || api.password || !LOOPBACK_HOSTS.has(api.hostname)) return '';
+  return api.origin;
 }
 
 export class ApiError extends Error {
@@ -65,7 +41,7 @@ export class ApiError extends Error {
 /** 사람에게 보일 오류 문구. */
 export function describeError(e: unknown): string {
   if (e instanceof ApiError) {
-    if (e.status === 401) return '토큰이 맞지 않아요. 곁을 다시 열어 주세요';
+    if (e.status === 401) return '열쇠가 만료됐어요';
     if (e.status === 403 || e.status === 421) return '이 창의 출처를 데몬이 막았어요';
     if (e.status === 404) return '데몬이 이 요청을 모른대요(버전이 다를 수 있어요)';
     if (e.status >= 500) return '데몬 안에서 오류가 났어요';
@@ -75,9 +51,11 @@ export function describeError(e: unknown): string {
   return '곁 데몬에 닿지 않아요';
 }
 
+/**
+ * 데몬 API(§7). 인증은 같은 출처의 HttpOnly 세션 쿠키다(§12.1) — 얼굴은 토큰을 모르고, 머리글·주소에 싣지 않는다.
+ */
 export interface Api {
   readonly base: string;
-  readonly token: string;
   state(): Promise<Snapshot>;
   itemAction(id: string, action: ItemAction, opts?: { reason?: DismissReason; minutes?: number }): Promise<void>;
   focus(on: boolean, minutes?: number): Promise<FocusResult>;
@@ -88,18 +66,17 @@ export interface Api {
   streamUrl(): string;
 }
 
-export function createApi(base: string, token: string, fetchImpl: typeof fetch = (...a) => fetch(...a)): Api {
+export function createApi(base: string, fetchImpl: typeof fetch = (...a) => fetch(...a)): Api {
   async function call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 8_000);
     try {
       const res = await fetchImpl(base + path, {
         method,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        },
+        headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        // 쿠키는 같은 출처에만 싣는다(기본값이지만 분명히 적는다).
+        credentials: 'same-origin',
         signal: ctrl.signal,
         cache: 'no-store',
       });
@@ -113,7 +90,6 @@ export function createApi(base: string, token: string, fetchImpl: typeof fetch =
   const enc = encodeURIComponent;
   return {
     base,
-    token,
     state: () => call<Snapshot>('GET', '/v1/state'),
     async itemAction(id, action, opts = {}) {
       const body: Record<string, unknown> = { action };
@@ -130,7 +106,7 @@ export function createApi(base: string, token: string, fetchImpl: typeof fetch =
     async proposal(id, accept) {
       await call('POST', `/v1/proposals/${enc(id)}`, { accept });
     },
-    // EventSource 는 머리글을 못 붙여서 계약대로 ?t= 로 넘긴다.
-    streamUrl: () => `${base}/v1/stream?t=${enc(token)}`,
+    // 같은 출처 EventSource 는 쿠키를 싣는다. 주소에 비밀을 싣지 않는다(§7).
+    streamUrl: () => `${base}/v1/stream`,
   };
 }

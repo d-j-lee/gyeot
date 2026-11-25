@@ -43,15 +43,17 @@ afterEach(() => vi.useRealTimers());
 function start(probe?: () => Promise<'ok' | 'auth' | 'down'>) {
   const events: SseEvent[] = [];
   const statuses: ConnState[] = [];
+  const onAuthLost = vi.fn();
   const s = new EventStream({
-    url: () => '/v1/stream?t=x',
+    url: () => '/v1/stream',
     onEvent: (e) => events.push(e),
     onStatus: (c) => statuses.push(c),
     probe,
+    onAuthLost,
     EventSourceImpl: FakeES as unknown as typeof EventSource,
   });
   s.start();
-  return { s, events, statuses };
+  return { s, events, statuses, onAuthLost };
 }
 
 describe('다시 잇기 간격', () => {
@@ -90,15 +92,46 @@ describe('EventStream', () => {
     expect(FakeES.all[0]!.closed).toBe(true);
   });
 
-  it('토큰 문제면 auth 로 알리고 30초 뒤에 다시 본다', async () => {
-    const { statuses } = start(async () => 'auth');
+  it('열쇠 문제(401)면 auth 로 알리고 저절로 다시 잇지 않는다 — 지금 다시(retryNow)로만', async () => {
+    let probes = 0;
+    const { s, statuses, onAuthLost } = start(async () => {
+      probes += 1;
+      return 'auth';
+    });
     FakeES.all[0]!.fail();
     await vi.advanceTimersByTimeAsync(0);
-    expect(statuses.at(-1)?.status).toBe('auth');
-    await vi.advanceTimersByTimeAsync(29_999);
+    expect(statuses.at(-1)).toEqual({ status: 'auth', attempt: 1, retryAt: null });
+    expect(onAuthLost).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(FakeES.all).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(1);
+    expect(probes).toBe(1);
+    s.retryNow();
     expect(FakeES.all).toHaveLength(2);
+    FakeES.all[1]!.open();
+    expect(statuses.at(-1)?.status).toBe('open');
+  });
+
+  it('authLost() 는 열린 연결도 닫고 다시 잇지 않는다(API 가 401 을 받았을 때)', async () => {
+    const { s, statuses } = start(async () => 'down');
+    FakeES.all[0]!.open();
+    s.authLost();
+    expect(FakeES.all[0]!.closed).toBe(true);
+    expect(statuses.at(-1)).toMatchObject({ status: 'auth', retryAt: null });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(FakeES.all).toHaveLength(1);
+  });
+
+  it('원인을 가리는 동안 다시 이었으면, 늦게 온 판정은 버린다(겹친 연결 없음)', async () => {
+    let resolve: (r: 'down' | 'auth') => void = () => {};
+    const { s, statuses } = start(() => new Promise((r) => (resolve = r)));
+    FakeES.all[0]!.fail();
+    s.retryNow();
+    expect(FakeES.all).toHaveLength(2);
+    resolve('auth');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(FakeES.all).toHaveLength(2);
+    expect(FakeES.all[1]!.closed).toBe(false);
+    expect(statuses.some((c) => c.status === 'auth')).toBe(false);
   });
 
   it('지금 다시는 기다리지 않고 잇는다, stop 뒤에는 잇지 않는다', async () => {

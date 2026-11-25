@@ -109,6 +109,50 @@ describe('전달과 말풍선·소리', () => {
   });
 });
 
+describe('집중·잠잘 때의 답(§12.4)', () => {
+  const presence = (over: object) => ({ ...demoSnapshot(NOW).presence, ...over });
+
+  it('집중 모드면 reply 를 말풍선으로 띄우지 않고 대화 기록과 배지로만', () => {
+    const { ctl, backend } = setup();
+    backend.sink().event({ event: 'presence', data: presence({ mood: 'waiting', focus_mode_until_ms: Date.now() + 30 * 60_000 }) });
+    backend.sink().event({ event: 'reply', data: demoReply(NOW) });
+    expect(ctl.bubble.get()).toBeNull();
+    expect(ctl.state.get().chat).toHaveLength(1);
+    expect(ctl.state.get().unreadReplies).toBe(1);
+  });
+
+  it('기분이 sleep 이면 같다', () => {
+    const { ctl, backend } = setup();
+    backend.sink().event({ event: 'presence', data: presence({ mood: 'sleep', focus_mode_until_ms: null }) });
+    backend.sink().event({ event: 'reply', data: demoReply(NOW) });
+    expect(ctl.bubble.get()).toBeNull();
+    expect(ctl.state.get().unreadReplies).toBe(1);
+  });
+
+  it('집중 모드가 지났으면 전처럼 말풍선을 띄우고 배지는 없다', () => {
+    const { ctl, backend } = setup();
+    backend.sink().event({ event: 'presence', data: presence({ mood: 'idle', focus_mode_until_ms: Date.now() - 1_000 }) });
+    backend.sink().event({ event: 'reply', data: demoReply(NOW) });
+    expect(ctl.bubble.get()?.kind).toBe('reply');
+    expect(ctl.state.get().unreadReplies).toBe(0);
+  });
+
+  it('데몬이 정한 전달(nudge)은 이 규칙과 상관없이 그대로', () => {
+    const { ctl, backend } = setup();
+    backend.sink().event({ event: 'presence', data: presence({ mood: 'waiting', focus_mode_until_ms: Date.now() + 30 * 60_000 }) });
+    backend.sink().event({ event: 'deliver', data: demoNudge(NOW) });
+    expect(ctl.bubble.get()?.kind).toBe('nudge');
+  });
+
+  it('대화를 보면(markChatSeen) 배지를 지운다', () => {
+    const { ctl, backend } = setup();
+    backend.sink().event({ event: 'presence', data: presence({ mood: 'sleep' }) });
+    backend.sink().event({ event: 'reply', data: demoReply(NOW) });
+    ctl.markChatSeen();
+    expect(ctl.state.get().unreadReplies).toBe(0);
+  });
+});
+
 describe('낙관적 동작', () => {
   it('처리함은 바로 숨기고 성공하면 그대로 둔다', async () => {
     const { ctl, backend } = setup();
@@ -173,7 +217,7 @@ describe('낙관적 동작', () => {
     const { ctl: c2 } = setup({ focus: vi.fn(async () => Promise.reject(new ApiError(401, 'x'))) });
     await c2.setFocus(60);
     expect(c2.state.get().presence.focus_mode_until_ms).toBeNull();
-    expect(c2.toasts.get()[0]!.text).toContain('토큰');
+    expect(c2.toasts.get()[0]!.text).toContain('열쇠가 만료됐어요');
   });
 });
 

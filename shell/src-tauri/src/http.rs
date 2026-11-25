@@ -1,8 +1,11 @@
 //! 127.0.0.1 데몬 전용의 아주 작은 HTTP/1.1 클라이언트.
 //!
-//! 셸이 데몬에 묻는 것은 `GET /health`와 `POST /v1/focus` 둘뿐이라, TLS·프록시·리다이렉트가
-//! 필요 없다. 외부 HTTP 라이브러리 대신 표준 라이브러리만 쓴다. `Host`는 데몬의 DNS 리바인딩
-//! 검사(§7)를 통과하도록 늘 `127.0.0.1:<port>`로 보낸다.
+//! 셸이 데몬에 묻는 것은 `GET /health`, `POST /v1/boot`, `POST /v1/focus` 셋뿐이라, TLS·프록시·
+//! 리다이렉트가 필요 없다. 외부 HTTP 라이브러리 대신 표준 라이브러리만 쓴다.
+//!
+//! - `Host`는 데몬의 DNS 리바인딩 검사(§7)를 통과하도록 늘 `127.0.0.1:<port>`로 보낸다.
+//! - 토큰은 `Authorization: Bearer`로만 보낸다. 경로에 쿼리를 받지 않는다(URL에 비밀을 싣지 않는다).
+//! - `Origin` 머리는 보내지 않는다. 데몬은 Tauri 출처를 `403`으로 막는다(§12.2).
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -93,7 +96,8 @@ pub fn build_request(
     if method.is_empty() || !method.bytes().all(|b| b.is_ascii_uppercase()) {
         return Err(bad("메서드"));
     }
-    if !path.starts_with('/') || has_ctl(path) || path.contains(' ') {
+    // 셸의 요청에는 쿼리가 없다. `?t=<토큰>` 같은 꼴이 끼어들 길을 막는다.
+    if !path.starts_with('/') || has_ctl(path) || path.contains([' ', '?', '#']) {
         return Err(bad("경로"));
     }
     let mut req = format!(
@@ -256,6 +260,35 @@ mod tests {
     }
 
     #[test]
+    fn request_never_carries_query_token_or_origin() {
+        // 토큰은 Authorization 머리로만 보낸다. 셸 요청에는 쿼리(`?t=` 등)가 아예 없다(§7).
+        for path in [
+            "/v1/focus?t=abc",
+            "/v1/boot?t=",
+            "/?mode=overlay",
+            "/health#x",
+        ] {
+            assert!(
+                build_request(47321, "POST", path, Some("abc"), None).is_err(),
+                "{path}"
+            );
+        }
+        // Origin 머리는 보내지 않는다(데몬은 Tauri 출처를 403으로 막는다, §12.2).
+        for (method, path, bearer) in [
+            ("GET", "/health", None),
+            ("POST", "/v1/boot", Some("abc")),
+            ("POST", "/v1/focus", Some("abc")),
+        ] {
+            let r = build_request(47321, method, path, bearer, Some("{}")).unwrap();
+            assert!(!r.to_ascii_lowercase().contains("\r\norigin:"), "{r}");
+            assert!(
+                r.starts_with(&format!("{method} {path} HTTP/1.1\r\n")),
+                "{r}"
+            );
+        }
+    }
+
+    #[test]
     fn request_rejects_header_injection() {
         assert!(build_request(1, "GET", "/a\r\nX: y", None, None).is_err());
         assert!(build_request(1, "GET", "health", None, None).is_err());
@@ -327,6 +360,7 @@ mod tests {
         assert!(resp.body_text().contains("\"ok\":true"));
         let seen = server.join().unwrap();
         assert!(seen.contains(&format!("Host: 127.0.0.1:{port}\r\n")));
+        assert!(!seen.to_ascii_lowercase().contains("\norigin:"), "{seen}");
     }
 
     #[test]

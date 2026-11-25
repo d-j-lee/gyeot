@@ -95,6 +95,15 @@ impl TestServer {
         r.json()
     }
 
+    /// 요청 바이트를 그대로 보낸다(읽을 수 없는 머리 등).
+    pub async fn raw_bytes(&self, req: &[u8]) -> Resp {
+        let mut s = TcpStream::connect(self.addr).await.expect("connect");
+        s.write_all(req).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(10), s.read_to_end(&mut buf)).await;
+        Resp::parse(&buf)
+    }
+
     pub async fn raw(
         &self,
         method: &str,
@@ -121,11 +130,44 @@ impl TestServer {
         Resp::parse(&buf)
     }
 
-    /// SSE 스트림을 연다(토큰은 쿼리 `t`로).
+    /// SSE 스트림을 연다(토큰은 Authorization 머리로).
     pub async fn sse(&self, path: &str) -> Sse {
-        let sep = if path.contains('?') { '&' } else { '?' };
-        let full = format!("{path}{sep}t={}", self.token);
-        Sse::open(self.addr, &self.host(), &full, None).await
+        let auth = format!("Bearer {}", self.token);
+        Sse::open(self.addr, &self.host(), path, Some(&auth)).await
+    }
+
+    /// `POST /v1/boot`(Bearer)로 받은 응답 JSON.
+    pub async fn boot(&self) -> Value {
+        let r = self.post("/v1/boot", serde_json::json!({})).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        r.json()
+    }
+
+    /// 쿠키만 붙인 요청(토큰 없음).
+    pub async fn with_cookie(&self, method: &str, path: &str, cookie: &str) -> Resp {
+        let c = format!("gyeot_session={cookie}");
+        self.raw(
+            method,
+            path,
+            &[("Host", &self.host()), ("Cookie", &c)],
+            None,
+        )
+        .await
+    }
+
+    /// 부트 코드로 세션을 열고 쿠키 값을 돌려준다.
+    pub async fn open_session(&self) -> String {
+        let code = self.boot().await["code"].as_str().unwrap().to_owned();
+        let r = self
+            .raw(
+                "GET",
+                &format!("/?boot={code}"),
+                &[("Host", &self.host())],
+                None,
+            )
+            .await;
+        assert_eq!(r.status, 303, "{}", r.text());
+        cookie_of(&r).expect("Set-Cookie")
     }
 }
 
@@ -242,11 +284,23 @@ pub struct Sse {
 
 impl Sse {
     pub async fn open(addr: SocketAddr, host: &str, path: &str, auth: Option<&str>) -> Sse {
+        match auth {
+            Some(a) => Sse::open_with(addr, host, path, &[("Authorization", a)]).await,
+            None => Sse::open_with(addr, host, path, &[]).await,
+        }
+    }
+
+    pub async fn open_with(
+        addr: SocketAddr,
+        host: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Sse {
         let mut s = TcpStream::connect(addr).await.expect("connect");
         let mut req =
             format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: text/event-stream\r\n");
-        if let Some(a) = auth {
-            req.push_str(&format!("Authorization: {a}\r\n"));
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
         }
         req.push_str("\r\n");
         s.write_all(req.as_bytes()).await.unwrap();
@@ -344,6 +398,13 @@ impl Sse {
             }
         }
     }
+}
+
+/// `Set-Cookie: gyeot_session=<값>; …`의 값.
+pub fn cookie_of(r: &Resp) -> Option<String> {
+    let v = r.header("set-cookie")?;
+    let first = v.split(';').next()?.trim();
+    first.strip_prefix("gyeot_session=").map(str::to_owned)
 }
 
 pub fn hook(name: &str, session: &str, extra: Value) -> Value {

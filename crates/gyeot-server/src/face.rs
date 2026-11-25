@@ -1,59 +1,93 @@
-//! 얼굴 정적 파일: `index.html`에 토큰을 채워 보내고, 나머지는 폴더 밖으로 나가지 못하게 해서 보낸다.
+//! 얼굴 정적 파일과 안내 쪽(계약 §7·§12.1). 얼굴 쪽 응답에는 토큰을 싣지 않고 보안 머리를 붙인다.
 
 use axum::body::Body;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use regex::Regex;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
-fn meta_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(r#"(?i)<meta\b[^>]*\bname\s*=\s*["']gyeot-token["'][^>]*>"#).expect("meta regex")
-    })
-}
+/// 얼굴 쪽 응답의 `Content-Security-Policy`(계약 §7).
+pub const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
-fn head_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"(?i)<head\b[^>]*>").expect("head regex"))
-}
-
-/// `<meta name="gyeot-token" content="">`에 토큰을 채운다. 태그가 없으면 `<head>` 바로 뒤에 넣는다.
-pub fn inject_token(html: &str, token: &str) -> String {
-    let tag = format!(r#"<meta name="gyeot-token" content="{token}">"#);
-    if meta_re().is_match(html) {
-        return meta_re()
-            .replacen(html, 1, regex::NoExpand(&tag))
-            .into_owned();
+/// 얼굴 쪽 보안 머리. `no_store`면 `Cache-Control: no-store`도(index·안내 쪽·되돌려 보내기).
+pub fn secure_headers(h: &mut HeaderMap, no_store: bool) {
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if no_store {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
-    if let Some(m) = head_re().find(html) {
-        let mut out = String::with_capacity(html.len() + tag.len());
-        out.push_str(&html[..m.end()]);
-        out.push_str(&tag);
-        out.push_str(&html[m.end()..]);
-        return out;
-    }
-    format!("{tag}{html}")
 }
 
-fn html_response(body: String) -> Response {
-    let mut r = (StatusCode::OK, body).into_response();
+fn html_response(status: StatusCode, body: String) -> Response {
+    let mut r = (status, body).into_response();
     let h = r.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    h.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
+    secure_headers(h, true);
     r
+}
+
+const GUIDE_STYLE: &str = r#"<style>
+body{font-family:system-ui,-apple-system,"Malgun Gothic","Apple SD Gothic Neo",sans-serif;background:#F4EFE6;color:#3A3530;max-width:40rem;margin:3rem auto;padding:0 1.25rem;line-height:1.6}
+code{background:#E6DDCF;border-radius:6px;padding:.1rem .35rem}
+</style>"#;
+
+/// 안내 쪽의 까닭.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guide {
+    /// 세션 쿠키가 없거나 지났다.
+    NoSession,
+    /// 부트 코드가 틀렸거나 지났거나 이미 썼다.
+    BadBootCode,
+}
+
+/// 한국어 안내 쪽(`401`). 토큰·얼굴을 싣지 않는다.
+pub fn guidance(kind: Guide) -> Response {
+    let (title, lead) = match kind {
+        Guide::NoSession => (
+            "곁 — 열쇠가 필요해요",
+            "곁의 얼굴은 보안을 위해 이 주소만으로는 열리지 않아요. 열쇠(세션)가 없거나 30일이 지났어요.",
+        ),
+        Guide::BadBootCode => (
+            "곁 — 열기 코드가 맞지 않아요",
+            "열기 코드가 틀렸거나, 120초가 지났거나, 이미 쓴 코드예요. 코드는 한 번만 쓸 수 있어요.",
+        ),
+    };
+    let body = format!(
+        r#"<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+{GUIDE_STYLE}
+</head>
+<body>
+<h1>{title}</h1>
+<p>{lead}</p>
+<p>이렇게 열어 주세요.</p>
+<ul>
+<li>트레이(알림 영역)의 곁 아이콘에서 <strong>곁 열기</strong>를 누르세요.</li>
+<li>또는 터미널에서 <code>gyeotd --open</code>을 실행하세요(주소만 보려면 <code>gyeotd --open --print</code>).</li>
+</ul>
+<p>한 번 열면 이 브라우저에 열쇠가 30일 동안 남아요.</p>
+</body>
+</html>
+"#
+    );
+    html_response(StatusCode::UNAUTHORIZED, body)
 }
 
 /// 얼굴이 없을 때 보이는 안내 쪽.
@@ -84,18 +118,17 @@ npm run build</pre>
 </html>
 "#;
 
-/// `GET /`: 얼굴의 `index.html`(토큰을 채운 것) 또는 안내 쪽.
-pub async fn index_response(face_dir: Option<&Path>, token: &str) -> Response {
+/// `GET /`(세션 쿠키를 확인한 뒤): 얼굴의 `index.html` 그대로, 없으면 얼굴 없음 안내 쪽. 토큰을 싣지 않는다.
+pub async fn index_response(face_dir: Option<&Path>) -> Response {
     if let Some(dir) = face_dir {
         match tokio::fs::read(dir.join("index.html")).await {
             Ok(bytes) => {
-                let html = String::from_utf8_lossy(&bytes);
-                return html_response(inject_token(&html, token));
+                return html_response(StatusCode::OK, String::from_utf8_lossy(&bytes).into_owned());
             }
             Err(e) => tracing::warn!("{}/index.html을 읽지 못했어요: {e}", dir.display()),
         }
     }
-    html_response(BUILTIN_PAGE.to_owned())
+    html_response(StatusCode::OK, BUILTIN_PAGE.to_owned())
 }
 
 fn percent_decode(s: &str) -> Option<String> {
@@ -166,9 +199,14 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-/// 얼굴 폴더의 정적 파일 하나.
-pub async fn static_response(face_dir: Option<&Path>, url_path: &str, token: &str) -> Response {
-    let not_found = || (StatusCode::NOT_FOUND, "없는 파일이에요").into_response();
+/// 얼굴 폴더의 정적 파일 하나(쿠키 없이 받는다, 비밀 없음). 맨 위 `index.html`은 쿠키를 보는
+/// `GET /`·`GET /index.html`로만 보낸다(인코딩한 경로로 돌아 들어오지 못하게 여기서는 404).
+pub async fn static_response(face_dir: Option<&Path>, url_path: &str) -> Response {
+    let not_found = || {
+        let mut r = (StatusCode::NOT_FOUND, "없는 파일이에요").into_response();
+        secure_headers(r.headers_mut(), false);
+        r
+    };
     let Some(root) = face_dir else {
         return not_found();
     };
@@ -176,7 +214,7 @@ pub async fn static_response(face_dir: Option<&Path>, url_path: &str, token: &st
         return not_found();
     };
     if path.file_name().is_some_and(|n| n == "index.html") && path.parent() == Some(root) {
-        return index_response(Some(root), token).await;
+        return not_found();
     }
     let Ok(meta) = tokio::fs::metadata(&path).await else {
         return not_found();
@@ -194,10 +232,7 @@ pub async fn static_response(face_dir: Option<&Path>, url_path: &str, token: &st
         header::CONTENT_TYPE,
         HeaderValue::from_static(content_type(&path)),
     );
-    h.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
+    secure_headers(h, false);
     h.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(if immutable {
@@ -214,29 +249,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn injects_into_existing_meta() {
-        let t = "a".repeat(64);
-        for html in [
-            r#"<html><head><meta name="gyeot-token" content=""></head></html>"#,
-            r#"<html><head><meta name="gyeot-token" content="" /></head></html>"#,
-            r#"<html><head><META content='' NAME='gyeot-token'></head></html>"#,
-        ] {
-            let out = inject_token(html, &t);
-            assert!(
-                out.contains(&format!(r#"<meta name="gyeot-token" content="{t}">"#)),
-                "{out}"
-            );
-            assert_eq!(out.matches("gyeot-token").count(), 1);
+    fn guidance_pages_are_korean_401_without_secrets() {
+        for g in [Guide::NoSession, Guide::BadBootCode] {
+            let r = guidance(g);
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+            let h = r.headers();
+            assert_eq!(h[header::CONTENT_SECURITY_POLICY], CSP);
+            assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
+            assert_eq!(h[header::CACHE_CONTROL], "no-store");
         }
-    }
-
-    #[test]
-    fn injects_after_head_or_prepends() {
-        let out = inject_token("<html><HEAD lang=x><title>x</title></head></html>", "tok");
-        assert!(out.starts_with(r#"<html><HEAD lang=x><meta name="gyeot-token" content="tok">"#));
-        assert!(inject_token("<p>x</p>", "tok").starts_with("<meta"));
-        // `$`가 들어 있어도 그대로 넣는다
-        assert!(inject_token(r#"<meta name="gyeot-token" content="">"#, "$1").contains("\"$1\""));
     }
 
     #[test]

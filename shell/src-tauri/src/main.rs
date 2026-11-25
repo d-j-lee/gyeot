@@ -3,7 +3,8 @@
 //! UI만 맡는 얇은 껍데기다(G-002). 서버는 따로 사는 `gyeotd`가 맡고, 셸은
 //!
 //! - 데몬이 없으면 창 없이 띄우고,
-//! - 데몬이 서빙하는 얼굴(`/?mode=overlay`)을 투명·항상 위 창에 띄우고,
+//! - 토큰으로 일회용 부트 코드를 받아 데몬이 서빙하는 얼굴(`/?mode=overlay`)을 투명·항상 위 창에
+//!   띄우고(세션 쿠키, docs/contracts.md §12.1),
 //! - 얼굴이 알려 준 영역에서만 클릭을 받으며,
 //! - 트레이·전역 단축키(Ctrl+Alt+Space)를 제공한다.
 
@@ -39,9 +40,9 @@ fn main() {
     );
 
     let app = tauri::Builder::default()
-        // 하나만 뜬다. 두 번째 실행은 기존 창을 보이게 하고 끝난다(반드시 첫 플러그인).
+        // 하나만 뜬다. 두 번째 실행은 "곁 열기"처럼 기존 창을 보이고 끝난다(반드시 첫 플러그인).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            overlay::show(app);
+            overlay::open(app);
         }))
         .plugin(
             tauri_plugin_autostart::Builder::new()
@@ -58,6 +59,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             overlay::set_hit_rect,
             overlay::set_expanded,
+            overlay::renew_session,
             overlay::retry_connect
         ])
         .setup(move |app| {

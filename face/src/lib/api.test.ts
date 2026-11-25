@@ -1,78 +1,104 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, createApi, describeError, resolveApiBase, resolveToken, DEFAULT_DAEMON } from './api.ts';
-
-function docWithMeta(content: string | null): Document {
-  const doc = document.implementation.createHTMLDocument('t');
-  if (content !== null) {
-    const m = doc.createElement('meta');
-    m.setAttribute('name', 'gyeot-token');
-    m.setAttribute('content', content);
-    doc.head.appendChild(m);
-  }
-  return doc;
-}
-
-function memStorage(): Storage {
-  const m = new Map<string, string>();
-  return {
-    get length() {
-      return m.size;
-    },
-    clear: () => m.clear(),
-    getItem: (k) => m.get(k) ?? null,
-    key: (i) => [...m.keys()][i] ?? null,
-    removeItem: (k) => void m.delete(k),
-    setItem: (k, v) => void m.set(k, String(v)),
-  };
-}
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { ApiError, createApi, describeError, resolveApiBase } from './api.ts';
 
 const loc = (href: string) => new URL(href) as unknown as Location;
 
-afterEach(() => {
-  history.replaceState(null, '', '/');
-});
-
-describe('토큰 찾기', () => {
-  it('데몬이 채운 meta 를 먼저 쓴다', () => {
-    expect(resolveToken(docWithMeta('a'.repeat(64)), loc('http://127.0.0.1:47321/?t=dev'), memStorage())).toBe('a'.repeat(64));
+describe('열쇠(§12.1) — 얼굴은 토큰을 받지 않는다', () => {
+  it('index.html 에 토큰 meta 가 없다', () => {
+    const html = readFileSync(resolve(process.cwd(), 'index.html'), 'utf8'); // vitest 의 root = face/
+    expect(html).not.toMatch(/gyeot-token/i);
   });
 
-  it('meta 가 비었으면 ?t= 를 쓰고 기억한 뒤 주소창에서 지운다', () => {
-    history.replaceState(null, '', '/?mode=overlay&t=dev');
-    const store = memStorage();
-    expect(resolveToken(docWithMeta(''), location, store)).toBe('dev');
-    expect(location.search).toBe('?mode=overlay');
-    // 새로 고쳐도 같은 탭이면 기억한 토큰을 쓴다
-    expect(resolveToken(docWithMeta(''), location, store)).toBe('dev');
-  });
-
-  it('아무것도 없으면 빈 문자열', () => {
-    expect(resolveToken(docWithMeta(null), loc('http://x/'), memStorage())).toBe('');
+  it('토큰을 읽는 함수를 내보내지 않는다', async () => {
+    const mod: Record<string, unknown> = await import('./api.ts');
+    expect(mod.resolveToken).toBeUndefined();
   });
 });
 
-describe('API 주소', () => {
-  it('같은 출처가 기본, ?api= 로 바꾸고, Tauri 묶음이면 데몬 기본 주소', () => {
-    expect(resolveApiBase(loc('http://127.0.0.1:47321/'))).toBe('');
-    expect(resolveApiBase(loc('http://localhost:5173/?api=http://127.0.0.1:47399/'))).toBe('http://127.0.0.1:47399');
-    expect(resolveApiBase(loc('http://tauri.localhost/?mode=overlay'))).toBe(DEFAULT_DAEMON);
+describe('API 주소(§12.1-5)', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('배포 빌드는 ?api= 를 무시하고 늘 같은 출처', () => {
+    for (const href of [
+      'http://127.0.0.1:47321/',
+      'http://127.0.0.1:47321/?api=http://127.0.0.1:47399/',
+      'http://127.0.0.1:47321/?api=http://evil.example/',
+      'http://127.0.0.1:47321/?mode=overlay&api=http://localhost:1/',
+    ]) {
+      expect(resolveApiBase(loc(href), false)).toBe('');
+    }
+  });
+
+  it('기본값은 import.meta.env.DEV 를 따른다(배포 빌드 흉내)', () => {
+    vi.stubEnv('DEV', false);
+    expect(resolveApiBase(loc('http://127.0.0.1:47321/?api=http://127.0.0.1:47399/'))).toBe('');
+    vi.stubEnv('DEV', true);
+    expect(resolveApiBase(loc('http://127.0.0.1:5173/?api=http://127.0.0.1:47399/'))).toBe('http://127.0.0.1:47399');
+  });
+
+  it('배포 빌드(DEV=false)에서는 dev=true 를 넘겨도 무시한다 — 분기가 통째로 빠진다', () => {
+    vi.stubEnv('DEV', false);
+    expect(resolveApiBase(loc('http://127.0.0.1:47321/?api=http://127.0.0.1:47399/'), true)).toBe('');
+  });
+
+  it('개발 빌드는 루프백 http 주소일 때만 받고, 출처만 남긴다', () => {
+    const dev = (api: string) => resolveApiBase(loc(`http://127.0.0.1:5173/?api=${encodeURIComponent(api)}`), true);
+    expect(dev('http://127.0.0.1:47399/')).toBe('http://127.0.0.1:47399');
+    expect(dev('http://localhost:47399/some/path?x=1')).toBe('http://localhost:47399');
+    expect(dev('http://[::1]:47399')).toBe('http://[::1]:47399');
+    expect(dev('http://127.0.0.1')).toBe('http://127.0.0.1');
+  });
+
+  it('개발 빌드라도 루프백 http 가 아니면 같은 출처', () => {
+    const dev = (api: string) => resolveApiBase(loc(`http://127.0.0.1:5173/?api=${encodeURIComponent(api)}`), true);
+    for (const bad of [
+      'http://evil.example:47321',
+      'http://127.0.0.1.evil.example',
+      'http://localhost.evil.example',
+      'http://127.0.0.1@evil.example/',
+      'http://127.0.0.2:47321',
+      'http://0.0.0.0:47321',
+      'https://127.0.0.1:47321',
+      'ws://127.0.0.1:47321',
+      'javascript:alert(1)',
+      '//127.0.0.1:47321',
+      '/v1',
+      'not a url',
+    ]) {
+      expect(dev(bad), bad).toBe('');
+    }
+  });
+
+  it('Tauri 출처에서 열려도 데몬 주소로 바꾸지 않는다(§12.2, 셸은 데몬 주소를 직접 연다)', () => {
+    expect(resolveApiBase(loc('http://tauri.localhost/?mode=overlay'), false)).toBe('');
+    expect(resolveApiBase(loc('tauri://localhost/?mode=overlay'), true)).toBe('');
   });
 });
 
 describe('요청(§7)', () => {
   function api(status = 200, body: unknown = { ok: true }) {
     const fetchImpl = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), { status }));
-    return { a: createApi('http://d', 'tok', fetchImpl as unknown as typeof fetch), fetchImpl };
+    return { a: createApi('http://d', fetchImpl as unknown as typeof fetch), fetchImpl };
   }
 
-  it('모든 요청에 Bearer 토큰, 본문은 JSON', async () => {
+  it('토큰 머리글 없이 같은 출처 쿠키로 인증한다, 본문은 JSON', async () => {
     const { a, fetchImpl } = api();
     await a.itemAction('it_1', 'dismiss', { reason: '과민' });
+    await a.state();
     const [url, init] = fetchImpl.mock.calls[0]!;
     expect(url).toBe('http://d/v1/items/it_1/action');
     expect(init!.method).toBe('POST');
-    expect((init!.headers as Record<string, string>).Authorization).toBe('Bearer tok');
+    expect(init!.credentials).toBe('same-origin');
+    expect(init!.headers).toEqual({ 'Content-Type': 'application/json' });
     expect(JSON.parse(init!.body as string)).toEqual({ action: 'dismiss', reason: '과민' });
+    const [, getInit] = fetchImpl.mock.calls[1]!;
+    expect(getInit!.credentials).toBe('same-origin');
+    expect(getInit!.headers).toEqual({});
+    for (const [, i] of fetchImpl.mock.calls) {
+      expect(JSON.stringify(i!.headers)).not.toMatch(/authorization/i);
+    }
   });
 
   it('경로와 본문이 계약과 같다', async () => {
@@ -100,14 +126,15 @@ describe('요청(§7)', () => {
     ]);
   });
 
-  it('EventSource 주소는 ?t= 로 토큰을 싣는다', () => {
-    expect(createApi('', 'a b').streamUrl()).toBe('/v1/stream?t=a%20b');
+  it('EventSource 주소에 토큰(?t=)을 싣지 않는다 — 같은 출처라 쿠키가 실린다', () => {
+    expect(createApi('').streamUrl()).toBe('/v1/stream');
+    expect(createApi('http://127.0.0.1:47399').streamUrl()).toBe('http://127.0.0.1:47399/v1/stream');
   });
 
   it('실패 상태는 ApiError, 문구는 한국어', async () => {
     const { a } = api(401);
     await expect(a.state()).rejects.toBeInstanceOf(ApiError);
-    expect(describeError(new ApiError(401, ''))).toContain('토큰');
+    expect(describeError(new ApiError(401, ''))).toBe('열쇠가 만료됐어요');
     expect(describeError(new ApiError(421, ''))).toContain('출처');
     expect(describeError(new TypeError('x'))).toBe('곁 데몬에 닿지 않아요');
   });

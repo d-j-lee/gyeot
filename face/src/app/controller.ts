@@ -1,7 +1,7 @@
 import type { DismissReason, ItemAction, SayResult, SseEvent } from '../types.ts';
 import type { Backend } from './backend.ts';
 import { Observable } from './observable.ts';
-import { initialState, reduce, type Action, type AppState, type ConnStatus } from '../state/reducer.ts';
+import { initialState, quietReplies, reduce, type Action, type AppState, type ConnStatus } from '../state/reducer.ts';
 import { BubbleQueue, bubbleFromDelivery, bubbleFromReply, type Bubble } from '../lib/bubble.ts';
 import { describeError } from '../lib/api.ts';
 import { playChime } from '../lib/audio.ts';
@@ -78,7 +78,8 @@ export class Controller {
 
   /** SSE 이벤트 하나 — 상태에 넣고, 말풍선·소리 같은 곁가지 일을 한다. */
   onEvent(ev: SseEvent): void {
-    this.dispatch({ type: 'sse', ev, at: Date.now() });
+    const at = Date.now();
+    this.dispatch({ type: 'sse', ev, at });
     const s = this.state.get();
     switch (ev.event) {
       case 'deliver': {
@@ -87,6 +88,8 @@ export class Controller {
         break;
       }
       case 'reply': {
+        // 집중 모드·sleep 이면 말풍선 없이 대화 기록과 배지로만(§12.4). 배지는 리듀서가 센다.
+        if (quietReplies(s, at)) break;
         const b = bubbleFromReply(ev.data);
         if (b) this.queue.push(b);
         break;
@@ -127,6 +130,11 @@ export class Controller {
 
   holdBubble(source: string, on: boolean): void {
     this.queue.hold(source, on);
+  }
+
+  /** 사람이 대화 탭을 봤다 — 안 읽은 답 배지를 지운다. */
+  markChatSeen(): void {
+    if (this.state.get().unreadReplies > 0) this.dispatch({ type: 'chatSeen' });
   }
 
   // ── 당신 차례 동작(낙관적, 실패하면 되돌림) ──

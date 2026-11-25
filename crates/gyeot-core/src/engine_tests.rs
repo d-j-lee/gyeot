@@ -813,6 +813,8 @@ fn waiting_line_counts_blocking_items() {
 #[test]
 fn delivery_nudge_then_interrupt_after_two_minutes() {
     let mut h = H::new();
+    // 작업 신호를 낸 세션(§12.3)
+    h.apply(tool(T0 - 10 * SEC, "Read"));
     let fx = h.apply(perm_prompt(T0));
     let d = deliveries(&fx);
     assert_eq!(d[0].level, Level::Nudge);
@@ -834,6 +836,101 @@ fn delivery_nudge_then_interrupt_after_two_minutes() {
     assert_eq!(h.e.presence().level, Level::Interrupt);
     // 한 번 승격하면 다시 판단하지 않는다
     assert!(deliveries(&h.tick(T0 + 30 * MIN)).is_empty());
+}
+
+const NO_ACTIVITY_LINE: &str = "이 세션은 작업 신호가 없어 승인 여부를 알 수 없어요 → 말풍선까지만";
+
+/// R1 H2(계약 §12.3): `activity`를 한 번도 내지 않은 세션의 승인·병합은 대기로 소리까지 올리지 않는다.
+#[test]
+fn approval_without_activity_never_interrupts() {
+    let mut h = H::new();
+    let fx = h.apply(perm_prompt(T0));
+    assert_eq!(deliveries(&fx)[0].level, Level::Nudge);
+    // 2분이 지나도, 한참 지나도 소리로 올리지 않는다
+    assert!(deliveries(&h.tick(T0 + 2 * MIN + 1)).is_empty());
+    assert!(deliveries(&h.tick(T0 + 30 * MIN)).is_empty());
+    assert_eq!(h.e.presence().level, Level::Nudge);
+    assert_eq!(h.e.snapshot(T0 + 30 * MIN).budget.interrupt, 1);
+
+    // 늦게 온(스풀) 승인 대기: 처음 판단부터 2분 넘게 기다린 상태 → 이유 줄과 함께 말풍선
+    let mut h = H::new();
+    h.apply(hook_in(T0 + 5 * MIN, "other", "/w/o", 9, "Stop", json!({})));
+    let fx = h.apply(perm_prompt(T0));
+    let d = deliveries(&fx);
+    assert_eq!(d.len(), 1, "{fx:?}");
+    assert_eq!(d[0].level, Level::Nudge);
+    assert!(!d[0].speak);
+    assert!(
+        d[0].reasons.iter().any(|r| r == NO_ACTIVITY_LINE),
+        "{:?}",
+        d[0].reasons
+    );
+
+    // 작업 신호를 낸 적이 있는 세션은 그대로 소리 후보
+    let mut h = H::new();
+    h.apply(tool(T0 - 10 * SEC, "Read"));
+    h.apply(perm_prompt(T0));
+    let d = deliveries(&h.tick(T0 + 2 * MIN + 1));
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].level, Level::Interrupt);
+    assert!(d[0].reasons.iter().all(|r| r != NO_ACTIVITY_LINE));
+}
+
+#[test]
+fn merge_without_activity_never_interrupts() {
+    let five_hours = 5 * 3_600_000;
+    let run = |with_activity: bool| {
+        let mut h = H::new();
+        if with_activity {
+            h.apply(tool(T0 - 10 * SEC, "Read"));
+        }
+        h.apply(perm_request(T0, "Bash", "git -C . push origin main"));
+        let mut all = deliveries(&h.tick(T0 + 11 * SEC));
+        assert_eq!(h.kinds(T0 + 11 * SEC), vec![ItemKind::Merge]);
+        let mut t = T0 + 11 * SEC;
+        while t < T0 + five_hours {
+            t += MIN;
+            all.extend(deliveries(&h.tick(t)));
+        }
+        all
+    };
+    let quiet = run(false);
+    assert!(!quiet.is_empty());
+    assert!(
+        quiet.iter().all(|d| d.level != Level::Interrupt),
+        "{quiet:?}"
+    );
+    let loud = run(true);
+    assert!(loud.iter().any(|d| d.level == Level::Interrupt), "{loud:?}");
+}
+
+/// `PostToolBatch`는 도구 이름이 없으니 그 세션의 승인·병합(도구를 아는 것도)을 닫는다(§12.3).
+#[test]
+fn post_tool_batch_closes_approval_and_merge() {
+    // 보강된(도구를 아는) 승인
+    let mut h = H::new();
+    h.apply(perm_request(T0, "Bash", "npm install"));
+    h.apply(perm_prompt(T0 + SEC));
+    assert_eq!(h.kinds(T0 + SEC), vec![ItemKind::Approval]);
+    let fx = h.apply(hook(T0 + 2 * SEC, "PostToolBatch", json!({})));
+    assert_eq!(removed(&fx), vec![item_id(S, ItemKind::Approval)]);
+    assert!(h.open(T0 + 2 * SEC).is_empty());
+
+    // 병합(보류 창이 지나 열린 것)
+    let mut h = H::new();
+    h.apply(perm_request(T0, "Bash", "gh pr merge 12 --squash"));
+    h.tick(T0 + 11 * SEC);
+    assert_eq!(h.kinds(T0 + 11 * SEC), vec![ItemKind::Merge]);
+    let fx = h.apply(hook(T0 + 12 * SEC, "PostToolBatch", json!({})));
+    assert_eq!(removed(&fx), vec![item_id(S, ItemKind::Merge)]);
+    assert!(h.open(T0 + 12 * SEC).is_empty());
+
+    // 보류 중인 병합 요청도 버린다(창이 지나도 열리지 않는다)
+    let mut h = H::new();
+    h.apply(perm_request(T0, "Bash", "git merge topic"));
+    h.apply(hook(T0 + 2 * SEC, "PostToolBatch", json!({})));
+    h.tick(T0 + 20 * SEC);
+    assert!(h.open(T0 + 20 * SEC).is_empty());
 }
 
 #[test]
@@ -882,6 +979,7 @@ fn stall_escalates_when_waiting_bonus_reaches_nudge_min() {
 #[test]
 fn delivery_in_focus_mode() {
     let mut h = H::new();
+    h.apply(tool(T0 - 10 * SEC, "Read"));
     h.focus(true, None, T0);
     assert_eq!(h.e.presence().focus_mode_until_ms, Some(T0 + 60 * MIN));
     let fx = h.apply(perm_prompt(T0 + SEC));
@@ -921,6 +1019,7 @@ fn delivery_in_quiet_hours() {
         ..Policy::default()
     };
     let mut h = H::with(p);
+    h.apply(hook(t, "PostToolUse", json!({"tool_name": "Read"})));
     let fx = h.apply(perm_prompt(t + MIN));
     let d = deliveries(&fx);
     assert_eq!(d[0].level, Level::Ambient);
@@ -978,6 +1077,15 @@ fn nudge_budget_four_then_refill() {
 #[test]
 fn interrupt_budget_downgrades() {
     let mut h = H::new();
+    h.apply(tool(T0 - 10 * SEC, "Read"));
+    h.apply(hook_in(
+        T0 - 10 * SEC,
+        "s2",
+        "/w/b",
+        2,
+        "PostToolUse",
+        json!({"tool_name": "Read"}),
+    ));
     h.apply(perm_prompt(T0));
     h.apply(hook_in(
         T0,
@@ -1395,6 +1503,19 @@ fn scenario(h: &mut H, tick_every: Option<i64>) {
         hook(T0 + 120 * MIN, "SessionEnd", json!({"reason": "exit"})),
         &mut t,
     );
+    // s5는 작업 신호 없이 승인만 기다린다(§12.3: 말풍선까지만)
+    step(
+        h,
+        hook_in(
+            T0 + 125 * MIN,
+            "s5",
+            "/w/e",
+            5,
+            "Notification",
+            json!({"notification_type": "permission_prompt", "message": "m"}),
+        ),
+        &mut t,
+    );
 }
 
 fn snapshot_json(e: &Engine, now: i64) -> Value {
@@ -1432,6 +1553,12 @@ fn replay_reproduces_state_exactly() {
     assert!(snap.items.iter().all(|i| i.session != S));
     assert!(snap.sessions.iter().all(|s| s.id != S));
     assert!(snap.sessions.iter().any(|s| s.id == "s3"));
+    assert!(
+        snap.items
+            .iter()
+            .any(|i| i.session == "s5" && i.kind == ItemKind::Approval)
+    );
+    assert_ne!(snap.presence.level, Level::Interrupt);
 
     // tick 간격이 달라도 같다(분 단위 tick, tick 없음)
     let mut coarse = H::new();

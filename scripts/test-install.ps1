@@ -45,6 +45,26 @@ function Invoke-GyeotScript([string]$Name, [string[]]$Arguments) {
     return $LASTEXITCODE
 }
 
+# 자식 스크립트의 표준 출력을 글로 받는다. install.ps1은 출력이 넘겨질 때 UTF-8로 쓰므로 여기서도 UTF-8로 읽는다.
+# 표준 오류는 받지 않는다(Windows PowerShell 5.1은 Stop 아래에서 넘겨받은 stderr 한 줄을 종료 오류로 바꾼다).
+function Invoke-GyeotScriptOutput([string]$Name, [string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
+    $exe = Get-GyeotPowerShellExe
+    Write-Host ''
+    Write-Host ">> $Name $($Arguments -join ' ')" -ForegroundColor Cyan
+    $prevEncoding = [Console]::OutputEncoding
+    try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { Write-Verbose "출력 인코딩을 바꾸지 못함: $($_.Exception.Message)" }
+    try {
+        $lines = & $exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $Name) @Arguments
+        $code = $LASTEXITCODE
+    } finally {
+        try { [Console]::OutputEncoding = $prevEncoding } catch { Write-Verbose "출력 인코딩을 되돌리지 못함: $($_.Exception.Message)" }
+    }
+    $text = ($lines | Out-String)
+    Write-Host $text
+    return @{ Code = $code; Text = $text }
+}
+
 function Read-GyeotTree([string]$Path) {
     return , (ConvertFrom-GyeotJsonText -Text (Read-GyeotTextFile $Path) -What $Path)
 }
@@ -80,6 +100,9 @@ $original = @'
     "PreToolUse": [
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "aok-guard pre-bash" } ] }
     ],
+    "PostToolBatch": [
+      { "hooks": [ { "type": "command", "command": "batch-logger" } ] }
+    ],
     "SessionStart": []
   },
   "statusLine": { "type": "command", "command": "echo hi" }
@@ -103,10 +126,12 @@ try {
     Assert-Gyeot ($null -ne $examples) 'examples\ 폴더를 찾았다'
     if ($examples) {
         $ex = Read-GyeotTree (Join-Path $examples 'claude-settings.hooks.json')
-        $want = @($script:GyeotClaudeEvents | ForEach-Object { $_.Name })
+        $want = @(Get-GyeotClaudeEventList | ForEach-Object { $_.Name })
         $got = @($ex['hooks'].Keys)
-        Assert-Gyeot ((($got | Sort-Object) -join ',') -eq (($want | Sort-Object) -join ',')) "Claude 견본 이벤트 = 설치 이벤트 ($($got -join ','))"
-        foreach ($ev in $script:GyeotClaudeEvents) {
+        Assert-Gyeot ((($got | Sort-Object) -join ',') -eq (($want | Sort-Object) -join ',')) "Claude 견본 이벤트 = 기본 설치 이벤트 ($($got -join ','))"
+        Assert-Gyeot ($want -contains 'PostToolBatch') '기본 설치 이벤트에 PostToolBatch가 있다(§12.3)'
+        Assert-Gyeot (-not (@(Get-GyeotClaudeEventList -NoActivity | ForEach-Object { $_.Name }) -contains 'PostToolBatch')) '-NoActivity 목록에는 PostToolBatch가 없다'
+        foreach ($ev in (Get-GyeotClaudeEventList)) {
             if (-not $ex['hooks'].Contains($ev.Name)) { continue }
             $grp = $ex['hooks'][$ev.Name][0]
             Assert-Gyeot ($grp.Contains('matcher') -eq [bool]$ev.Matcher) "Claude 견본 matcher 유무: $($ev.Name)"
@@ -130,8 +155,15 @@ try {
     Write-Host '== 2. 설치 + 훅 적용' -ForegroundColor White
     $args2 = $common + @('-ApplyClaudeHooks')
     if ($WithStartup) { $args2 += @('-RegisterStartup', '-NoStart') }
-    $code = Invoke-GyeotScript 'install.ps1' $args2
+    $run = Invoke-GyeotScriptOutput 'install.ps1' $args2
+    $code = $run.Code
     Assert-Gyeot ($code -eq 0) "설치 종료 코드 0 (받은 값 $code)"
+    Assert-Gyeot ($run.Text -match 'gyeotd\.exe"? --open') '설치 출력이 얼굴 여는 법(gyeotd --open)을 알려 준다'
+    if ($run.Text -match '설치를 마쳤어요') {
+        Assert-Gyeot ($run.Text -match '곁 열기') "설치 출력이 트레이의 '곁 열기'를 알려 준다"
+    } else {
+        Write-Host '  skip 이 콘솔에서 자식 출력의 한국어를 읽지 못해 문구 확인을 건너뜀' -ForegroundColor Yellow
+    }
     foreach ($f in @('bin\gyeotd.exe', 'bin\gyeot-hook.exe', 'bin\face\index.html', 'scripts\uninstall.ps1', 'scripts\gyeot-common.ps1',
             'snippets\claude-settings.hooks.json', 'snippets\codex-hooks.json', 'snippets\codex-config.notify.toml', 'snippets\mcp.json')) {
         Assert-Gyeot (Test-Path -LiteralPath (Join-GyeotTestPath $root $f)) "설치됨: $f"
@@ -145,10 +177,15 @@ try {
     }
     $hookExe = Join-GyeotTestPath $root 'bin\gyeot-hook.exe'
     $tree = Read-GyeotTree $settings
-    foreach ($ev in $script:GyeotClaudeEvents) {
+    foreach ($ev in (Get-GyeotClaudeEventList)) {
         Assert-Gyeot ((Get-GyeotHookCount -Settings $tree -EventName $ev.Name) -eq 1) "곁 훅 1개: $($ev.Name)"
     }
-    Assert-Gyeot ((Get-GyeotHookCount -Settings $tree -EventName 'PostToolBatch') -eq 0) 'PostToolBatch는 기본으로 넣지 않는다'
+    Assert-Gyeot ((Get-GyeotHookCount -Settings $tree -EventName 'PostToolBatch') -eq 1) 'PostToolBatch는 기본으로 넣는다(승인 뒤 대기를 닫음)'
+    $batch = $tree['hooks']['PostToolBatch']
+    Assert-Gyeot ($batch.Count -eq 2 -and $batch[0]['hooks'][0]['command'] -eq 'batch-logger') 'PostToolBatch: 기존 묶음이 그대로(첫 자리) + 곁 묶음'
+    Assert-Gyeot ($batch.Count -eq 2 -and -not $batch[1].Contains('matcher')) 'PostToolBatch 곁 묶음에는 matcher가 없다'
+    $snip = Read-GyeotTree (Join-GyeotTestPath $root 'snippets\claude-settings.hooks.json')
+    Assert-Gyeot ($snip['hooks'].Contains('PostToolBatch')) '출력 조각에도 PostToolBatch가 있다'
     $stopGroups = $tree['hooks']['Stop']
     Assert-Gyeot ($stopGroups.Count -eq 2) 'Stop: 기존 묶음 + 곁 묶음'
     Assert-Gyeot ($stopGroups[0]['hooks'][0]['command'] -eq 'fsmap-hook stop') 'Stop: 기존 fsmap 훅이 그대로(첫 자리)'
@@ -189,19 +226,41 @@ try {
     Assert-Gyeot ((Get-GyeotFileHash $settings) -eq $afterFirst) '두 번째 적용은 settings.json을 바꾸지 않는다'
     Assert-Gyeot (@(Get-ChildItem -LiteralPath (Split-Path -Parent $settings) -Filter 'settings.json.bak-*').Count -eq 1) '바뀐 것이 없으면 백업도 더 만들지 않는다'
 
-    Write-Host '== 4. 작업 중 훅(PostToolBatch) 더하기' -ForegroundColor White
-    Start-Sleep -Seconds 1  # 백업 이름(초 단위)이 겹치지 않게
-    $code = Invoke-GyeotScript 'install.ps1' ($common + @('-ApplyClaudeHooks', '-IncludeActivityHook'))
-    Assert-Gyeot ($code -eq 0) "PostToolBatch 설치 종료 코드 0 (받은 값 $code)"
+    Write-Host '== 4. -NoActivityHook 은 곁의 PostToolBatch만 뺀다, 기본으로 되돌리면 다시 넣는다' -ForegroundColor White
+    # 사용자가 셸 형식으로 손수 고친 곁 훅(args 없음)은 -NoActivityHook 도 건드리지 않아야 한다.
     $tree = Read-GyeotTree $settings
-    Assert-Gyeot ((Get-GyeotHookCount -Settings $tree -EventName 'PostToolBatch') -eq 1) 'PostToolBatch 1개'
+    $handMade = 'C:\hand\gyeot-hook.exe claude-code'
+    $hand = New-GyeotDict
+    $hand['type'] = 'command'
+    $hand['command'] = $handMade
+    $tree['hooks']['SessionEnd'][0]['hooks'][0] = $hand
+    Write-GyeotTextFile -Path $settings -Text ((ConvertTo-GyeotJson $tree) + "`n")
+    Start-Sleep -Seconds 1  # 백업 이름(초 단위)이 겹치지 않게
+    $code = Invoke-GyeotScript 'install.ps1' ($common + @('-ApplyClaudeHooks', '-NoActivityHook'))
+    Assert-Gyeot ($code -eq 0) "-NoActivityHook 설치 종료 코드 0 (받은 값 $code)"
+    $tree = Read-GyeotTree $settings
+    $se = $tree['hooks']['SessionEnd']
+    Assert-Gyeot ($se.Count -eq 1 -and $se[0]['hooks'].Count -eq 1 -and $se[0]['hooks'][0]['command'] -eq $handMade -and -not $se[0]['hooks'][0].Contains('args')) '-NoActivityHook: 손수 고친 곁 훅(SessionEnd)은 그대로'
+
+    Assert-Gyeot ((Get-GyeotHookCount -Settings $tree -EventName 'PostToolBatch') -eq 0) '-NoActivityHook: 곁의 PostToolBatch 0개'
+    Assert-Gyeot ($tree['hooks']['PostToolBatch'].Count -eq 1 -and $tree['hooks']['PostToolBatch'][0]['hooks'][0]['command'] -eq 'batch-logger') '-NoActivityHook: 사용자의 PostToolBatch 훅은 그대로'
     Assert-Gyeot ((Get-GyeotHookCount -Settings $tree -EventName 'Stop') -eq 1) 'Stop은 여전히 1개'
+    $snip = Read-GyeotTree (Join-GyeotTestPath $root 'snippets\claude-settings.hooks.json')
+    Assert-Gyeot (-not $snip['hooks'].Contains('PostToolBatch')) '-NoActivityHook: 출력 조각에도 PostToolBatch가 없다'
+    $afterOptOut = Get-GyeotFileHash $settings
+    $code = Invoke-GyeotScript 'install.ps1' ($common + @('-ApplyClaudeHooks', '-NoActivityHook'))
+    Assert-Gyeot ($code -eq 0 -and (Get-GyeotFileHash $settings) -eq $afterOptOut) '-NoActivityHook 되풀이도 멱등'
+    Start-Sleep -Seconds 1
+    $code = Invoke-GyeotScript 'install.ps1' ($common + @('-ApplyClaudeHooks'))
+    $tree = Read-GyeotTree $settings
+    Assert-Gyeot ($code -eq 0 -and (Get-GyeotHookCount -Settings $tree -EventName 'PostToolBatch') -eq 1) '기본으로 다시 설치하면 PostToolBatch 1개'
+    Assert-Gyeot ($tree['hooks']['PostToolBatch'].Count -eq 2) 'PostToolBatch: 사용자 묶음 + 곁 묶음'
 
     Write-Host '== 5. 옛 경로의 곁 훅은 새 경로로 고친다' -ForegroundColor White
     $tree['hooks']['Stop'][1]['hooks'][0]['command'] = 'C:\old\place\gyeot-hook.exe'
     Write-GyeotTextFile -Path $settings -Text ((ConvertTo-GyeotJson $tree) + "`n")
     Start-Sleep -Seconds 1
-    $code = Invoke-GyeotScript 'install.ps1' ($common + @('-ApplyClaudeHooks', '-IncludeActivityHook'))
+    $code = Invoke-GyeotScript 'install.ps1' ($common + @('-ApplyClaudeHooks'))
     $tree = Read-GyeotTree $settings
     Assert-Gyeot ($code -eq 0 -and $tree['hooks']['Stop'][1]['hooks'][0]['command'] -eq $hookExe) 'Stop 곁 훅 경로를 새 경로로 고쳤다'
     Assert-Gyeot ((Get-GyeotHookCount -Settings $tree -EventName 'Stop') -eq 1) '고친 뒤에도 1개'
@@ -218,6 +277,7 @@ try {
     Assert-Gyeot ($left -eq 0) '곁 훅이 하나도 남지 않았다'
     Assert-Gyeot ($tree['hooks']['Stop'].Count -eq 1 -and $tree['hooks']['Stop'][0]['hooks'][0]['command'] -eq 'fsmap-hook stop') '기존 Stop 훅은 남았다'
     Assert-Gyeot ($tree['hooks']['PreToolUse'][0]['hooks'][0]['command'] -eq 'aok-guard pre-bash') '기존 PreToolUse 훅은 남았다'
+    Assert-Gyeot ($tree['hooks']['PostToolBatch'].Count -eq 1 -and $tree['hooks']['PostToolBatch'][0]['hooks'][0]['command'] -eq 'batch-logger') '기존 PostToolBatch 훅은 남고 곁 것만 빠졌다'
     # 원래 빈 배열이던 SessionStart 는 곁이 채웠다가 비우면서 키째 빠질 수 있다(누가 만든 키인지 알 수 없어서). 둘 다 허용.
     Assert-Gyeot ((-not $tree['hooks'].Contains('SessionStart')) -or $tree['hooks']['SessionStart'].Count -eq 0) 'SessionStart 에 곁 항목이 남지 않았다'
     Assert-Gyeot (-not $tree['hooks'].Contains('Notification')) '곁만 있던 이벤트(Notification)는 빠졌다'

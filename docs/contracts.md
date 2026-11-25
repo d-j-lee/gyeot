@@ -200,18 +200,24 @@ cwd = "C:/work/proj"
 
 ## 7. 로컬 HTTP API (`gyeot-server`)
 
-- 바인드는 `127.0.0.1`만. 요청 `Host`가 `127.0.0.1:<port>`·`localhost:<port>`가 아니면 `421`(DNS 리바인딩 방어).
-- `Origin` 헤더가 있으면 `http://127.0.0.1:<port>`·`http://localhost:<port>`·`tauri://localhost`·`http://tauri.localhost`·`https://tauri.localhost`만 허용, 그 밖은 `403`.
-- 인증: `Authorization: Bearer <토큰>` 또는 쿼리 `?t=<토큰>`(EventSource용). 상수 시간 비교. 실패 `401`.
-- 본문 최대 1 MiB. CORS 헤더는 내지 않는다(같은 출처만), 단 Tauri 출처에는 반사한다.
+- 바인드는 `127.0.0.1`만. 요청 `Host`가 `127.0.0.1:<port>`·`localhost:<port>`가 아니면 `421`(DNS 리바인딩 방어). `Host` 머리가 있는데 읽을 수 없으면(비UTF-8 등) 요청줄의 주소로 넘어가지 않고 `421`.
+- `Origin` 헤더가 있으면 `http://127.0.0.1:<port>`·`http://localhost:<port>`만 허용, 그 밖(`null`·Tauri 출처 포함)은 `403`. CORS 헤더는 내지 않는다(같은 출처만).
+- 인증은 둘 중 하나다. 쿼리 토큰(`?t=`)은 받지 않는다(URL에 비밀을 싣지 않는다).
+  - **토큰**: `Authorization: Bearer <토큰>`. 상수 시간 비교. 훅 심·channel·셸·`gyeotd --open`이 토큰 파일을 읽어 쓴다.
+  - **세션 쿠키**: 브라우저·셸 창의 얼굴용. `gyeot_session=<32바이트 hex>; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`. 일회용 부트 코드로만 발급한다(§12).
+  - 실패 `401`.
+- 본문 최대 1 MiB.
+- 얼굴 응답(`/`·`/assets/*`·안내 쪽)에는 `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`(index·안내 쪽)를 붙인다.
 
 | 메서드·경로 | 인증 | 본문 → 응답 |
 |---|---|---|
 | `GET /health` | 아니오 | `{"ok":true,"version":"0.1.0"}` |
-| `GET /` · `GET /assets/*` | 아니오 | 얼굴 정적 파일. `index.html`의 `<meta name="gyeot-token" content="">`에 토큰을 채워 보낸다(같은 출처·Host 검사로 보호) |
+| `GET /` | 쿠키 | 유효한 세션 쿠키가 있으면 얼굴 `index.html`(토큰을 싣지 않는다). 없으면 한국어 안내 쪽(`401`): "트레이의 곁 열기 또는 `gyeotd --open`". `?boot=<코드>`가 붙으면 §12 |
+| `GET /assets/*` | 아니오 | 얼굴 정적 파일(비밀 없음) |
+| `POST /v1/boot` | 토큰만 | → `{"code":str,"url":"http://127.0.0.1:<port>/?boot=<code>","expires_ms":n}`. 쿠키로는 부를 수 없다 |
 | `POST /v1/ingest/{source}` | 예 | 원본 페이로드 JSON. 심은 `{"payload":…, "pid_hint":n, "received_ms":n}` 봉투로 보낸다 → `202 {"accepted":k}` |
 | `GET /v1/state` | 예 | `Snapshot` |
-| `GET /v1/stream` | 예 | SSE(§8) |
+| `GET /v1/stream` | 예 | SSE(§8). 얼굴은 쿠키로, 그 밖은 Bearer로 |
 | `POST /v1/items/{id}/action` | 예 | `{"action":"open"\|"done"\|"dismiss"\|"snooze","reason"?:str,"minutes"?:n}` → `{"ok":true}` |
 | `POST /v1/focus` | 예 | `{"on":bool,"minutes"?:n}` → `{"ok":true,"until_ms":n\|null}` |
 | `POST /v1/presence/listening` | 예 | `{"on":bool}` → `{"ok":true}` |
@@ -327,3 +333,49 @@ cwd = "C:/work/proj"
 **셸·설치** (`shell/README.md`, `scripts/`)
 - 셸 로그는 `<데이터>\shell.log`, 설치 스크립트 사본은 `<데이터>\scripts\`, 출력한 설정 조각은 `<데이터>\snippets\`에 둔다.
 - 로그인 시작 작업의 이름은 `gyeot-daemon`, 레지스트리 Run 값의 이름은 `gyeotd`·`gyeot-shell`이다.
+
+## 12. 보안·정확성 개정 (2026-11-26, 독립 검증 R1 반영)
+
+### 12.1 얼굴 열기 — 일회용 부트 코드와 세션 쿠키 (R1 H1·M1·L3)
+
+얼굴 페이지에 토큰을 싣지 않는다. 같은 PC의 다른 사용자·프로세스나 다른 출처 페이지가 `GET /`로 토큰을 얻을 수 없게 하기 위해서다.
+
+1. 토큰을 가진 쪽(셸·`gyeotd --open`)이 `POST /v1/boot`(Bearer)로 코드를 받는다. 코드는 32바이트 난수 hex, **120초 동안 한 번만** 쓸 수 있다. 동시에 열린 코드는 최대 8개(넘으면 가장 오래된 것부터 버린다).
+2. 브라우저·셸 창이 `GET /<경로>?boot=<code>&…`를 연다. 코드가 맞으면 서버는 세션을 만들고 `303`으로 같은 경로·같은 쿼리에서 `boot`만 뺀 주소로 보낸다(`?mode=overlay`는 남는다). 이때 `Set-Cookie: gyeot_session=<64 hex>; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`를 단다. 코드가 틀리거나 지났거나 이미 썼으면 안내 쪽(`401`)을 보이고 쿠키를 달지 않는다(이미 유효한 쿠키가 있어도 같다). `/v1/*`·`/health`가 아닌 모든 경로(정적 파일 포함)에서 `boot`를 코드로 쓴다.
+   - `Location` 경로는 `/`로 시작하고 빈 조각(`//`)·점 조각(`.`·`..`)·`%`가 없을 때만 그대로 쓰고, 아니면 `/`로 보낸다. 점 조각을 정리하면 `//host`로 접혀 다른 호스트로 해석될 수 있어서다.
+3. 세션은 만든 때부터 30일 동안 쓸 수 있다(쿠키 `Max-Age`와 같다). 쓸 때마다 마지막 사용 시각을 갱신하되, 이 시각은 개수 상한에서 버릴 순서에만 쓴다(디스크에는 10분마다와 끌 때 쓴다). 세션은 최대 20개(넘으면 가장 오래 안 쓴 것부터 버린다). `<데이터>/sessions.json`에 **세션 값의 SHA-256만** 저장한다(파일이 새도 그대로 쓸 수 없다). Unix 권한 0600.
+4. 얼굴은 같은 출처 `fetch`·`EventSource`로 쿠키 인증을 쓴다. `401`을 받으면, 셸 안이면 IPC `renew_session`을 부르고, 브라우저면 "열쇠가 만료됐어요 — 트레이의 곁 열기 또는 `gyeotd --open`" 안내를 보인다.
+5. `?api=`(다른 API 주소)는 개발 빌드(`import.meta.env.DEV`)에서 루프백 주소일 때만 받는다. 배포 빌드는 늘 같은 출처다.
+
+`gyeotd --open [--print]`: 실행 중인 데몬에 `POST /v1/boot` 하고 기본 브라우저로 연다(`--print`면 주소만 출력). Windows는 `rundll32 url.dll,FileProtocolHandler <url>`, Linux는 `xdg-open`, macOS는 `open`.
+셸: 데몬이 건강해지면 `POST /v1/boot`로 코드를 받아 `http://127.0.0.1:<port>/?mode=overlay&boot=<code>`를 연다. 원격 IPC 허용 명령은 `set_hit_rect`·`set_expanded`·`renew_session` 셋이다. `renew_session`은 새 코드를 받아 같은 창을 다시 연다(30초에 한 번까지).
+
+### 12.2 Tauri 출처 허용 삭제 (R1 M2)
+셸은 데몬 주소를 직접 열므로 페이지 출처가 같은 출처다. 셸에 묶인 대체 화면은 데몬 API를 부르지 않는다. 그래서 Tauri 출처(`tauri://localhost`·`http(s)://tauri.localhost`)를 허용하지 않고, CORS 반사도 하지 않는다.
+
+### 12.3 승인 대기와 작업 신호 (R1 H2)
+- 기본 설치는 `PostToolBatch` 훅을 넣는다(병렬 도구 묶음이 끝나면 한 번, 승인 대기 중인 도구를 포함한다). 설치 스크립트의 `-NoActivityHook`을 주면 뺀다.
+- 코어: 한 번도 `activity`를 낸 적이 없는 세션은 사람이 승인했는지 알 수 없다. 그런 세션의 `approval`·`merge`는 대기 시간으로 `interrupt`까지 올리지 않는다(`nudge`가 최대). 이유 줄: "이 세션은 작업 신호가 없어 승인 여부를 알 수 없어요 → 말풍선까지만".
+- `PostToolBatch`는 병렬 도구 묶음의 모든 호출이 끝난 뒤, 다음 모델 호출 전에 한 번 온다(공식 hooks 레퍼런스, 2026-11-26 열람). 그 세션의 `approval`·`merge`를 닫는다. 입력의 `tool_calls`(도구마다 `tool_input`·`tool_response`가 들어 있다)는 심이 줄일 때 버리므로, 정규화는 이것을 도구 이름 없는 activity, 곧 G-016의 '알 수 없는 도구'로 본다.
+
+### 12.4 Claude의 답(reply) (R1 L1)
+- `/v1/channel/reply`는 그 channel에 데몬이 발급한 `chat_id`(say의 `m<n>`, 결정의 `d…`)만 받는다. 발급 뒤 24시간 안, channel마다 최근 256개. 그 밖은 `400 {"ok":false,"error":"발급하지 않은 chat_id"}`(다른 API 오류와 같은 모양). 검사 순서는 모르는 cid `404` → 꼴 `400` → 빈 글·길이 `400` → 발급 여부 `400`. 같은 id로 여러 번 답해도 된다. channel이 다시 등록되거나 데몬이 다시 뜨면 이전 cid에 발급한 id는 쓸 수 없다.
+- 얼굴: 집중 모드이거나 존재감이 `sleep`이면 reply를 말풍선으로 띄우지 않고 대화 탭 기록과 배지로만 보인다.
+
+### 12.5 훅 심의 스풀 (R1 M3·L6)
+- 심은 보내기 전에 페이로드를 줄인다(`gyeot_core::sanitize_payload`, 순수 함수). 이벤트마다 정규화가 읽는 필드만 남긴다.
+  - `prompt`는 글자 수가 같은 `x` 문자열로 바꾼다(정규화는 길이만 쓴다).
+  - 미리보기로만 쓰는 글(`message` 등)은 마스킹 → 공백 접기 → 4,000자로 자른다.
+  - `last_assistant_message`는 줄 구조가 질문 판단에 쓰이므로 마스킹만 한다. 4,000자가 넘으면 앞 2,000자와 끝 1,999자를 줄바꿈으로 잇는다.
+  - `tool_input`은 정규화가 미리보기로 고르는 필드 **하나**만 남긴다(예: Bash는 `command`). 고를 필드가 없으면(MCP 도구 등) `tool_input` JSON을 마스킹해 300자로 자른 글로 바꾼다. activity 이벤트(`PreToolUse`·`PostToolUse`·`PostToolBatch`)는 `tool_name`만 남긴다.
+  - 그 밖(`transcript_path`·`tool_response`·`tool_calls`·`content`·`old_string` 등)은 버린다. 식별자(`session_id`·`cwd`·`hook_event_name`)는 그대로 둔다.
+  - 4,000자 이하 입력에서는 `normalize(원본) == normalize(줄인 것)`이다. 모르는 source는 보내지도 스풀에 쓰지도 않는다.
+- 스풀 파일 권한은 Unix 0600, 폴더 0700(Windows는 `%LOCALAPPDATA%`의 사용자 전용 권한을 이어받는다).
+- stdin이 1 MiB를 넘으면 나머지를 마감 시각까지 읽어 버린다(호스트에 EPIPE를 내지 않는다).
+
+### 12.6 병합 감지 (R1 L5)
+`permission_request` 미리보기가 다음 가운데 하나면 병합이다: `gh pr merge`, `git merge`(옵션 사이에 `-C <경로>` 같은 앞 옵션 허용), `git … push` 뒤 브랜치 자리가 정확히 `main`·`master`(앞은 공백·`:`, 뒤는 공백·끝·`:`). `feature/main-fix`처럼 단어 일부는 병합이 아니다.
+
+### 12.7 남은 위험 (알고 받아들인 것)
+- **쿠키는 포트를 가리지 않는다.** 브라우저는 `127.0.0.1`의 다른 포트에서 도는 서버에도 `gyeot_session`을 보낸다(같은 사이트로 본다). `SameSite=Strict`라 다른 사이트에서 건너온 요청에는 붙지 않지만, 사용자가 주소창이나 같은 사이트 링크로 `127.0.0.1:<다른 포트>`를 열면 붙는다. 그 서버를 다른 사용자가 띄웠다면 쿠키를 얻어 30일 동안 곁 API를 쓸 수 있다. 토큰을 아무나 받던 v0.1보다 좁지만 남는다. 줄이는 방법: 세션 기한을 줄이거나, 얼굴 주소를 `gyeot.localhost` 같은 전용 이름으로 옮긴다(WebView2·브라우저의 `*.localhost` 해석은 실측 전). 지금은 기록만 한다(G-028).
+- **1 MiB가 넘는 훅 입력**은 앞부분에서 최상위 문자열 필드만 건진다. 필드 순서가 `tool_calls` 뒤라면 건지지 못하고 그 신호를 잃는다(Claude Code의 필드 순서는 실측 전). 잃으면 승인 대기가 다음 `PostToolBatch`·`Stop`까지 남는다.

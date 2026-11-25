@@ -9,6 +9,7 @@
 //! # }
 //! ```
 
+pub mod auth;
 pub mod config;
 pub mod face;
 pub mod http;
@@ -89,11 +90,17 @@ pub async fn bind(cfg: ServerConfig) -> Result<Server> {
         .context("상태를 되살리지 못했어요")??;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let sessions_path = cfg.sessions_path();
+    let sessions =
+        tokio::task::spawn_blocking(move || auth::Sessions::load(&sessions_path, now_ms()))
+            .await
+            .context("세션을 읽지 못했어요")?;
     let shared = Arc::new(Shared::new(
         addr.port(),
         token,
         cfg.face_dir.clone(),
         hub,
+        sessions,
         shutdown_rx,
     ));
     Ok(Server {
@@ -233,6 +240,10 @@ impl Server {
             let _ = t.await;
         }
         save_learn(&shared, &cfg).await;
+        {
+            let sh = shared.clone();
+            let _ = tokio::task::spawn_blocking(move || sh.sessions().flush()).await;
+        }
         drop(shared);
         let log2 = log.clone();
         let _ = tokio::task::spawn_blocking(move || log2.flush_blocking()).await;

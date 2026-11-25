@@ -13,7 +13,7 @@ export function connText(conn: ConnState, localNow: number): string {
     case 'demo':
       return '데모 모드 — 데몬 없이 표본 데이터로 보여요';
     case 'auth':
-      return '토큰이 맞지 않아요 — 곁을 다시 열어 주세요';
+      return '열쇠가 만료됐어요';
     case 'retrying': {
       if (conn.retryAt === null) return '곁 데몬에 연결 중…';
       const s = Math.max(0, Math.ceil((conn.retryAt - localNow) / 1000));
@@ -62,7 +62,8 @@ export function StatusLine({ mood, line, focusUntil, now, conn, onRetry }: Statu
         <p class={`status__conn status__conn--${conn.status}`} role="status">
           {offline && conn.status !== 'auth' && <span class="spinner" aria-hidden="true" />}
           <span>{connText(conn, tick)}</span>
-          {offline && (
+          {/* 열쇠 만료면 패널 위 안내(AuthNotice)가 다시 확인 단추를 단다 */}
+          {offline && conn.status !== 'auth' && (
             <button type="button" class="btn btn--xs btn--ghost" onClick={onRetry}>
               <IconRefresh size={12} /> 지금 다시
             </button>

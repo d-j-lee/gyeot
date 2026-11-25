@@ -5,12 +5,13 @@ import {
   chatTargets,
   CHAT_LIMIT,
   initialState,
+  quietReplies,
   reduce,
   visibleItems,
   visibleProposals,
   type AppState,
 } from './reducer.ts';
-import { demoSnapshot } from '../demo/data.ts';
+import { demoReply, demoSnapshot } from '../demo/data.ts';
 
 const NOW = Date.UTC(2026, 10, 26, 5, 0, 0);
 
@@ -268,5 +269,48 @@ describe('고르개', () => {
     const s = reduce(synced(), { type: 'focusUntil', until_ms: NOW + 1000 });
     expect(s.presence.focus_mode_until_ms).toBe(NOW + 1000);
     expect(s.presence.mood).toBe('waiting');
+  });
+});
+
+describe('집중·잠잘 때의 답(§12.4)', () => {
+  const synced = (presence: Partial<AppState['presence']>) =>
+    applyEvent(initialState('open'), { event: 'snapshot', data: { ...demoSnapshot(NOW), presence: { ...demoSnapshot(NOW).presence, ...presence } } }, NOW);
+
+  it('집중 모드가 앞날이거나 기분이 sleep 이면 조용히, 아니면 아니다', () => {
+    expect(quietReplies(synced({ mood: 'waiting', focus_mode_until_ms: NOW + 60_000 }), NOW)).toBe(true);
+    expect(quietReplies(synced({ mood: 'sleep', focus_mode_until_ms: null }), NOW)).toBe(true);
+    expect(quietReplies(synced({ mood: 'waiting', focus_mode_until_ms: NOW - 1 }), NOW)).toBe(false);
+    expect(quietReplies(synced({ mood: 'idle', focus_mode_until_ms: null }), NOW)).toBe(false);
+  });
+
+  it('집중 모드 끝은 서버 시계로 잰다(현지 시계와 차이 반영)', () => {
+    // 서버가 현지보다 5분 앞섬: 서버 기준 집중은 2분 남았다
+    const s = applyEvent(
+      initialState('open'),
+      { event: 'snapshot', data: { ...demoSnapshot(NOW + 300_000), presence: { ...demoSnapshot(NOW).presence, mood: 'waiting', focus_mode_until_ms: NOW + 420_000 } } },
+      NOW,
+    );
+    expect(quietReplies(s, NOW + 60_000)).toBe(true);
+    expect(quietReplies(s, NOW + 121_000)).toBe(false);
+  });
+
+  it('조용할 때 온 답은 안 읽은 답으로 센다(같은 답은 한 번), 대화를 보면 지운다', () => {
+    let s = synced({ mood: 'sleep' });
+    expect(s.unreadReplies).toBe(0);
+    const r: SseEvent = { event: 'reply', data: demoReply(NOW) };
+    s = applyEvent(s, r, NOW);
+    s = applyEvent(s, r, NOW);
+    expect(s.chat).toHaveLength(1);
+    expect(s.unreadReplies).toBe(1);
+    s = applyEvent(s, { event: 'reply', data: { ...demoReply(NOW + 1), chat_id: 'm2' } }, NOW);
+    expect(s.unreadReplies).toBe(2);
+    s = reduce(s, { type: 'chatSeen' });
+    expect(s.unreadReplies).toBe(0);
+  });
+
+  it('조용하지 않을 때 온 답은 세지 않는다(말풍선으로 보인다)', () => {
+    const s = applyEvent(synced({ mood: 'waiting', focus_mode_until_ms: null }), { event: 'reply', data: demoReply(NOW) }, NOW);
+    expect(s.chat).toHaveLength(1);
+    expect(s.unreadReplies).toBe(0);
   });
 });

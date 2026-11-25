@@ -21,6 +21,7 @@ pub const AUTOSTART_NAME: &str = "gyeot-shell";
 pub const AUTOSTART_ARG: &str = "--autostart";
 
 mod id {
+    pub const OPEN: &str = "open";
     pub const TOGGLE: &str = "toggle";
     pub const FOCUS_ON: &str = "focus_on";
     pub const FOCUS_OFF: &str = "focus_off";
@@ -29,27 +30,50 @@ mod id {
     pub const QUIT: &str = "quit";
 }
 
+/// 메뉴 순서. `None`은 구분선.
+const LAYOUT: &[Option<&str>] = &[
+    Some(id::OPEN),
+    Some(id::TOGGLE),
+    Some(id::FOCUS_ON),
+    Some(id::FOCUS_OFF),
+    None,
+    Some(id::RESTART),
+    Some(id::AUTOSTART),
+    None,
+    Some(id::QUIT),
+];
+
+/// 메뉴 문구.
+fn label(item: &str) -> String {
+    match item {
+        id::OPEN => "곁 열기".into(),
+        id::TOGGLE => "보이기/숨기기".into(),
+        id::FOCUS_ON => format!("집중 모드 {FOCUS_MINUTES}분"),
+        id::FOCUS_OFF => "집중 모드 끄기".into(),
+        id::RESTART => "곁 데몬 다시 시작".into(),
+        id::AUTOSTART => "로그인 시 시작".into(),
+        id::QUIT => "종료".into(),
+        _ => String::new(),
+    }
+}
+
 /// 말풍선 문구를 잠시 바꿨다가 되돌릴 때, 더 새 문구를 덮지 않게 세대를 센다.
 static TIP_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    let toggle = MenuItemBuilder::with_id(id::TOGGLE, "보이기/숨기기").build(app)?;
-    let focus_on = MenuItemBuilder::with_id(id::FOCUS_ON, format!("집중 모드 {FOCUS_MINUTES}분"))
-        .build(app)?;
-    let focus_off = MenuItemBuilder::with_id(id::FOCUS_OFF, "집중 모드 끄기").build(app)?;
-    let restart = MenuItemBuilder::with_id(id::RESTART, "곁 데몬 다시 시작").build(app)?;
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
-    let autostart = CheckMenuItemBuilder::with_id(id::AUTOSTART, "로그인 시 시작")
+    let autostart = CheckMenuItemBuilder::with_id(id::AUTOSTART, label(id::AUTOSTART))
         .checked(autostart_on)
         .build(app)?;
-    let quit = MenuItemBuilder::with_id(id::QUIT, "종료").build(app)?;
-    let menu = MenuBuilder::new(app)
-        .items(&[&toggle, &focus_on, &focus_off])
-        .separator()
-        .items(&[&restart, &autostart])
-        .separator()
-        .item(&quit)
-        .build()?;
+    let mut menu = MenuBuilder::new(app);
+    for entry in LAYOUT {
+        menu = match *entry {
+            None => menu.separator(),
+            Some(id::AUTOSTART) => menu.item(&autostart),
+            Some(item) => menu.item(&MenuItemBuilder::with_id(item, label(item)).build(app)?),
+        };
+    }
+    let menu = menu.build()?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip(TIP)
@@ -75,6 +99,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
 
 fn on_menu(app: &AppHandle, event: &MenuEvent, autostart: &CheckMenuItem<tauri::Wry>) {
     match event.id().as_ref() {
+        id::OPEN => overlay::open(app),
         id::TOGGLE => overlay::toggle(app),
         id::FOCUS_ON => focus(app, true),
         id::FOCUS_OFF => focus(app, false),
@@ -86,9 +111,8 @@ fn on_menu(app: &AppHandle, event: &MenuEvent, autostart: &CheckMenuItem<tauri::
                 match daemon::restart(cfg.port, cfg.data_dir.as_deref()) {
                     Ok(_) => {
                         set_tip(&app, TIP, None);
-                        if let Some(win) = app.get_webview_window(overlay::MAIN) {
-                            let _ = win.navigate(cfg.face_url());
-                        }
+                        // 새 부트 코드로 얼굴을 다시 연다(데몬이 떠 있으니 띄우지는 않는다).
+                        overlay::connect_async(app.clone(), false);
                     }
                     Err(reason) => {
                         crate::warn!("데몬 다시 시작 실패: {reason}");
@@ -240,6 +264,26 @@ mod tests {
             quoted_command(r#""C:\a b\x.exe""#, "--autostart"),
             r#""C:\a b\x.exe" --autostart"#
         );
+    }
+
+    #[test]
+    fn menu_starts_with_gyeot_open_and_keeps_old_items() {
+        let ids: Vec<&str> = LAYOUT.iter().flatten().copied().collect();
+        assert_eq!(ids.first(), Some(&id::OPEN), "{ids:?}");
+        assert_eq!(label(id::OPEN), "곁 열기");
+        for (item, want) in [
+            (id::TOGGLE, "보이기/숨기기"),
+            (id::FOCUS_ON, "집중 모드 30분"),
+            (id::FOCUS_OFF, "집중 모드 끄기"),
+            (id::RESTART, "곁 데몬 다시 시작"),
+            (id::AUTOSTART, "로그인 시 시작"),
+            (id::QUIT, "종료"),
+        ] {
+            assert_eq!(ids.iter().filter(|i| **i == item).count(), 1, "{item}");
+            assert_eq!(label(item), want);
+        }
+        assert_eq!(ids.len(), 7);
+        assert_eq!(ids.last(), Some(&id::QUIT));
     }
 
     #[test]

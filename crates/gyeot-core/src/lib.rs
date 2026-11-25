@@ -14,6 +14,7 @@ pub mod model;
 pub mod normalize;
 pub mod paths;
 pub mod policy;
+pub mod sanitize;
 pub mod text;
 
 pub use engine::{ActError, Action, ChannelInfo, DecisionInfo, Effect, Engine, VERSION};
@@ -25,3 +26,4 @@ pub use model::{
 };
 pub use normalize::normalize;
 pub use policy::{Policy, QuietRange};
+pub use sanitize::sanitize_payload;

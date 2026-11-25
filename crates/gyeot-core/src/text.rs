@@ -155,15 +155,27 @@ pub fn human_followup(text: &str) -> bool {
     FOLLOWUP_KEYS.iter().any(|k| t.contains(k)) || decision_count_re().is_match(&t)
 }
 
+/// `git`과 하위 명령 사이의 앞 옵션: 값을 받는 옵션(`-C <경로>`·`-c <키=값>` 등, 따옴표 경로 포함)과 홀로 쓰는 옵션.
+const GIT_GLOBAL_OPTS: &str = r#"(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)\s+(?:"[^"]*"|'[^']*'|\S+)|\s+-\S+)*"#;
+
 fn merge_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"(?i)\bgh\s+pr\s+merge\b|\bgit\s+merge(?:\s|$)|\bgit\s+push\b[^;&|\n]*\bmain\b")
-            .expect("merge regex")
+        let opts = GIT_GLOBAL_OPTS;
+        Regex::new(&format!(
+            concat!(
+                r"(?i)\bgh\s+pr\s+merge\b",
+                r"|\bgit{opts}\s+merge(?:\s|$)",
+                // 브랜치 자리는 정확히 main·master: 앞은 공백·`:`, 뒤는 공백·`:`·끝.
+                r"|\bgit{opts}\s+push\b[^;&|\n]*?[\s:](?:main|master)(?:[\s:]|$)",
+            ),
+            opts = opts
+        ))
+        .expect("merge regex")
     })
 }
 
-/// 미리보기가 병합 명령(`gh pr merge`·`git merge`·`git push … main`)인가(계약 §3 `merge`).
+/// 미리보기가 병합 명령(`gh pr merge`·`git merge`·`git push … main|master`)인가(계약 §3 `merge`, §12.6).
 pub fn is_merge_command(preview: &str) -> bool {
     merge_re().is_match(preview)
 }
@@ -351,6 +363,41 @@ mod tests {
             "npm install",
         ] {
             assert!(!is_merge_command(s), "{s}");
+        }
+    }
+
+    /// R1 L5(계약 §12.6): 앞 옵션을 건너뛰고, 브랜치 자리는 정확히 `main`·`master`만 본다.
+    #[test]
+    fn merge_detection_r1() {
+        for s in [
+            "git -C . push origin main",
+            "git -C /w/proj push origin main",
+            "git -C \"C:/my repo\" push -u origin main",
+            "git push origin HEAD:main",
+            "git push origin main:main",
+            "git push origin master",
+            "git push origin master:master",
+            "git -C . merge topic",
+            "git -C 'my dir' merge --no-ff topic",
+            "git --no-pager -c core.editor=true merge topic",
+            "cd x && git -C . push origin main && echo done",
+        ] {
+            assert!(is_merge_command(s), "병합이어야 함: {s}");
+        }
+        for s in [
+            "git push origin feature/main-fix",
+            "git push origin main-fix",
+            "git push origin feature:main-fix",
+            "git push origin mainline",
+            "git push origin my_main",
+            "git push origin remaster",
+            "git merge-base main topic",
+            "git -C . merge-base main topic",
+            "git -C main status",
+            "git log main",
+            "git push origin dev; echo main",
+        ] {
+            assert!(!is_merge_command(s), "병합이 아니어야 함: {s}");
         }
     }
 

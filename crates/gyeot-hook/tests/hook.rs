@@ -111,6 +111,199 @@ fn bad_input_and_odd_setups_still_exit_zero() {
     assert_eq!(spool_files(d.path()).len(), 2);
 }
 
+const SECRET: &str = "sk-ant-api03-SECRETSECRETSECRET123";
+
+/// R1 M3·L6(계약 §12.5): 스풀에는 줄인 페이로드만, 권한은 파일 0600·폴더 0700.
+#[test]
+fn spooled_payload_is_sanitized_and_private() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("token"), "a".repeat(64)).unwrap();
+    // 이미 있던 느슨한 스풀 폴더도 좁힌다
+    std::fs::create_dir_all(d.path().join("spool")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            d.path().join("spool"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let url = format!("http://127.0.0.1:{}", free_port());
+    let prompt = format!("비밀 프롬프트 {SECRET}");
+    let input = json!({
+        "session_id": "s1",
+        "transcript_path": "/home/me/.claude/projects/p/s1.jsonl",
+        "cwd": "/work/proj",
+        "hook_event_name": "UserPromptSubmit",
+        "permission_mode": "default",
+        "prompt": prompt,
+    });
+    let (out, _) = run_hook(
+        d.path(),
+        &url,
+        &["claude-code"],
+        input.to_string().as_bytes(),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    let write = json!({
+        "session_id": "s1",
+        "transcript_path": "/t.jsonl",
+        "cwd": "/work/proj",
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "Write",
+        "tool_input": {"file_path": "/work/proj/.env", "content": format!("KEY={SECRET}\n비밀 내용")},
+    });
+    run_hook(
+        d.path(),
+        &url,
+        &["claude-code"],
+        write.to_string().as_bytes(),
+    );
+    let files = spool_files(d.path());
+    assert_eq!(files.len(), 2, "{files:?}");
+    let mut payloads = Vec::new();
+    for f in &files {
+        let text = std::fs::read_to_string(f).unwrap();
+        for bad in [
+            "비밀",
+            SECRET,
+            "transcript_path",
+            "permission_mode",
+            "content",
+        ] {
+            assert!(!text.contains(bad), "{bad} 남음: {text}");
+        }
+        let v: Value = serde_json::from_str(&text).unwrap();
+        payloads.push(v["payload"].clone());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", f.display());
+        }
+    }
+    assert!(
+        payloads
+            .iter()
+            .any(|p| p["prompt"] == "x".repeat(prompt.chars().count())),
+        "{payloads:?}"
+    );
+    assert!(
+        payloads
+            .iter()
+            .any(|p| p["tool_input"] == json!({"file_path": "/work/proj/.env"})),
+        "{payloads:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(d.path().join("spool"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+}
+
+/// 데몬에 보내는 본문도 줄인 것이다(가짜 데몬이 받은 본문을 본다).
+#[test]
+fn sent_payload_is_sanitized() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("token"), "a".repeat(64)).unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 65536];
+        loop {
+            let n = s.read(&mut tmp).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            if let Some(at) = text.find("\r\n\r\n") {
+                let len = text[..at]
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= at + 4 + len {
+                    let _ = s.write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    );
+                    return String::from_utf8_lossy(&buf[at + 4..at + 4 + len]).into_owned();
+                }
+            }
+        }
+        String::new()
+    });
+    let input = json!({
+        "session_id": "s1",
+        "transcript_path": "/t.jsonl",
+        "cwd": "/work/proj",
+        "hook_event_name": "Stop",
+        "last_assistant_message": format!("끝났어요. 키는 {SECRET} 입니다."),
+        "stop_hook_active": false,
+    });
+    let url = format!("http://127.0.0.1:{port}");
+    let (out, _) = run_hook(
+        d.path(),
+        &url,
+        &["claude-code"],
+        input.to_string().as_bytes(),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let body = server.join().unwrap();
+    let v: Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    assert_eq!(
+        v["payload"],
+        json!({
+            "session_id": "s1",
+            "cwd": "/work/proj",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "끝났어요. 키는 [가림] 입니다.",
+        })
+    );
+    assert!(spool_files(d.path()).is_empty());
+}
+
+/// 1 MiB가 넘는 stdin도 끝까지 읽어 버린다(호스트가 EPIPE를 받지 않는다).
+#[test]
+fn oversized_stdin_is_drained_without_epipe() {
+    let d = tempfile::tempdir().unwrap();
+    let url = format!("http://127.0.0.1:{}", free_port());
+    let big = format!(
+        r#"{{"session_id":"big","cwd":"/w","hook_event_name":"Stop","last_assistant_message":"끝","tool_response":"{}"}}"#,
+        "y".repeat(3 * 1024 * 1024)
+    );
+    let start = Instant::now();
+    let mut child = hook_cmd(d.path(), &url).arg("claude-code").spawn().unwrap();
+    let mut si = child.stdin.take().unwrap();
+    let wrote = si.write_all(big.as_bytes());
+    drop(si);
+    let out = child.wait_with_output().unwrap();
+    assert!(wrote.is_ok(), "호스트 쪽 쓰기가 실패함: {wrote:?}");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    assert!(start.elapsed() < Duration::from_secs(3));
+    // 잘린 입력에서도 쓰는 필드는 건진다
+    let files = spool_files(d.path());
+    assert_eq!(files.len(), 1, "{files:?}");
+    let v: Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+    assert_eq!(v["payload"]["hook_event_name"], "Stop");
+    assert_eq!(v["payload"]["session_id"], "big");
+    assert!(v["payload"].get("tool_response").is_none());
+}
+
 fn get_state(port: u16, token: &str) -> Value {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

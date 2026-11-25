@@ -245,6 +245,10 @@ impl ServerConfig {
     pub fn learn_path(&self) -> PathBuf {
         self.home.join("learn.json")
     }
+    /// `<home>/sessions.json`(얼굴 세션의 SHA-256, §12.1).
+    pub fn sessions_path(&self) -> PathBuf {
+        self.home.join("sessions.json")
+    }
     /// `<home>/tails.json`(따라 읽기 위치).
     pub fn tail_state_path(&self) -> PathBuf {
         self.home.join("tails.json")

@@ -14,6 +14,7 @@ import { TurnTab } from './components/TurnTab.tsx';
 import { ChatTab } from './components/ChatTab.tsx';
 import { SettingsTab } from './components/SettingsTab.tsx';
 import { SessionList } from './components/SessionList.tsx';
+import { AuthNotice } from './components/AuthNotice.tsx';
 
 export interface AppConfig {
   mode: 'default' | 'overlay';
@@ -55,7 +56,9 @@ export function App({ ctl, config }: { ctl: Controller; config: AppConfig }) {
   const proposals = useMemo(() => visibleProposals(state), [state]);
   const sessions = useMemo(() => chatTargets(state.sessions), [state.sessions]);
   const overlay = config.mode === 'overlay';
-  const offline = !state.synced && state.conn.status !== 'demo';
+  // 열쇠를 잃으면 받은 상태가 더는 살아 있지 않다 — 연결 전과 같이 오프라인으로 보인다.
+  const authLost = state.conn.status === 'auth';
+  const offline = (!state.synced || authLost) && state.conn.status !== 'demo';
   const mood: Mood = state.presence.mood;
   // 오버레이에서 패널이 열려 있으면 말풍선은 패널 뒤에 숨긴다(차례는 그대로).
   const showBubble = !(overlay && open);
@@ -73,6 +76,12 @@ export function App({ ctl, config }: { ctl: Controller; config: AppConfig }) {
     setHighlight(null);
     requestAnimationFrame(() => avatarBtnRef.current?.focus());
   }, [overlay]);
+
+  // 대화 탭을 보고 있으면 안 읽은 답 배지를 지운다(§12.4).
+  const unread = state.unreadReplies;
+  useEffect(() => {
+    if (unread > 0 && open && tab === 'chat') ctl.markChatSeen();
+  }, [unread, open, tab, ctl]);
 
   useEffect(() => {
     if (!highlight) return undefined;
@@ -245,10 +254,12 @@ export function App({ ctl, config }: { ctl: Controller; config: AppConfig }) {
       status={status}
       turnCount={items.length}
       blockingCount={blockingCount}
+      chatUnread={unread}
       toasts={toasts}
       onDropToast={(id) => ctl.dropToast(id)}
       onClose={overlay ? closePanel : undefined}
       demo={state.conn.status === 'demo'}
+      notice={authLost ? <AuthNotice onRetry={() => ctl.retryNow()} /> : null}
     >
       {body}
     </Panel>
@@ -269,7 +280,7 @@ export function App({ ctl, config }: { ctl: Controller; config: AppConfig }) {
   const avatarMood: Mood = offline ? 'idle' : mood;
 
   if (overlay) {
-    const label = `곁 — ${moodLabel(avatarMood)}${blockingCount ? `, 막힌 일 ${blockingCount}건` : ''}. 패널 ${open ? '접기' : '열기'}`;
+    const label = `곁 — ${authLost ? '열쇠가 만료됐어요' : moodLabel(avatarMood)}${blockingCount ? `, 막힌 일 ${blockingCount}건` : ''}${unread ? `, 안 읽은 답 ${unread}개` : ''}. 패널 ${open ? '접기' : '열기'}`;
     return (
       <div class="ov">
         <LiveAnnouncer bubble={bubble} />
@@ -297,6 +308,7 @@ export function App({ ctl, config }: { ctl: Controller; config: AppConfig }) {
               {blockingCount}
             </span>
           )}
+          {unread > 0 && !open && <span class="ov-unread" aria-hidden="true" title="안 읽은 답" />}
         </button>
       </div>
     );

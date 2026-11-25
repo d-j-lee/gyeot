@@ -5,10 +5,8 @@ import './styles/app.css';
 import { App } from './App.tsx';
 import { MoodSheet } from './components/MoodSheet.tsx';
 import { Controller } from './app/controller.ts';
-import { HttpBackend } from './app/backend.ts';
-import { DemoBackend } from './demo/backend.ts';
+import { createBackend } from './app/create.ts';
 import { parseBoot } from './boot.ts';
-import { resolveApiBase, resolveToken } from './lib/api.ts';
 import { installAudioUnlock } from './lib/audio.ts';
 
 const boot = parseBoot(location.search);
@@ -22,7 +20,7 @@ const mount = document.getElementById('app')!;
 if (boot.demo?.scene === 'sheet') {
   render(<MoodSheet />, mount);
 } else {
-  const backend = boot.demo ? new DemoBackend(boot.demo) : new HttpBackend(resolveApiBase(), resolveToken());
+  const backend = createBackend(boot);
   const ctl = new Controller(backend, { persistPrefs: !boot.demo }, boot.demo ? 'demo' : 'connecting');
   installAudioUnlock();
   render(<App ctl={ctl} config={{ mode: boot.mode, initialTab: boot.tab, initialOpen: boot.open }} />, mount);

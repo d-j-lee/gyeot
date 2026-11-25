@@ -8,6 +8,12 @@
     `gyeotd --init` 을 실행한 뒤, Claude Code 훅 · Codex 훅/notify · .mcp.json(channel)
     조각을 절대 경로로 채워서 출력합니다. 기본값은 출력만 하고 다른 프로그램의 설정은 바꾸지 않습니다.
 
+    Claude Code 훅 조각에는 기본으로 PostToolBatch 가 들어 있습니다. 사람이 터미널에서 승인한 뒤
+    곁의 승인 대기를 닫는 신호입니다(-NoActivityHook 으로 뺄 수 있음).
+
+    얼굴은 셸 트레이의 "곁 열기" 또는 `gyeotd --open`(기본 브라우저)으로 엽니다. 얼굴 주소에는
+    토큰이 없고, 일회용 부트 코드로 받은 세션 쿠키로 데몬에 붙습니다.
+
     zip 배포본(bin\, face\, scripts\, examples\)에서도, 빌드한 저장소(target\release 등)에서도 돌아갑니다.
 
 .PARAMETER SourceDir
@@ -20,11 +26,13 @@
     아무것도 바꾸지 않고 할 일과 조각만 보여 줍니다.
 
 .PARAMETER ApplyClaudeHooks
-    ~/.claude/settings.json 을 settings.json.bak-<시각> 으로 백업한 뒤 곁의 훅을 더합니다.
+    ~/.claude/settings.json 을 settings.json.bak-<시각> 으로 백업한 뒤 곁의 훅(PostToolBatch 포함)을 더합니다.
     기존 훅은 지우지 않고, 이미 있으면 다시 더하지 않습니다(여러 번 실행해도 같음).
 
-.PARAMETER IncludeActivityHook
-    PostToolBatch 훅도 더합니다("작업 중" 표정용, 잦음).
+.PARAMETER NoActivityHook
+    PostToolBatch 훅을 넣지 않습니다(기본은 넣음). -ApplyClaudeHooks 와 함께 주면 이미 넣은 곁의
+    PostToolBatch 항목만 뺍니다(다른 훅은 그대로). 빼면 터미널에서 승인해도 곁의 승인 대기가 턴이
+    끝날 때까지 남을 수 있고, 곁은 그 세션의 승인 대기를 말풍선까지만 알립니다.
 
 .PARAMETER ClaudeSettingsPath
     Claude Code 사용자 설정 파일. 기본값 ~/.claude/settings.json.
@@ -45,6 +53,8 @@
     powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -ApplyClaudeHooks -RegisterStartup
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DryRun
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -ApplyClaudeHooks -NoActivityHook
 #>
 [CmdletBinding()]
 param(
@@ -52,7 +62,7 @@ param(
     [string]$InstallRoot,
     [switch]$DryRun,
     [switch]$ApplyClaudeHooks,
-    [switch]$IncludeActivityHook,
+    [switch]$NoActivityHook,
     [string]$ClaudeSettingsPath,
     [switch]$RegisterStartup,
     [switch]$NoStart,
@@ -164,7 +174,7 @@ try {
     $labels = @{ Daemon = 'gyeotd.exe'; Hook = 'gyeot-hook.exe'; Shell = 'gyeot-shell.exe'; Channel = 'gyeot-channel.mjs'; Face = 'face\index.html' }
     foreach ($k in @('Daemon', 'Hook', 'Shell', 'Channel', 'Face')) {
         if ($src[$k]) { Write-GyeotOk "$($labels[$k]): $($src[$k])" }
-        elseif ($k -eq 'Shell') { Write-GyeotWarn 'gyeot-shell.exe 가 없어요. 셸 없이 브라우저로 얼굴을 열 수 있어요(http://127.0.0.1:47321/).' }
+        elseif ($k -eq 'Shell') { Write-GyeotWarn 'gyeot-shell.exe 가 없어요. 셸 없이 gyeotd --open 으로 브라우저에서 얼굴을 열 수 있어요.' }
         elseif ($k -eq 'Channel') { Write-GyeotWarn 'gyeot-channel.mjs 가 없어요. Claude Code 세션과 대화(channel)는 쓸 수 없어요.' }
         else { Write-GyeotWarn "$($labels[$k]) 를 찾지 못했어요." }
     }
@@ -245,7 +255,8 @@ try {
     # ── 5. 연결 조각 ──
     $hookExe = $dst.Hook
     $channelJs = $dst.Channel
-    $claudeSnippet = ConvertTo-GyeotJson (New-GyeotClaudeHooksSnippet -HookExe $hookExe -IncludeActivity:$IncludeActivityHook)
+    $noActivity = [bool]$NoActivityHook
+    $claudeSnippet = ConvertTo-GyeotJson (New-GyeotClaudeHooksSnippet -HookExe $hookExe -NoActivity:$noActivity)
 
     $codexHooks = New-GyeotDict
     $codexCmd = (Get-GyeotShortPath $hookExe)
@@ -293,6 +304,11 @@ try {
     } else {
         Write-GyeotInfo "Claude Code 훅: $claudeSettings 의 `"hooks`" 에 합치세요(또는 -ApplyClaudeHooks 로 다시 실행)."
     }
+    if ($noActivity) {
+        Write-GyeotWarn 'PostToolBatch 훅을 넣지 않아요(-NoActivityHook). 터미널에서 승인해도 곁의 승인 대기가 턴이 끝날 때까지 남을 수 있어요.'
+    } else {
+        Write-GyeotInfo 'PostToolBatch 훅이 들어 있어요. 터미널에서 승인한 뒤 곁의 승인 대기를 닫아요(빼려면 -NoActivityHook).'
+    }
     Write-GyeotBlock 'Claude Code 훅 (~/.claude/settings.json)' $claudeSnippet
     Write-GyeotInfo "Codex 훅: $(Join-Path $codexHome 'hooks.json') 에 합치세요(입력 모양은 실측 전 F3)."
     Write-GyeotBlock 'Codex 훅 (~/.codex/hooks.json)' $codexSnippet
@@ -326,19 +342,20 @@ try {
     # ── 6. Claude Code 훅 적용(선택) ──
     if ($ApplyClaudeHooks) {
         Write-GyeotStep "Claude Code 훅 적용 → $claudeSettings"
-        $include = [bool]$IncludeActivityHook
         $res = Update-GyeotJsonFile -Path $claudeSettings -DryRun:$DryRun -Mutate {
             param($tree)
-            Merge-GyeotClaudeHook -Settings $tree -HookExe $hookExe -IncludeActivity:$include
+            Merge-GyeotClaudeHook -Settings $tree -HookExe $hookExe -NoActivity:$noActivity
         }
         $d = $res.Detail
+        $removedNote = ''
+        if ($d.Removed -gt 0) { $removedNote = ", 곁의 PostToolBatch $($d.Removed)개 뺌" }
         if (-not $res.Changed) {
             Write-GyeotOk "이미 들어 있어요(그대로 둠, 곁 항목 $($d.Kept)개)."
         } elseif ($DryRun) {
-            Write-GyeotPlan "백업 후 곁 항목 $($d.Added)개 추가, $($d.Updated)개 경로 갱신"
+            Write-GyeotPlan "백업 후 곁 항목 $($d.Added)개 추가, $($d.Updated)개 경로 갱신$removedNote"
         } else {
             if ($res.Backup) { Write-GyeotOk "백업: $($res.Backup)" }
-            Write-GyeotOk "곁 항목 $($d.Added)개 추가, $($d.Updated)개 경로 갱신, 기존 훅은 그대로"
+            Write-GyeotOk "곁 항목 $($d.Added)개 추가, $($d.Updated)개 경로 갱신$removedNote, 기존 훅은 그대로"
             Write-GyeotInfo '이미 열려 있는 Claude Code 세션은 /hooks 를 열거나 다시 시작해야 반영돼요.'
         }
     }
@@ -404,8 +421,14 @@ try {
         Write-Host '미리보기를 마쳤어요. -DryRun 없이 다시 실행하면 위 일을 합니다.' -ForegroundColor White
     } else {
         Write-Host '설치를 마쳤어요.' -ForegroundColor White
-        if ($src.Shell) { Write-GyeotInfo "곁 셸 실행: `"$($dst.Shell)`"  (Ctrl+Alt+Space 로 보이기/숨기기)" }
-        Write-GyeotInfo '브라우저로 열기: http://127.0.0.1:47321/'
+        if ($src.Shell) {
+            Write-GyeotInfo "곁 셸 실행: `"$($dst.Shell)`"  (Ctrl+Alt+Space 로 보이기/숨기기)"
+            Write-GyeotInfo "얼굴 열기: 트레이 아이콘의 '곁 열기', 또는 브라우저로 `"$($dst.Daemon)`" --open"
+        } else {
+            Write-GyeotInfo "얼굴 열기: `"$($dst.Daemon)`" --open  (기본 브라우저로 열려요)"
+            Write-GyeotInfo "곁 셸(설치본 gyeot-shell-setup)을 쓰면 트레이 아이콘의 '곁 열기'로도 열 수 있어요."
+        }
+        Write-GyeotInfo '얼굴 주소에는 토큰이 없어요. 주소만 복사해 열면 안내 쪽이 보이니 위 방법으로 여세요.'
         Write-GyeotInfo "지우기: powershell -ExecutionPolicy Bypass -File `"$(Join-Path $ScriptsDir 'uninstall.ps1')`""
     }
     $exitCode = 0

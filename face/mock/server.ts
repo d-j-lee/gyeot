@@ -1,10 +1,14 @@
-// 개발용 가짜 곁 데몬. docs/contracts.md §7·§8 의 엔드포인트와 SSE 를 흉내 낸다.
-//   npm run mock                 → http://127.0.0.1:47321/ (dist 가 있으면 토큰을 채워 내보낸다)
+// 개발용 가짜 곁 데몬. docs/contracts.md §7·§8·§12.1 의 엔드포인트·SSE·열쇠 흐름을 흉내 낸다.
+//   npm run mock                 → http://127.0.0.1:47321/ (dist 가 있으면 / 에서 얼굴을 내보낸다)
 //   GYEOT_PORT=47322 npm run mock
-//   GYEOT_TOKEN=xxx npm run mock (기본 토큰: dev)
+//   GYEOT_TOKEN=<hex> npm run mock (기본: 띄울 때마다 새 난수. 터미널에 보인다)
+//   GYEOT_MOCK_DIST=<폴더>        → 얼굴 폴더(기본 face/dist)
 //   npm run mock -- --quiet      → 저절로 일어나는 일(대본) 없이
-// 손으로 일으키기: GET /mock/trigger?what=interrupt|nudge|reply|alert|done|working|item|reset&t=<토큰>
+// 열쇠(배포와 같다): 토큰(Bearer)으로 POST /v1/boot → 부트 주소 /?boot=<코드>(120초, 한 번) → 쿠키 + 303.
+//   그 뒤 얼굴의 API·SSE 는 같은 출처 쿠키로만. ?t= 는 받지 않는다. 띄울 때 부트 주소를 보이고, Enter 마다 새로 보인다.
+// 손으로 일으키기: curl -H "Authorization: Bearer <토큰>" "http://127.0.0.1:<포트>/mock/trigger?what=interrupt|nudge|reply|alert|done|working|item|reset"
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { extname, join, normalize, dirname } from 'node:path';
@@ -19,13 +23,17 @@ import {
   demoNudge,
   demoSessions,
 } from '../src/demo/data.ts';
+import { AuthStore } from './auth.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const dist = join(here, '..', 'dist');
+const dist = process.env.GYEOT_MOCK_DIST ? normalize(process.env.GYEOT_MOCK_DIST) : join(here, '..', 'dist');
 const PORT = Number(process.env.GYEOT_PORT ?? 47321);
-const TOKEN = process.env.GYEOT_TOKEN ?? 'dev';
+const TOKEN = process.env.GYEOT_TOKEN || randomBytes(32).toString('hex');
 const QUIET = process.argv.includes('--quiet');
 const MAX_BODY = 1024 * 1024;
+/** vite 개발 서버(vite.config.ts 의 server.port). 그 프록시가 Origin 을 그대로 넘기므로 가짜 데몬만 받아 준다. */
+const DEV_PORT = 5173;
+const auth = new AuthStore(TOKEN);
 
 // channel 은 있지만 개발 채널 플래그 없이 시작된 세션(§10.1): 말을 넘겨도 답이 오지 않는다.
 const SILENT_SESSIONS = new Set(['c3d95e11-dja']);
@@ -140,21 +148,76 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   }
 }
 
-function authed(req: IncomingMessage, url: URL): boolean {
-  const h = req.headers.authorization ?? '';
-  return h === `Bearer ${TOKEN}` || url.searchParams.get('t') === TOKEN;
+/** §7: 토큰(Bearer) 또는 세션 쿠키. 쿼리 토큰(?t=)은 받지 않는다. */
+function authed(req: IncomingMessage): boolean {
+  return auth.bearerOk(req.headers.authorization) || auth.sessionOk(req.headers.cookie);
 }
 
-const ALLOWED_ORIGINS = new Set([
-  `http://127.0.0.1:${PORT}`,
-  `http://localhost:${PORT}`,
-  'tauri://localhost',
-  'http://tauri.localhost',
-  'https://tauri.localhost',
-  // 개발 서버(vite)에서 프록시로 들어오는 요청
-  'http://127.0.0.1:5173',
-  'http://localhost:5173',
-]);
+let listenPort = PORT;
+const allowedHosts = () => new Set([`127.0.0.1:${listenPort}`, `localhost:${listenPort}`]);
+// §7·§12.2: 같은 출처만. Tauri 출처는 받지 않는다. 개발 서버(vite) 출처는 가짜 데몬만의 예외다.
+const allowedOrigins = () =>
+  new Set([
+    `http://127.0.0.1:${listenPort}`,
+    `http://localhost:${listenPort}`,
+    `http://127.0.0.1:${DEV_PORT}`,
+    `http://localhost:${DEV_PORT}`,
+  ]);
+
+/** §7: 얼굴 응답(index·안내 쪽)의 보안 머리글 */
+const FACE_HEADERS: Record<string, string> = {
+  'Content-Security-Policy':
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'X-Content-Type-Options': 'nosniff',
+  'Cache-Control': 'no-store',
+};
+
+const GUIDE_PAGE = `<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>곁 — 열쇠가 필요해요</title>
+<style>body{font-family:system-ui,"Malgun Gothic",sans-serif;max-width:40rem;margin:3rem auto;padding:0 1.25rem;line-height:1.6}code{background:#ebe5db;border-radius:6px;padding:.1rem .35rem}</style>
+</head>
+<body>
+<h1>곁을 열려면 열쇠가 필요해요</h1>
+<p>트레이의 ‘곁 열기’를 누르거나 터미널에서 <code>gyeotd --open</code>을 실행하세요.</p>
+<p>가짜 데몬(<code>npm run mock</code>)이면 그 터미널에서 Enter 를 누르면 새 주소가 나와요. 주소는 120초 안에 한 번만 쓸 수 있어요.</p>
+</body>
+</html>
+`;
+
+function guide(res: ServerResponse) {
+  res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', ...FACE_HEADERS });
+  res.end(GUIDE_PAGE);
+}
+
+/** §12.1-2: 코드를 쿠키로 바꾸고 같은 경로·같은 쿼리에서 boot 만 뺀 주소로 303. */
+function redeemBoot(res: ServerResponse, url: URL) {
+  const value = auth.redeem(url.searchParams.get('boot') ?? '');
+  if (!value) return guide(res);
+  const q = new URLSearchParams(url.search);
+  q.delete('boot');
+  const rest = q.toString();
+  // '//host' 꼴은 다른 호스트로 읽히므로 앞의 / 를 하나로 접는다.
+  const path = `/${url.pathname.replace(/^\/+/, '')}`;
+  res.writeHead(303, {
+    Location: rest ? `${path}?${rest}` : path,
+    'Set-Cookie': auth.cookieFor(value),
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+  });
+  res.end();
+  console.log('  ⚿ 부트 코드 → 세션 쿠키');
+}
+
+function issueBoot(port = listenPort) {
+  const c = auth.issueCode();
+  return { ...c, url: `http://127.0.0.1:${port}/?boot=${c.code}` };
+}
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -164,20 +227,30 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
 };
 
-async function serveStatic(res: ServerResponse, pathname: string) {
-  if (!existsSync(join(dist, 'index.html'))) {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end(`dist 가 없어요. face/ 에서 npm run build 를 하거나, npm run dev 로 띄운 뒤 http://localhost:5173/?t=${TOKEN} 를 여세요.\n`);
+/** §7: index(`/`·확장자 없는 경로)는 쿠키가 있어야, 그 밖의 정적 파일(`/assets/*` 등)은 열쇠 없이. 토큰을 싣지 않는다. */
+async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string) {
+  let p: string;
+  try {
+    p = normalize(decodeURIComponent(pathname));
+  } catch {
+    return json(res, 404, { error: 'not found' });
+  }
+  const isIndex = p === '/' || p === '/index.html' || !extname(p);
+  if (isIndex && !auth.sessionOk(req.headers.cookie)) return guide(res);
+  if (isIndex && !existsSync(join(dist, 'index.html'))) {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', ...FACE_HEADERS });
+    res.end('dist 가 없어요. face/ 에서 npm run build 를 하거나, npm run dev 로 띄운 뒤 터미널에 보인 개발 서버 부트 주소를 여세요.\n');
     return;
   }
-  let p = normalize(decodeURIComponent(pathname));
-  if (p === '/' || !extname(p)) p = '/index.html';
+  if (isIndex) p = '/index.html';
   const file = join(dist, p);
   if (!file.startsWith(dist)) return json(res, 404, { error: 'not found' });
   try {
-    let body: Buffer | string = await readFile(file);
-    if (p === '/index.html') body = body.toString('utf8').replace('<meta name="gyeot-token" content="">', `<meta name="gyeot-token" content="${TOKEN}">`);
-    res.writeHead(200, { 'Content-Type': MIME[extname(file)] ?? 'application/octet-stream' });
+    const body = await readFile(file);
+    res.writeHead(200, {
+      'Content-Type': MIME[extname(file)] ?? 'application/octet-stream',
+      ...(isIndex ? FACE_HEADERS : { 'X-Content-Type-Options': 'nosniff' }),
+    });
     res.end(body);
   } catch {
     json(res, 404, { error: 'not found' });
@@ -283,15 +356,27 @@ function trigger(what: string): boolean {
 // ── 경로 ───────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
-  const method = req.method ?? 'GET';
+  // §7: DNS 리바인딩 방어(Host), 같은 출처만(Origin). vite 프록시는 changeOrigin 으로 Host 를 데몬 주소로 바꾼다.
+  const host = req.headers.host ?? '';
+  if (!allowedHosts().has(host)) return json(res, 421, { error: 'host' });
   const origin = req.headers.origin;
-  if (origin && !ALLOWED_ORIGINS.has(origin)) return json(res, 403, { error: 'origin' });
+  if (origin !== undefined && !allowedOrigins().has(origin)) return json(res, 403, { error: 'origin' });
+  const url = new URL(req.url ?? '/', `http://${host}`);
+  const method = req.method ?? 'GET';
 
   try {
     if (method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, version: '0.1.0-mock' });
-    if (method === 'GET' && !url.pathname.startsWith('/v1/') && !url.pathname.startsWith('/mock/')) return serveStatic(res, url.pathname);
-    if (!authed(req, url)) return json(res, 401, { error: 'unauthorized' });
+    // §7: 부트 코드는 토큰으로만(쿠키로는 부를 수 없다)
+    if (url.pathname === '/v1/boot') {
+      if (method !== 'POST') return json(res, 405, { error: 'method' });
+      if (!auth.bearerOk(req.headers.authorization)) return json(res, 401, { error: 'unauthorized' });
+      return json(res, 200, issueBoot());
+    }
+    if (method === 'GET' && !url.pathname.startsWith('/v1/') && !url.pathname.startsWith('/mock/')) {
+      if (url.searchParams.has('boot')) return redeemBoot(res, url);
+      return serveStatic(req, res, url.pathname);
+    }
+    if (!authed(req)) return json(res, 401, { error: 'unauthorized' });
 
     if (method === 'GET' && url.pathname === '/mock/trigger') {
       const what = url.searchParams.get('what') ?? '';
@@ -391,12 +476,29 @@ server.on('error', (e: NodeJS.ErrnoException) => {
   throw e;
 });
 
+/** 부트 주소 두 개(데몬이 내보내는 얼굴 / vite 개발 서버). 코드마다 120초 안에 한 번만 쓴다. */
+function printBootUrls() {
+  const direct = issueBoot();
+  const dev = issueBoot(DEV_PORT);
+  console.log(`  얼굴 열기(dist, 120초 안에 한 번):  ${direct.url}`);
+  console.log(`  개발 서버(npm run dev, 120초 안에 한 번): ${dev.url}`);
+  console.log(`    오버레이는 주소 끝에 &mode=overlay — 새 주소는 이 터미널에서 Enter`);
+}
+
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`가짜 곁 데몬: http://127.0.0.1:${PORT}/  (토큰 ${TOKEN})`);
-  console.log(`  오버레이: http://127.0.0.1:${PORT}/?mode=overlay`);
-  console.log(`  개발 서버와 함께: npm run dev → http://localhost:5173/?t=${TOKEN}`);
-  console.log(`  손으로: curl "http://127.0.0.1:${PORT}/mock/trigger?what=interrupt&t=${TOKEN}"`);
+  const addr = server.address();
+  if (addr && typeof addr === 'object') listenPort = addr.port;
+  const bearer = `-H "Authorization: Bearer ${TOKEN}"`;
+  console.log(`가짜 곁 데몬: http://127.0.0.1:${listenPort}/`);
+  console.log(`  개발용 토큰: ${TOKEN}  (GYEOT_TOKEN 으로 정할 수 있어요)`);
+  printBootUrls();
+  console.log(`  부트 코드 직접: curl -s -X POST ${bearer} http://127.0.0.1:${listenPort}/v1/boot`);
+  console.log(`  손으로: curl ${bearer} "http://127.0.0.1:${listenPort}/mock/trigger?what=interrupt"`);
   console.log(`  dj-assis 세션은 channel 이 있지만 답하지 않아요(§10.1 안내 확인용).`);
+  if (process.stdin.isTTY) {
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', () => printBootUrls());
+  }
   if (!QUIET) {
     for (const [ms, what] of SCRIPT) setTimeout(() => trigger(what), ms).unref();
     setInterval(() => {

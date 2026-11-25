@@ -16,11 +16,19 @@ pub const SPOOL_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// 다른 쪽이 집어 간 채로 이만큼 지난 스풀 파일은 다시 집는다(그쪽이 죽었다고 본다).
 const STALE_CLAIM: Duration = Duration::from_secs(300);
 
-/// 데이터 폴더와 하위 폴더를 만든다.
+/// 데이터 폴더와 하위 폴더를 만든다. 스풀 폴더는 사용자 전용(Unix 0700, 계약 §12.5).
 pub fn ensure_dirs(home: &Path) -> Result<()> {
     for d in [home.to_path_buf(), home.join("events"), home.join("spool")] {
         fs::create_dir_all(&d)
             .with_context(|| format!("폴더 {}를 만들지 못했어요", d.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let spool = home.join("spool");
+        if let Err(e) = fs::set_permissions(&spool, fs::Permissions::from_mode(0o700)) {
+            tracing::warn!("스풀 폴더 {} 권한을 좁히지 못했어요: {e}", spool.display());
+        }
     }
     Ok(())
 }
@@ -430,6 +438,25 @@ mod tests {
         let t2 = ensure_token(&p).unwrap();
         assert_ne!(t2, t);
         assert!(is_valid_token(&t2));
+    }
+
+    #[test]
+    fn spool_dir_is_private() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        ensure_dirs(&home).unwrap();
+        assert!(home.join("events").is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let spool = home.join("spool");
+            let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&spool), 0o700);
+            // 이미 있던 느슨한 폴더도 좁힌다
+            fs::set_permissions(&spool, fs::Permissions::from_mode(0o755)).unwrap();
+            ensure_dirs(&home).unwrap();
+            assert_eq!(mode(&spool), 0o700);
+        }
     }
 
     #[test]

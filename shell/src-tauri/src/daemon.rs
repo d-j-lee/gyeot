@@ -206,24 +206,76 @@ pub fn set_focus(
     on: bool,
     minutes: Option<u32>,
 ) -> Result<Option<i64>, String> {
-    let token = crate::paths::read_token(data_dir)?;
-    let body = focus_body(on, minutes);
-    let resp = http::request(
-        port,
-        "POST",
-        "/v1/focus",
-        Some(&token),
-        Some(&body),
-        Duration::from_secs(3),
-    )
-    .map_err(|e| format!("곁 데몬에 닿지 않아요: {e}"))?;
+    let resp = post_with_token(port, data_dir, "/v1/focus", &focus_body(on, minutes))?;
     match resp.status {
         200 => {
             let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or_default();
             Ok(v.get("until_ms").and_then(serde_json::Value::as_i64))
         }
-        401 => Err("토큰이 맞지 않아요(401). 데몬을 다시 시작해 보세요.".into()),
+        401 => Err(TOKEN_REFUSED.into()),
         s => Err(format!("집중 모드 요청이 HTTP {s}로 끝났어요")),
+    }
+}
+
+/// `POST /v1/boot` 응답(docs/contracts.md §12.1). 셸은 `code`만 쓴다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Boot {
+    pub code: String,
+    pub expires_ms: Option<i64>,
+}
+
+/// 부트 코드 모양: hex 32–128자(계약은 32바이트 hex = 64자). 주소에 넣으므로 다른 글자는 받지 않는다.
+pub fn is_valid_boot_code(code: &str) -> bool {
+    (32..=128).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `{"code":…, "url":…, "expires_ms":…}`에서 코드를 꺼낸다. 서버가 준 `url`로는 가지 않는다
+/// (셸이 자기 포트·`?mode=overlay`로 주소를 만든다).
+pub fn parse_boot(body: &[u8]) -> Option<Boot> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = v.get("code")?.as_str()?;
+    if !is_valid_boot_code(code) {
+        return None;
+    }
+    Some(Boot {
+        code: code.to_string(),
+        expires_ms: v.get("expires_ms").and_then(serde_json::Value::as_i64),
+    })
+}
+
+/// 토큰 파일을 읽어 `Authorization: Bearer`로 `POST`한다. 셸이 데몬에 인증해서 묻는 길은 이것뿐이다.
+fn post_with_token(
+    port: u16,
+    data_dir: Option<&Path>,
+    path: &str,
+    body: &str,
+) -> Result<http::Response, String> {
+    let token = crate::paths::read_token(data_dir)?;
+    http::request(
+        port,
+        "POST",
+        path,
+        Some(&token),
+        Some(body),
+        Duration::from_secs(3),
+    )
+    .map_err(|e| format!("곁 데몬에 닿지 않아요: {e}"))
+}
+
+const TOKEN_REFUSED: &str = "토큰이 맞지 않아요(401). 데몬을 다시 시작해 보세요.";
+
+/// `POST /v1/boot` — 얼굴 창을 열 일회용 코드(120초, 한 번만, §12.1).
+pub fn request_boot(port: u16, data_dir: Option<&Path>) -> Result<Boot, String> {
+    let resp = post_with_token(port, data_dir, "/v1/boot", "{}")?;
+    match resp.status {
+        200 => parse_boot(&resp.body)
+            .ok_or_else(|| "곁 데몬의 부트 코드 응답 모양이 맞지 않아요".to_string()),
+        401 => Err(TOKEN_REFUSED.into()),
+        404 | 405 => Err(format!(
+            "곁 데몬이 부트 코드(/v1/boot)를 모르는 옛 판이에요(HTTP {}). 곁을 같은 판으로 다시 설치하세요(install.ps1).",
+            resp.status
+        )),
+        s => Err(format!("부트 코드 요청이 HTTP {s}로 끝났어요")),
     }
 }
 
@@ -279,6 +331,148 @@ mod tests {
         assert_eq!(v, serde_json::json!({ "on": true, "minutes": 30 }));
         let v: serde_json::Value = serde_json::from_str(&focus_body(false, None)).unwrap();
         assert_eq!(v, serde_json::json!({ "on": false }));
+    }
+
+    const CODE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn boot_body_must_carry_a_hex_code() {
+        let ok = format!(
+            r#"{{"code":"{CODE}","url":"http://127.0.0.1:47321/?boot={CODE}","expires_ms":1764126840123}}"#
+        );
+        assert_eq!(
+            parse_boot(ok.as_bytes()),
+            Some(Boot {
+                code: CODE.into(),
+                expires_ms: Some(1_764_126_840_123)
+            })
+        );
+        let no_expiry = format!(r#"{{"code":"{CODE}"}}"#);
+        assert_eq!(parse_boot(no_expiry.as_bytes()).unwrap().expires_ms, None);
+        // 주소에 들어가므로 hex가 아닌 글자·너무 짧거나 긴 코드는 받지 않는다
+        for bad in [
+            r#"{"url":"http://127.0.0.1:47321/?boot=x"}"#.to_string(),
+            r#"{"code":""}"#.to_string(),
+            r#"{"code":"abc"}"#.to_string(),
+            format!(r#"{{"code":"{CODE}&mode=evil"}}"#),
+            format!(r#"{{"code":"{}"}}"#, "a".repeat(200)),
+            format!(r#"{{"code":"{}"}}"#, CODE.replace('a', "가")),
+            r#"{"code":12}"#.to_string(),
+            "<html>".to_string(),
+        ] {
+            assert_eq!(parse_boot(bad.as_bytes()), None, "{bad}");
+        }
+        assert!(is_valid_boot_code(CODE));
+        assert!(!is_valid_boot_code(&CODE[..31]));
+    }
+
+    /// 가짜 데몬: 요청 하나를 받아 머리를 돌려주고 `reply`로 답한다.
+    fn fake_daemon(reply: &'static str) -> (u16, thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            let mut b = [0u8; 4096];
+            loop {
+                let n = s.read(&mut b).unwrap();
+                got.extend_from_slice(&b[..n]);
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let len = text[..head_end]
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if got.len() >= head_end + 4 + len || n == 0 {
+                        break;
+                    }
+                }
+            }
+            s.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8(got).unwrap()
+        });
+        (port, server)
+    }
+
+    fn temp_data_dir(tag: &str, token: Option<&str>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gyeot-shell-boot-{tag}-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(t) = token {
+            std::fs::write(dir.join("token"), format!("{t}\n")).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn boot_is_requested_with_bearer_only() {
+        const REPLY: &str = concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 126\r\n\r\n",
+            r#"{"code":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","url":"http://evil.example/?boot=x","expires_ms":1}"#
+        );
+        let token = "cd".repeat(32);
+        let dir = temp_data_dir("ok", Some(&token));
+        let (port, server) = fake_daemon(REPLY);
+        let boot = request_boot(port, Some(&dir)).expect("부트 코드");
+        assert_eq!(boot.code, CODE);
+        let seen = server.join().unwrap();
+        let first_line = seen.lines().next().unwrap();
+        assert_eq!(
+            first_line, "POST /v1/boot HTTP/1.1",
+            "쿼리 없이 경로만: {seen}"
+        );
+        assert!(
+            seen.contains(&format!("\r\nAuthorization: Bearer {token}\r\n")),
+            "{seen}"
+        );
+        assert!(
+            seen.contains(&format!("\r\nHost: 127.0.0.1:{port}\r\n")),
+            "{seen}"
+        );
+        let lower = seen.to_ascii_lowercase();
+        assert!(
+            !lower.contains("\norigin:"),
+            "Origin을 보내지 않는다: {seen}"
+        );
+        assert!(!lower.contains("cookie:"), "{seen}");
+        assert!(
+            !seen.contains(&format!("t={token}")),
+            "토큰은 URL에 싣지 않는다"
+        );
+        // 본문은 빈 JSON 객체(서버가 JSON 추출기를 써도 받도록)
+        assert!(seen.ends_with("\r\n\r\n{}"), "{seen}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn boot_failures_are_explained() {
+        let token = "ef".repeat(32);
+        let dir = temp_data_dir("err", Some(&token));
+        let (port, server) = fake_daemon("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+        let e = request_boot(port, Some(&dir)).unwrap_err();
+        assert!(e.contains("토큰"), "{e}");
+        server.join().unwrap();
+        let (port, server) = fake_daemon("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        let e = request_boot(port, Some(&dir)).unwrap_err();
+        assert!(e.contains("/v1/boot"), "{e}");
+        server.join().unwrap();
+        let (port, server) =
+            fake_daemon("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"code\":\"zz\"}");
+        let e = request_boot(port, Some(&dir)).unwrap_err();
+        assert!(e.contains("모양"), "{e}");
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        // 토큰이 없으면 데몬에 묻지도 않는다
+        let empty = temp_data_dir("none", None);
+        let e = request_boot(1, Some(&empty)).unwrap_err();
+        assert!(e.contains("토큰"), "{e}");
+        assert!(request_boot(1, None).is_err());
+        std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]

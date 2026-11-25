@@ -158,6 +158,34 @@ pub fn gyeot_event(
 
 /// channel 대기열에 쌓아 두는 최대 메시지 수.
 const QUEUE_MAX: usize = 200;
+/// channel마다 기억하는 발급한 `chat_id` 수(계약 §12.4).
+pub const ISSUED_MAX: usize = 256;
+/// 발급한 `chat_id`로 답할 수 있는 시간(계약 §12.4).
+pub const ISSUED_TTL_MS: i64 = 24 * 3_600_000;
+
+/// 데몬이 한 channel에 발급한 `chat_id`(say의 `m<n>`, 결정의 `d…`)와 발급 시각.
+#[derive(Debug, Default)]
+pub struct IssuedIds {
+    ids: VecDeque<(String, i64)>,
+}
+
+impl IssuedIds {
+    /// 발급을 기억한다. 같은 id면 시각만 새로 한다. 넘치면 가장 오래된 것부터 잊는다.
+    pub fn issue(&mut self, chat_id: &str, now_ms: i64) {
+        self.ids.retain(|(id, _)| id != chat_id);
+        self.ids.push_back((chat_id.to_owned(), now_ms));
+        while self.ids.len() > ISSUED_MAX {
+            self.ids.pop_front();
+        }
+    }
+
+    /// 24시간 안에 발급한 id인가.
+    pub fn contains(&self, chat_id: &str, now_ms: i64) -> bool {
+        self.ids
+            .iter()
+            .any(|(id, at)| id == chat_id && now_ms - *at <= ISSUED_TTL_MS)
+    }
+}
 
 /// channel 하나의 연결 상태.
 #[derive(Debug)]
@@ -176,6 +204,8 @@ pub struct ChannelConn {
     pub registered_at: Instant,
     /// 한 번이라도 스트림이 붙었는가.
     pub ever_connected: bool,
+    /// 이 channel에 발급한 `chat_id`.
+    pub issued: IssuedIds,
 }
 
 impl ChannelConn {
@@ -188,6 +218,7 @@ impl ChannelConn {
             disconnected_at: None,
             registered_at: Instant::now(),
             ever_connected: false,
+            issued: IssuedIds::default(),
         }
     }
 }
@@ -231,6 +262,24 @@ impl Channels {
         c.queue.push_back(msg);
         c.notify.notify_waiters();
         true
+    }
+
+    /// 이 channel에 `chat_id`를 발급했다고 기억한다. 없는 channel이면 `false`.
+    pub fn issue(&mut self, cid: &str, chat_id: &str, now_ms: i64) -> bool {
+        match self.map.get_mut(cid) {
+            Some(c) => {
+                c.issued.issue(chat_id, now_ms);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 이 channel에 24시간 안에 발급한 `chat_id`인가.
+    pub fn was_issued(&self, cid: &str, chat_id: &str, now_ms: i64) -> bool {
+        self.map
+            .get(cid)
+            .is_some_and(|c| c.issued.contains(chat_id, now_ms))
     }
 
     /// 새 스트림이 붙는다: 세대를 올리고 (세대, 알림)을 돌려준다.
@@ -332,6 +381,38 @@ mod tests {
         c.remove("x");
         assert!(!c.contains("x"));
         assert!(c.next_for("x", g2).is_err());
+    }
+
+    #[test]
+    fn issued_ids_expire_and_are_bounded() {
+        let t = 1_764_126_720_000;
+        let mut ids = IssuedIds::default();
+        ids.issue("m1", t);
+        assert!(ids.contains("m1", t));
+        assert!(ids.contains("m1", t + ISSUED_TTL_MS));
+        assert!(!ids.contains("m1", t + ISSUED_TTL_MS + 1));
+        assert!(!ids.contains("m2", t));
+        // 다시 발급하면 시각이 새로 된다
+        ids.issue("m1", t + ISSUED_TTL_MS);
+        assert!(ids.contains("m1", t + ISSUED_TTL_MS + 1));
+        for i in 0..ISSUED_MAX {
+            ids.issue(&format!("x{i}"), t + ISSUED_TTL_MS);
+        }
+        assert!(
+            !ids.contains("m1", t + ISSUED_TTL_MS),
+            "가장 오래된 것부터 잊는다"
+        );
+        assert!(ids.contains("x0", t + ISSUED_TTL_MS));
+        assert!(ids.contains(&format!("x{}", ISSUED_MAX - 1), t + ISSUED_TTL_MS));
+
+        let mut c = Channels::default();
+        assert!(!c.issue("ch", "m1", t));
+        c.register("ch");
+        assert!(c.issue("ch", "m1", t));
+        assert!(c.was_issued("ch", "m1", t));
+        assert!(!c.was_issued("other", "m1", t));
+        c.remove("ch");
+        assert!(!c.was_issued("ch", "m1", t));
     }
 
     #[test]

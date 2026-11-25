@@ -188,6 +188,21 @@
           }
         ]
       }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\<사용자>\\AppData\\Local\\gyeot\\bin\\gyeot-hook.exe",
+            "args": [
+              "claude-code"
+            ],
+            "async": true,
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

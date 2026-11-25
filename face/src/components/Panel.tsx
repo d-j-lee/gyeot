@@ -18,11 +18,15 @@ export interface PanelProps {
   status: ComponentChildren;
   turnCount: number;
   blockingCount: number;
+  /** 집중 모드 등으로 말풍선 없이 들어온 답의 수(§12.4) */
+  chatUnread?: number;
   toasts: Toast[];
   onDropToast: (id: number) => void;
   onClose?: () => void;
   /** 데모 모드 표시 */
   demo?: boolean;
+  /** 탭 위에 띄우는 안내(열쇠 만료 등) */
+  notice?: ComponentChildren;
   children: ComponentChildren;
   id?: string;
 }
@@ -92,11 +96,17 @@ export function Panel(p: PanelProps) {
                     {p.turnCount}
                   </span>
                 )}
+                {t.id === 'chat' && (p.chatUnread ?? 0) > 0 && (
+                  <span class="tab__count tab__count--unread" aria-label={`안 읽은 답 ${p.chatUnread}개`}>
+                    {p.chatUnread}
+                  </span>
+                )}
               </button>
             );
           })}
         </div>
       </header>
+      {p.notice}
       <div
         class={`panel__body panel__body--${p.tab}`}
         role="tabpanel"

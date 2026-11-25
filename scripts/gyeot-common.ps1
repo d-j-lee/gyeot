@@ -25,7 +25,9 @@ $script:GyeotClaudeEvents = @(
     @{ Name = 'TaskCompleted';      Matcher = $false },
     @{ Name = 'PreCompact';         Matcher = $true }
 )
-# 선택(잦음): 작업 중 표시용
+# 기본(docs/contracts.md §12.3): 병렬 도구 묶음이 끝나면 한 번 불린다(승인을 기다린 도구 포함).
+# 사람이 터미널에서 승인한 뒤 곁의 승인 대기를 닫는 신호라 기본으로 넣는다. matcher가 없는 이벤트다.
+# install.ps1 -NoActivityHook 이면 빼고, 이미 넣은 곁의 항목도 걷어 낸다.
 $script:GyeotClaudeActivityEvent = @{ Name = 'PostToolBatch'; Matcher = $false }
 
 # Codex 훅(~/.codex/hooks.json). Codex에 있는 이벤트 가운데 곁이 정규화하는 것만.
@@ -270,9 +272,10 @@ function Write-GyeotTextFile([string]$Path, [string]$Text) {
 
 # ───────────────────────── Claude Code 훅 ─────────────────────────
 
-function Get-GyeotClaudeEventList([switch]$IncludeActivity) {
+# 곁이 넣는 Claude Code 훅 이벤트. 기본은 PostToolBatch 포함, -NoActivity 이면 뺀다.
+function Get-GyeotClaudeEventList([switch]$NoActivity) {
     $list = @($script:GyeotClaudeEvents)
-    if ($IncludeActivity) { $list += $script:GyeotClaudeActivityEvent }
+    if (-not $NoActivity) { $list += $script:GyeotClaudeActivityEvent }
     return $list
 }
 
@@ -303,9 +306,9 @@ function Test-GyeotHookHandler($Handler) {
 }
 
 # Claude Code 훅 조각 전체({ "hooks": { … } }).
-function New-GyeotClaudeHooksSnippet([string]$HookExe, [switch]$IncludeActivity) {
+function New-GyeotClaudeHooksSnippet([string]$HookExe, [switch]$NoActivity) {
     $hooks = New-GyeotDict
-    foreach ($ev in (Get-GyeotClaudeEventList -IncludeActivity:$IncludeActivity)) {
+    foreach ($ev in (Get-GyeotClaudeEventList -NoActivity:$NoActivity)) {
         $hooks[$ev.Name] = (New-GyeotList @(, (New-GyeotClaudeGroup $HookExe $ev.Matcher)))
     }
     $root = New-GyeotDict
@@ -314,16 +317,20 @@ function New-GyeotClaudeHooksSnippet([string]$HookExe, [switch]$IncludeActivity)
 }
 
 # settings 나무에 곁의 훅을 더한다. 기존 훅은 지우지 않는다. 이미 있으면 경로만 맞춘다.
-# 돌려주는 값: @{ Added = n; Updated = n; Kept = n }
+# -NoActivity 이면 PostToolBatch 를 더하지 않고, 이미 있는 곁의 PostToolBatch 처리기만 뺀다.
+# 돌려주는 값: @{ Added = n; Updated = n; Kept = n; Removed = n }
 function Merge-GyeotClaudeHook {
-    param($Settings, [string]$HookExe, [switch]$IncludeActivity)
-    $result = @{ Added = 0; Updated = 0; Kept = 0 }
+    param($Settings, [string]$HookExe, [switch]$NoActivity)
+    $result = @{ Added = 0; Updated = 0; Kept = 0; Removed = 0 }
     if (-not $Settings.Contains('hooks') -or $null -eq $Settings['hooks']) {
         $Settings['hooks'] = (New-GyeotDict)
     }
     $hooks = $Settings['hooks']
     if ($hooks -isnot [System.Collections.IDictionary]) { throw 'settings.json의 "hooks"가 객체가 아니에요. 손으로 확인해 주세요.' }
-    foreach ($ev in (Get-GyeotClaudeEventList -IncludeActivity:$IncludeActivity)) {
+    if ($NoActivity) {
+        $result.Removed = Remove-GyeotClaudeHook -Settings $Settings -EventName $script:GyeotClaudeActivityEvent.Name
+    }
+    foreach ($ev in (Get-GyeotClaudeEventList -NoActivity:$NoActivity)) {
         $name = $ev.Name
         if (-not $hooks.Contains($name) -or $null -eq $hooks[$name]) { $hooks[$name] = (New-GyeotList @()) }
         $groups = $hooks[$name]
@@ -357,14 +364,16 @@ function Merge-GyeotClaudeHook {
     return $result
 }
 
-# 곁의 처리기만 뺀다. 그 때문에 빈 묶음·빈 이벤트가 되면 그것도 뺀다. 돌려주는 값: 뺀 수.
+# 곁의 처리기만 뺀다(PostToolBatch 포함). 그 때문에 빈 묶음·빈 이벤트가 되면 그것도 뺀다.
+# -EventName 을 주면 그 이벤트에서만 뺀다. 돌려주는 값: 뺀 수.
 function Remove-GyeotClaudeHook {
-    param($Settings)
+    param($Settings, [string]$EventName)
     $removed = 0
     if (-not $Settings.Contains('hooks')) { return 0 }
     $hooks = $Settings['hooks']
     if ($hooks -isnot [System.Collections.IDictionary]) { return 0 }
     foreach ($name in @($hooks.Keys)) {
+        if ($EventName -and $name -cne $EventName) { continue }
         $groups = $hooks[$name]
         if ($groups -isnot [System.Collections.IList]) { continue }
         $touched = $false

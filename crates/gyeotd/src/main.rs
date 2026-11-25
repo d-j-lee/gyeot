@@ -1,21 +1,28 @@
-//! 곁 데몬: `gyeotd`(서버), `--init`, `--print-config`, `--version`.
+//! 곁 데몬: `gyeotd`(서버), `--open [--print]`, `--init`, `--print-config`, `--version`.
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use gyeot_server::ServerConfig;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// `--open`이 데몬의 답을 기다리는 시간.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// 시작할 때 보이는 얼굴 여는 방법.
+const OPEN_HINT: &str = "얼굴 열기: gyeotd --open";
 
 const HELP: &str = "곁 데몬
 
 사용:
   gyeotd                 서버를 돌린다(Ctrl+C로 멈춤)
+  gyeotd --open          실행 중인 데몬에서 일회용 열기 코드를 받아 기본 브라우저로 얼굴을 연다
+  gyeotd --open --print  여는 대신 주소만 보인다(120초 안에 한 번 쓸 수 있다)
   gyeotd --init          데이터 폴더와 토큰을 만들고 경로를 보인다
   gyeotd --print-config  실제로 쓰는 설정을 보인다
   gyeotd --version       판을 보인다
@@ -26,6 +33,7 @@ const HELP: &str = "곁 데몬
 #[derive(Debug, PartialEq, Eq)]
 enum Cmd {
     Run,
+    Open { print: bool },
     Init,
     PrintConfig,
     Version,
@@ -34,8 +42,14 @@ enum Cmd {
 
 fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cmd, String> {
     let mut cmd = Cmd::Run;
+    let mut print = false;
     for a in args {
         let next = match a.as_str() {
+            "--open" => Cmd::Open { print: false },
+            "--print" => {
+                print = true;
+                continue;
+            }
             "--init" => Cmd::Init,
             "--print-config" => Cmd::PrintConfig,
             "--version" | "-V" => Cmd::Version,
@@ -47,7 +61,109 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cmd, String> {
         }
         cmd = next;
     }
-    Ok(cmd)
+    match cmd {
+        Cmd::Open { .. } => Ok(Cmd::Open { print }),
+        _ if print => Err("--print는 --open과 함께 써요".to_owned()),
+        other => Ok(other),
+    }
+}
+
+/// 기본 브라우저로 주소를 여는 명령(계약 §12.1).
+fn opener(url: &str) -> (&'static str, Vec<String>) {
+    if cfg!(windows) {
+        (
+            "rundll32",
+            vec!["url.dll,FileProtocolHandler".to_owned(), url.to_owned()],
+        )
+    } else if cfg!(target_os = "macos") {
+        ("open", vec![url.to_owned()])
+    } else {
+        ("xdg-open", vec![url.to_owned()])
+    }
+}
+
+fn read_token(path: &Path) -> Result<String> {
+    let s = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "토큰 파일 {}을 읽지 못했어요. 곁 데몬(gyeotd)을 먼저 한 번 띄우세요",
+            path.display()
+        )
+    })?;
+    let t = s.trim();
+    if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(
+            "토큰 파일 {}의 모양이 맞지 않아요(64자 hex)",
+            path.display()
+        );
+    }
+    Ok(t.to_owned())
+}
+
+/// 실행 중인 데몬에 `POST /v1/boot` 해서 일회용 열기 주소를 받는다.
+fn boot_url(cfg: &ServerConfig) -> Result<String> {
+    let token = read_token(&cfg.token_path())?;
+    let base = format!("http://127.0.0.1:{}", cfg.port);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(OPEN_TIMEOUT))
+        .proxy(None)
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into();
+    let mut resp = agent
+        .post(format!("{base}/v1/boot"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .send_empty()
+        .map_err(|e| {
+            anyhow::anyhow!("곁 데몬에 닿지 않아요({base}). 먼저 gyeotd를 띄우세요 — {e}")
+        })?;
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    match status {
+        200 => {}
+        401 => bail!(
+            "토큰이 맞지 않아요. 그 포트({base})에는 다른 데이터 폴더(GYEOT_HOME)의 데몬이 떠 있을 수 있어요"
+        ),
+        s => bail!("데몬이 {s}로 답했어요({base}/v1/boot)"),
+    }
+    let v: serde_json::Value = serde_json::from_str(&body).context("데몬의 답을 읽지 못했어요")?;
+    let url = v["url"].as_str().unwrap_or_default();
+    // 데몬이 준 주소가 이 루프백 주소의 부트 주소인지 확인한다(엉뚱한 곳을 열지 않는다).
+    let ok = url
+        .strip_prefix(&format!("{base}/?boot="))
+        .is_some_and(|c| c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit()));
+    if !ok {
+        bail!("데몬이 준 주소가 이상해요: {url}");
+    }
+    Ok(url.to_owned())
+}
+
+fn open_face(print: bool) -> Result<()> {
+    let cfg = ServerConfig::from_env()?;
+    let url = boot_url(&cfg)?;
+    if print {
+        println!("{url}");
+        return Ok(());
+    }
+    let (prog, args) = opener(&url);
+    let status = std::process::Command::new(prog)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("곁의 얼굴을 기본 브라우저로 열었어요");
+            Ok(())
+        }
+        Ok(s) => bail!(
+            "브라우저를 열지 못했어요({prog}: {s}). 120초 안에 이 주소를 브라우저에 붙여 넣으세요: {url}"
+        ),
+        Err(e) => bail!(
+            "브라우저를 열지 못했어요({prog}: {e}). 120초 안에 이 주소를 브라우저에 붙여 넣으세요: {url}"
+        ),
+    }
 }
 
 /// 표준 오류와 로그 파일에 함께 쓴다.
@@ -135,6 +251,7 @@ async fn shutdown_signal() {
 
 fn run(cmd: Cmd) -> Result<()> {
     match cmd {
+        Cmd::Open { print } => open_face(print),
         Cmd::Version => {
             println!("gyeotd {VERSION}");
             Ok(())
@@ -168,7 +285,11 @@ fn run(cmd: Cmd) -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(gyeot_server::serve(cfg, shutdown_signal()))
+            rt.block_on(async {
+                let server = gyeot_server::bind(cfg).await?;
+                tracing::info!("{OPEN_HINT}");
+                server.run(shutdown_signal()).await
+            })
         }
     }
 }
@@ -210,6 +331,26 @@ mod tests {
         assert!(p(&["--bogus"]).is_err());
         assert!(p(&["--init", "--version"]).is_err());
         assert_eq!(p(&["--init", "--init"]), Ok(Cmd::Init));
+        assert_eq!(p(&["--open"]), Ok(Cmd::Open { print: false }));
+        assert_eq!(p(&["--open", "--print"]), Ok(Cmd::Open { print: true }));
+        assert_eq!(p(&["--print", "--open"]), Ok(Cmd::Open { print: true }));
+        assert!(p(&["--print"]).is_err());
+        assert!(p(&["--init", "--print"]).is_err());
+        assert!(p(&["--open", "--init"]).is_err());
+    }
+
+    #[test]
+    fn opener_per_os() {
+        let url = "http://127.0.0.1:47321/?boot=ab";
+        let (prog, args) = opener(url);
+        if cfg!(windows) {
+            assert_eq!(prog, "rundll32");
+            assert_eq!(args, vec!["url.dll,FileProtocolHandler", url]);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!((prog, args), ("open", vec![url.to_owned()]));
+        } else {
+            assert_eq!((prog, args), ("xdg-open", vec![url.to_owned()]));
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const EXE = process.platform === 'win32' ? '.exe' : '';
-const BIN = path.join(ROOT, 'target', 'debug');
+const BIN = path.join(process.env.CARGO_TARGET_DIR ? path.resolve(process.env.CARGO_TARGET_DIR) : path.join(ROOT, 'target'), 'debug');
 const GYEOTD = path.join(BIN, `gyeotd${EXE}`);
 const HOOK = path.join(BIN, `gyeot-hook${EXE}`);
 const CHANNEL = path.join(ROOT, 'channel', 'dist', 'gyeot-channel.mjs');
@@ -94,6 +94,7 @@ function raw(method, p, { headers = {}, body } = {}) {
   });
 }
 let TOKEN = '';
+let COOKIE = '';
 const auth = () => ({ Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' });
 async function api(method, p, body) {
   const r = await raw(method, p, { headers: auth(), body });
@@ -107,7 +108,7 @@ async function api(method, p, body) {
 // 얼굴이 받는 SSE를 그대로 받아 둔다.
 const sse = [];
 function openStream() {
-  const req = http.get({ host: '127.0.0.1', port: PORT, path: `/v1/stream?t=${TOKEN}` }, (res) => {
+  const req = http.get({ host: '127.0.0.1', port: PORT, path: '/v1/stream', headers: { Authorization: `Bearer ${TOKEN}` } }, (res) => {
     let buf = '';
     res.setEncoding('utf8');
     res.on('data', (chunk) => {
@@ -166,8 +167,22 @@ try {
   check('토큰 없이 /v1/state → 401', (await raw('GET', '/v1/state')).status === 401);
   check('다른 Host → 421', (await raw('GET', '/v1/state', { headers: { ...auth(), Host: `evil.example:${PORT}` } })).status === 421);
   check('다른 Origin → 403', (await raw('GET', '/v1/state', { headers: { ...auth(), Origin: 'https://evil.example' } })).status === 403);
-  const index = await raw('GET', '/');
-  check('index.html에 토큰이 채워짐', index.status === 200 && index.body.includes(`content="${TOKEN}"`));
+  check('쿼리 토큰(?t=)은 받지 않음 → 401', (await raw('GET', `/v1/state?t=${TOKEN}`)).status === 401);
+  check('Tauri 출처도 거절 → 403', (await raw('GET', '/v1/state', { headers: { ...auth(), Origin: 'http://tauri.localhost' } })).status === 403);
+  const bare = await raw('GET', '/');
+  check('쿠키 없는 GET / → 401 안내 쪽, 토큰 없음', bare.status === 401 && !bare.body.includes(TOKEN) && /gyeotd --open/.test(bare.body));
+  check('얼굴 응답에 CSP frame-ancestors none·X-Frame-Options DENY', /frame-ancestors 'none'/.test(bare.headers['content-security-policy'] ?? '') && bare.headers['x-frame-options'] === 'DENY');
+  const boot = await api('POST', '/v1/boot');
+  check('POST /v1/boot(토큰) → 일회용 코드', boot.status === 200 && /^[0-9a-f]{64}$/.test(boot.json?.code ?? ''), boot.json?.url);
+  const enter = await raw('GET', `/?mode=overlay&boot=${boot.json?.code}`);
+  const setCookie = String(enter.headers['set-cookie'] ?? '');
+  COOKIE = (setCookie.match(/gyeot_session=([0-9a-f]+)/) ?? [])[1] ?? '';
+  check('부트 코드 → 303 + HttpOnly·SameSite=Strict 쿠키, 주소에서 코드 제거', enter.status === 303 && /HttpOnly/i.test(setCookie) && /SameSite=Strict/i.test(setCookie) && enter.headers.location === '/?mode=overlay' && COOKIE.length === 64, enter.headers.location);
+  check('같은 코드 재사용 → 401', (await raw('GET', `/?boot=${boot.json?.code}`)).status === 401);
+  const face = await raw('GET', '/', { headers: { Cookie: `gyeot_session=${COOKIE}` } });
+  check('쿠키로 GET / → 얼굴, 페이지에 토큰 없음', face.status === 200 && /<div id="app"|<script/.test(face.body) && !face.body.includes(TOKEN));
+  check('쿠키로 /v1/state → 200', (await raw('GET', '/v1/state', { headers: { Cookie: `gyeot_session=${COOKIE}` } })).status === 200);
+  check('쿠키로는 부트 코드를 못 만듦 → 401', (await raw('POST', '/v1/boot', { headers: { Cookie: `gyeot_session=${COOKIE}` } })).status === 401);
 
   openStream();
   check('SSE 첫 snapshot', await seen('snapshot', (d) => Array.isArray(d.items)));
@@ -226,8 +241,9 @@ try {
   check('전달 판단에 한국어 이유', d2 && d2.data.reasons?.length > 0 && /[가-힣]/.test(d2.data.reasons.join('')));
 
   // 7. 승인된 뒤 같은 도구 작업 신호 → approval 닫힘
-  hook('claude-code', { ...common(S1, CWD1, 'PostToolUse'), tool_name: 'Bash', tool_input: { command: 'npm install -D vitest' } });
-  check('같은 도구 작업 신호 → 승인 항목 닫힘', await seen('item_removed', (d) => d.id === appr?.data.id));
+  // 설치기가 기본으로 넣는 PostToolBatch(도구 이름 없음)가 승인 대기를 닫아야 한다(R1 H2).
+  hook('claude-code', { ...common(S1, CWD1, 'PostToolBatch') });
+  check('PostToolBatch(설치 기본 훅) → 승인 항목 닫힘', await seen('item_removed', (d) => d.id === appr?.data.id));
 
   // 8. 질문으로 끝난 턴 → decision
   hook('claude-code', {
@@ -250,6 +266,9 @@ try {
   check('reply 도구 성공', rep && !rep.isError);
   const replyEv = await seen('reply', (d) => d.chat_id === meta.chat_id);
   check('얼굴 SSE에 reply(세션 1)', replyEv && replyEv.data.session === S1 && /CI 게이트/.test(replyEv.data.text));
+  const cid = (await api('GET', '/v1/state')).json.sessions.find((x) => x.id === S1)?.channel;
+  const forged = await api('POST', '/v1/channel/reply', { cid, chat_id: 'never-issued-99', text: '[브리핑] 끼어들기' });
+  check('발급하지 않은 chat_id의 reply → 400', forged.status === 400, JSON.stringify(forged.json));
 
   // 11. Claude가 결정 카드를 내밀고, 사람이 고르면 같은 세션으로 돌아간다
   const dec = await client.callTool({ name: 'request_decision', arguments: { question: 'CI에도 같은 게이트를 걸까요?', options: ['지금 걸기', '다음 PR에서'] } });
@@ -292,6 +311,9 @@ try {
   await waitFor(async () => (await raw('GET', '/health').catch(() => null))?.status === 200, 15000, 100);
   const after = (await api('GET', '/v1/state')).json.items.map((i) => `${i.session}:${i.kind}:${i.state}`).sort();
   check('재시작 뒤 같은 항목(재생)', JSON.stringify(before) === JSON.stringify(after), after.join(', '));
+  check('재시작 뒤에도 세션 쿠키 유효(sessions.json)', (await raw('GET', '/v1/state', { headers: { Cookie: `gyeot_session=${COOKIE}` } })).status === 200);
+  const sess = fs.readFileSync(path.join(HOME, 'sessions.json'), 'utf8');
+  check('sessions.json에 세션 값 원문이 없음(해시만)', !sess.includes(COOKIE));
   const logs = fs.readdirSync(path.join(HOME, 'events'));
   const logText = logs.map((f) => fs.readFileSync(path.join(HOME, 'events', f), 'utf8')).join('');
   check('프롬프트 본문은 저장하지 않음', !logText.includes('테스트 하네스를 붙여 줘'));
@@ -303,6 +325,16 @@ try {
   const took = Date.now() - t0;
   const spooled = fs.existsSync(path.join(HOME, 'spool')) && fs.readdirSync(path.join(HOME, 'spool')).length > 0;
   check('데몬 없음: 훅 exit 0, stdout 비어 있음, 스풀에 남음', h.code === 0 && h.stdout === '' && spooled, `${took}ms`);
+  const SECRET = 'sk-ant-api03-' + 'A'.repeat(40);
+  hook('claude-code', { ...common(S2, CWD2, 'UserPromptSubmit'), prompt: `내 비밀번호는 hunter2 그리고 ${SECRET}` });
+  hook('claude-code', { ...common(S2, CWD2, 'PermissionRequest'), tool_name: 'Write', tool_input: { file_path: path.join(CWD2, '.env'), content: `DB_PASSWORD=supersecret\nKEY=${SECRET}` } });
+  const spoolDir = path.join(HOME, 'spool');
+  const spoolText = fs.readdirSync(spoolDir).map((f) => fs.readFileSync(path.join(spoolDir, f), 'utf8')).join('\n');
+  check('스풀에 프롬프트 본문·파일 내용·비밀이 없음(R1 M3)', !/hunter2|supersecret/.test(spoolText) && !spoolText.includes(SECRET));
+  if (process.platform !== 'win32') {
+    const modes = fs.readdirSync(spoolDir).map((f) => fs.statSync(path.join(spoolDir, f)).mode & 0o777);
+    check('스풀 파일 권한 0600', modes.length > 0 && modes.every((m) => m === 0o600), modes.map((m) => m.toString(8)).join(','));
+  }
   daemon = startDaemon();
   await waitFor(async () => (await raw('GET', '/health').catch(() => null))?.status === 200, 15000, 100);
   check('데몬이 다시 뜨면 스풀을 비움', await waitFor(() => fs.readdirSync(path.join(HOME, 'spool')).length === 0, 8000, 200));
@@ -372,7 +404,8 @@ async function shootFace(dir) {
   await send('Emulation.setDefaultBackgroundColorOverride', { color: { r: 226, g: 231, b: 238, a: 1 } });
 
   await send('Emulation.setDeviceMetricsOverride', { width: 420, height: 700, deviceScaleFactor: 2, mobile: false });
-  await send('Page.navigate', { url: `${BASE}/?mode=overlay` });
+  const bootShot = await api('POST', '/v1/boot');
+  await send('Page.navigate', { url: `${BASE}/?mode=overlay&boot=${bootShot.json?.code}` });
   await sleep(2500);
   const ovOk = await send('Runtime.evaluate', { expression: '!!document.querySelector(".ov-avatar")', returnByValue: true });
   check('실제 데몬에 붙은 얼굴(오버레이)이 그려짐', ovOk.result?.result?.value === true);
