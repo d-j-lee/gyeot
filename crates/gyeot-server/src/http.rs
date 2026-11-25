@@ -259,13 +259,25 @@ pub fn session_may_use(path: &str) -> bool {
 /// 인증은 `Authorization: Bearer` 하나다. 쿠키는 어떤 경로에서도 보지 않고, `Set-Cookie`도 내지 않는다
 /// (G-030). 얼굴 쪽(`/`·`/assets/*`)과 `/health`·`/v1/hello`·`/v1/session`은 인증 없이 받는다.
 async fn guard(State(st): State<St>, req: Request, next: Next) -> Response {
+    match rejection(&st, &req) {
+        None => next.run(req).await,
+        Some(resp) => {
+            // 거절도 본문을 다 읽은 뒤 답한다. 남긴 채 닫으면 Windows가 RST를 보내 클라이언트가
+            // 거절 응답까지 잃는다(CI windows-latest, 2026-11-26). 한도를 넘으면 거기서 그친다.
+            let _ = axum::body::to_bytes(req.into_body(), BODY_LIMIT).await;
+            resp
+        }
+    }
+}
+
+fn rejection(st: &St, req: &Request) -> Option<Response> {
     if !host_ok(request_host(req.headers(), req.uri()), st.port) {
-        return err(StatusCode::MISDIRECTED_REQUEST, "Host가 맞지 않아요");
+        return Some(err(StatusCode::MISDIRECTED_REQUEST, "Host가 맞지 않아요"));
     }
     if let Some(v) = req.headers().get(header::ORIGIN) {
         match v.to_str() {
             Ok(o) if origin_ok(o, st.port) => {}
-            _ => return err(StatusCode::FORBIDDEN, "허용하지 않는 Origin이에요"),
+            _ => return Some(err(StatusCode::FORBIDDEN, "허용하지 않는 Origin이에요")),
         }
     }
     let path = req.uri().path();
@@ -273,11 +285,11 @@ async fn guard(State(st): State<St>, req: Request, next: Next) -> Response {
         match st.caller(req.headers()) {
             Some(Caller::Token) => {}
             Some(Caller::Session) if session_may_use(path) => {}
-            Some(Caller::Session) => return err(StatusCode::FORBIDDEN, KEY_NOT_ALLOWED),
-            None => return err(StatusCode::UNAUTHORIZED, UNAUTHORIZED),
+            Some(Caller::Session) => return Some(err(StatusCode::FORBIDDEN, KEY_NOT_ALLOWED)),
+            None => return Some(err(StatusCode::UNAUTHORIZED, UNAUTHORIZED)),
         }
     }
-    next.run(req).await
+    None
 }
 
 /// 라우터.

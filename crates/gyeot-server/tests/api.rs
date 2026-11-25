@@ -1724,3 +1724,38 @@ async fn boot_reads_body_before_answering() {
     }
     srv.stop().await;
 }
+
+/// 거절(401·403·421)도 본문을 다 읽은 뒤 답한다. 본문을 남긴 채 닫으면 Windows가 RST를 보내
+/// 클라이언트가 거절 응답까지 잃는다(CI windows-latest에서 상태 0으로 관찰, 2026-11-26).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejections_read_body_before_answering() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let d = tempfile::tempdir().unwrap();
+    let srv = TestServer::start(d.path()).await;
+    let cases = [
+        ("Authorization: Bearer nope\r\n".to_owned(), srv.host(), "401"),
+        (String::new(), "evil.example".to_owned(), "421"),
+    ];
+    for (auth, host, want) in cases {
+        let mut s = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        s.set_nodelay(true).unwrap();
+        let head = format!(
+            "POST /v1/ingest/claude-code HTTP/1.1\r\nHost: {host}\r\n{auth}Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut buf = Vec::new();
+        let first = tokio::time::timeout(Duration::from_millis(50), s.read_buf(&mut buf)).await;
+        assert!(
+            first.is_err() || buf.is_empty(),
+            "본문을 받기 전에 답했다({want}): {}",
+            String::from_utf8_lossy(&buf)
+        );
+        let _ = s.write_all(b"{}").await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with(&format!("HTTP/1.1 {want}")), "응답: {text}");
+    }
+    srv.stop().await;
+}
