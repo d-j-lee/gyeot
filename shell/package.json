@@ -1,0 +1,16 @@
+{
+  "name": "gyeot-shell",
+  "private": true,
+  "version": "0.1.0",
+  "description": "곁(gyeot) Windows 데스크톱 셸 — Tauri 2 투명 오버레이",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:nsis": "tauri build --bundles nsis",
+    "icon": "python3 tools/make_icon.py && tauri icon assets/gyeot-idle-1024.png -o src-tauri/icons && node -e \"for (const d of ['android','ios']) require('fs').rmSync('src-tauri/icons/'+d,{recursive:true,force:true})\""
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.6"
+  }
+}

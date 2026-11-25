@@ -1,0 +1,10 @@
+# Codex notify — 턴이 끝나거나 승인을 기다릴 때 Codex가 곁에 알린다.
+#
+# 넣을 곳: ~/.codex/config.toml  (Windows: %USERPROFILE%\.codex\config.toml)
+#          맨 위, 어떤 [표]보다도 앞(최상위 키)에 둔다. 이미 notify 가 있으면 둘 중 하나만 쓸 수 있다.
+# 경로:    %LOCALAPPDATA%\gyeot\bin\gyeot-hook.exe 를 펼친 절대 경로.
+#          install.ps1 이 실제 경로를 채운 줄을 출력하고 %LOCALAPPDATA%\gyeot\snippets\ 에도 저장한다.
+# 작은따옴표는 TOML 리터럴 문자열이라 역슬래시를 두 번 쓰지 않아도 된다.
+#
+# 페이로드 JSON이 마지막 명령줄 인자로 온다는 것은 실측 전이다(docs/roadmap.md F4).
+notify = ['C:\Users\<사용자>\AppData\Local\gyeot\bin\gyeot-hook.exe', 'codex-notify']

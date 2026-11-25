@@ -1,0 +1,364 @@
+# 곁(gyeot) CI — 이 컨테이너(Linux)에서 돌려 보지 못한 것(Windows 빌드·Tauri 셸·PowerShell 설치)을 여기서 확인한다.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: short
+  NODE_VERSION: "22"
+
+jobs:
+  # ───────────── Rust 워크스페이스(코어·서버·데몬·훅 심) ─────────────
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: workspace
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+      - name: gyeot-core wasm 빌드 확인
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check -p gyeot-core --target wasm32-unknown-unknown
+
+  # ───────────── 얼굴(face) ─────────────
+  face:
+    name: face
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: face
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - id: npm-cache
+        run: echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.npm-cache.outputs.dir }}
+          key: npm-${{ runner.os }}-face-${{ hashFiles('face/package-lock.json', 'face/package.json') }}
+          restore-keys: npm-${{ runner.os }}-face-
+      - name: 의존성 설치
+        run: if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # ───────────── channel(MCP 서버) ─────────────
+  channel:
+    name: channel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: channel
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - id: npm-cache
+        run: echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.npm-cache.outputs.dir }}
+          key: npm-${{ runner.os }}-channel-${{ hashFiles('channel/package-lock.json', 'channel/package.json') }}
+          restore-keys: npm-${{ runner.os }}-channel-
+      - name: 의존성 설치
+        run: if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # ───────────── 끝-끝 실측: 실제 데몬·훅 심·channel·얼굴(Chrome)을 잇는다 ─────────────
+  e2e:
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: 빌드(데몬·훅 심)
+        run: cargo build --workspace
+      - name: 빌드(얼굴)
+        working-directory: face
+        run: npm ci --no-audit --no-fund && npm run build
+      - name: 빌드(channel)
+        working-directory: channel
+        run: npm ci --no-audit --no-fund && npm run build
+      - name: 끝-끝 실측
+        run: node tests/e2e/e2e.mjs --screenshots e2e-shots
+      - name: 실측 화면 올리기
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-shots-${{ matrix.os }}
+          path: e2e-shots
+          if-no-files-found: ignore
+
+  # ───────────── Tauri 셸: 포맷·린트·단위 시험(ACL 시험 포함) ─────────────
+  shell:
+    name: shell (windows)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: shell/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shell/src-tauri -> target
+          key: shell-debug
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --locked
+
+  # ───────────── 설치 스크립트: 구문·린트·가짜 파일로 설치/지우기 시험(5.1·7) ─────────────
+  scripts:
+    name: scripts (PowerShell 5.1 · 7)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: UTF-8 BOM 확인(Windows PowerShell 5.1이 한글을 읽으려면 필요)
+        shell: pwsh
+        run: |
+          $bad = @()
+          foreach ($f in Get-ChildItem scripts -Filter *.ps1) {
+            $b = [IO.File]::ReadAllBytes($f.FullName)
+            if (-not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) { $bad += $f.Name }
+          }
+          if ($bad) { Write-Error "BOM 없음: $($bad -join ', ')"; exit 1 }
+      - name: 구문 확인(Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem scripts -Filter *.ps1) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            if ($errs) { $failed = $true; $errs | ForEach-Object { Write-Host "$($f.Name):$($_.Extent.StartLineNumber): $($_.Message)" } }
+          }
+          if ($failed) { exit 1 }
+          $PSVersionTable.PSVersion
+      - name: 구문 확인(PowerShell 7)
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem scripts -Filter *.ps1) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            if ($errs) { $failed = $true; $errs | ForEach-Object { Write-Host "$($f.Name):$($_.Extent.StartLineNumber): $($_.Message)" } }
+          }
+          if ($failed) { exit 1 }
+          $PSVersionTable.PSVersion
+      - name: PSScriptAnalyzer(오류는 실패, 경고는 표시만)
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+            Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+          $all = Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning, Error `
+            -ExcludeRule PSAvoidUsingWriteHost, PSUseShouldProcessForStateChangingFunctions
+          $all | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message | Out-String -Width 220 | Write-Host
+          if (@($all | Where-Object Severity -eq 'Error').Count -gt 0) { exit 1 }
+      - name: 가짜 배포 폴더 만들기
+        shell: pwsh
+        run: |
+          $fake = Join-Path $env:RUNNER_TEMP 'gyeot-fake'
+          New-Item -ItemType Directory -Force -Path "$fake\bin", "$fake\face\assets" | Out-Null
+          Set-Content "$fake\bin\gyeotd.exe" 'fake'
+          Set-Content "$fake\bin\gyeot-hook.exe" 'fake'
+          Set-Content "$fake\bin\gyeot-channel.mjs" '// fake'
+          Set-Content "$fake\face\index.html" '<!doctype html>'
+          Set-Content "$fake\face\assets\app.js" '// fake'
+          Copy-Item examples "$fake\examples" -Recurse
+          "GYEOT_FAKE=$fake" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: 설치·지우기 자체 시험(Windows PowerShell 5.1)
+        shell: powershell
+        run: .\scripts\test-install.ps1 -SourceDir $env:GYEOT_FAKE -SkipInit
+      - name: 설치·지우기 자체 시험(PowerShell 7)
+        shell: pwsh
+        run: ./scripts/test-install.ps1 -SourceDir $env:GYEOT_FAKE -SkipInit
+
+  # ───────────── Windows 배포본: 릴리스 빌드 → 설치 스크립트 검증 → zip·설치본 ─────────────
+  windows-dist:
+    name: windows dist
+    needs: [rust, face, channel, e2e, shell, scripts]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            shell/src-tauri -> target
+          key: dist-release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - id: npm-cache
+        shell: bash
+        run: echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.npm-cache.outputs.dir }}
+          key: npm-${{ runner.os }}-dist-${{ hashFiles('face/package-lock.json', 'channel/package-lock.json', 'shell/package-lock.json', 'face/package.json', 'channel/package.json', 'shell/package.json') }}
+          restore-keys: npm-${{ runner.os }}-dist-
+
+      - name: 데몬·훅 심 릴리스 빌드
+        shell: pwsh
+        run: |
+          cargo build --release --workspace --bins
+          foreach ($exe in 'gyeotd.exe', 'gyeot-hook.exe') {
+            if (-not (Test-Path "target\release\$exe")) { Write-Error "target\release\$exe 가 없어요"; exit 1 }
+          }
+
+      - name: 얼굴(face) 빌드
+        shell: bash
+        working-directory: face
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npm run build
+          test -f dist/index.html
+
+      - name: channel 번들
+        shell: bash
+        working-directory: channel
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npm run build
+          test -f dist/gyeot-channel.mjs
+
+      - name: 셸(Tauri) 빌드 — 실행 파일과 NSIS 설치본
+        shell: bash
+        working-directory: shell
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npx tauri build --bundles nsis --ci
+          ls -la src-tauri/target/release/bundle/nsis/
+
+      - name: 배포 폴더 만들기
+        shell: pwsh
+        run: |
+          $stage = 'dist\gyeot-windows-x64'
+          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "$stage\bin", "$stage\face", "$stage\scripts", "$stage\examples" | Out-Null
+          Copy-Item target\release\gyeotd.exe, target\release\gyeot-hook.exe "$stage\bin\"
+          Copy-Item shell\src-tauri\target\release\gyeot-shell.exe "$stage\bin\"
+          Copy-Item channel\dist\gyeot-channel.mjs "$stage\bin\"
+          Copy-Item face\dist\* "$stage\face\" -Recurse
+          Copy-Item scripts\install.ps1, scripts\uninstall.ps1, scripts\gyeot-common.ps1 "$stage\scripts\"
+          Copy-Item examples\* "$stage\examples\" -Recurse
+          if (Test-Path README.md) { Copy-Item README.md "$stage\README.md" } else { Copy-Item shell\README.md "$stage\README.md" }
+          Copy-Item shell\README.md "$stage\README-shell.md"
+          @(
+            "곁(gyeot) Windows x64",
+            "commit: $env:GITHUB_SHA",
+            "built:  $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))",
+            "run:    $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          ) | Set-Content -Encoding utf8 "$stage\BUILD.txt"
+          $setup = @(Get-ChildItem shell\src-tauri\target\release\bundle\nsis -Filter '*-setup.exe')
+          if ($setup.Count -ne 1) { Write-Error "NSIS 설치본을 하나 찾지 못했어요: $($setup.Name -join ', ')"; exit 1 }
+          Copy-Item $setup[0].FullName dist\gyeot-shell-setup-x64.exe
+          Get-ChildItem $stage -Recurse -File | Select-Object -ExpandProperty FullName
+
+      - name: install.ps1 -DryRun (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\dist\gyeot-windows-x64\scripts\install.ps1 -DryRun -ApplyClaudeHooks -RegisterStartup -InstallRoot "$env:RUNNER_TEMP\gyeot-dry"
+
+      - name: install.ps1 -DryRun (PowerShell 7)
+        shell: pwsh
+        run: ./dist/gyeot-windows-x64/scripts/install.ps1 -DryRun -ApplyClaudeHooks -RegisterStartup -InstallRoot "$env:RUNNER_TEMP\gyeot-dry"
+
+      - name: 설치·지우기 자체 시험, 실제 gyeotd --init 포함(Windows PowerShell 5.1)
+        shell: powershell
+        run: .\scripts\test-install.ps1 -SourceDir .\dist\gyeot-windows-x64 -WithStartup
+
+      - name: 설치·지우기 자체 시험, 실제 gyeotd --init 포함(PowerShell 7)
+        shell: pwsh
+        run: ./scripts/test-install.ps1 -SourceDir ./dist/gyeot-windows-x64
+
+      - name: zip 만들기
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\gyeot-windows-x64\* -DestinationPath dist\gyeot-windows-x64.zip -Force
+          Get-FileHash dist\gyeot-windows-x64.zip, dist\gyeot-shell-setup-x64.exe -Algorithm SHA256 | Format-List
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gyeot-windows-x64
+          path: dist/gyeot-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gyeot-shell-setup-x64
+          path: dist/gyeot-shell-setup-x64.exe
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gyeot-shell-exe
+          path: shell/src-tauri/target/release/gyeot-shell.exe
+          if-no-files-found: error
+          retention-days: 14

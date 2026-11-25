@@ -1,0 +1,29 @@
+[package]
+name = "gyeot-server"
+description = "곁 데몬의 로컬 HTTP·SSE 서버(127.0.0.1 전용), 이벤트 로그·스풀·하네스 로그 따라 읽기"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+gyeot-core = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+futures-util = { workspace = true }
+regex = { workspace = true }
+getrandom = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

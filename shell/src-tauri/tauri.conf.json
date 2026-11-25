@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "곁",
+  "mainBinaryName": "gyeot-shell",
+  "version": "0.1.0",
+  "identifier": "dev.gyeot.shell",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost",
+      "capabilities": ["overlay-local", "overlay-remote"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "gyeot",
+    "category": "Utility",
+    "shortDescription": "곁 — Claude Code·Codex 옆의 작은 동료",
+    "longDescription": "곁 데몬(gyeotd)이 보여 주는 얼굴을 바탕화면 오른쪽 아래에 투명하게 띄우는 셸입니다. 데몬과 훅은 zip의 scripts/install.ps1로 설치합니다.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["Korean", "English"],
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

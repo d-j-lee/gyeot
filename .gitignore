@@ -1,0 +1,11 @@
+/target/
+**/target/
+node_modules/
+face/dist/
+channel/dist/
+shell/src-tauri/gen/
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*

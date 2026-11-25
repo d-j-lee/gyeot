@@ -1,0 +1,44 @@
+# 곁 데몬 설정 견본 — docs/contracts.md §6
+#
+# 넣을 곳: %LOCALAPPDATA%\gyeot\config.toml  (GYEOT_HOME 을 두었다면 그 폴더의 config.toml)
+# 모든 항목이 선택이다. 없는 항목은 아래 주석의 기본값을 쓴다.
+# 필요한 줄의 # 만 풀어서 쓰고, 바꾼 뒤에는 데몬을 다시 시작한다(트레이 메뉴 "곁 데몬 다시 시작").
+
+# 데몬 포트. 127.0.0.1 에만 묶인다. 환경 변수 GYEOT_PORT 가 있으면 그것이 먼저다.
+# 바꾸면 훅·channel 도 같은 곳을 보게 GYEOT_URL=http://127.0.0.1:<포트> 를 사용자 환경 변수로 둔다.
+# port = 47321
+
+# 작업 중인 세션(마지막 이벤트가 activity·prompt·subagent)이 이만큼(분) 조용하면 "멈춘 것 같아요"(stall).
+# stale_minutes = 30
+
+# 말풍선(nudge)을 띄우는 최소 점수와 소리·음성(interrupt)을 내는 최소 점수.
+# 승인 대기 95, 병합 90, 결정 85, 실패 80, … (docs/contracts.md §3)
+# nudge_min = 80
+# interrupt_min = 95
+
+# 조용한 시간(현지 시각). 이때는 점수 95 이상이고 3분 넘게 기다린 승인만 말풍선으로, 소리는 내지 않는다.
+# 빈 배열이면 조용한 시간이 없다.
+# quiet_hours = ["22:00-08:00"]
+
+# 조용한 시간 계산에 쓰는 현지 시간대(분). Windows에서는 데몬이 채운다. 한국 표준시 540.
+# utc_offset_minutes = 540
+
+# events/YYYY-MM-DD.jsonl 을 며칠 보관할지.
+# retention_days = 14
+
+# ── 따라 읽을 하네스 로그(JSONL) ──
+# 저장소마다 [[tail]] 한 덩어리. <git-dir> 은 그 저장소에서 `git rev-parse --git-dir` 로 본다
+# (워크트리면 .git/worktrees/<이름>). 경로는 / 로 쓰면 TOML 이스케이프가 필요 없다.
+# cwd 는 세션과 잇는 데 쓴다(로그에 session 이 없을 때 같은 저장소의 세션으로 잇는다).
+#
+# fsmap 게이트 로그 — gate 결과 block·push-error 는 "실패"(80), push-uncommitted 는 "휘발"(78)
+# [[tail]]
+# path = "C:/work/proj/.git/fsmap-harness/log.jsonl"
+# source = "fsmap-harness"
+# cwd = "C:/work/proj"
+#
+# AOK ⑧ 하네스 로그 — stop 의 fail·cannot 은 "실패"(80), pass 가 오면 닫힌다
+# [[tail]]
+# path = "C:/work/proj/.git/aok-harness/log.jsonl"
+# source = "aok-harness"
+# cwd = "C:/work/proj"

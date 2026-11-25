@@ -1,0 +1,225 @@
+/* 아바타 "곁" 움직임. 좌표는 viewBox(120×120) 단위다. */
+
+.av {
+  display: block;
+  overflow: visible;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.av :is(.av-rig, .av-breath, .av-sprout, .av-leaf, .av-face, .av-look, .av-eyes, .av-shadow, .av-z) {
+  transform-box: view-box;
+}
+
+.av-rig,
+.av-breath {
+  transform-origin: 60px 109px;
+}
+.av-shadow {
+  transform-origin: 60px 111.5px;
+}
+.av-sprout {
+  transform-origin: 78px 39px;
+}
+.av-leaf {
+  transform-origin: 83px 21.4px;
+  transition: transform 320ms ease;
+}
+.av-look {
+  transition: transform 320ms ease;
+}
+.av-eyes {
+  transform-origin: 60px 66px;
+}
+.av-rig {
+  transition: transform 320ms ease;
+}
+
+/* ── 깜박임(눈을 뜬 기분에서만) ── */
+.av-eyes--open {
+  animation: av-blink 5.2s infinite;
+}
+.av--waiting .av-eyes--open {
+  animation-duration: 6.4s;
+}
+.av--alert .av-eyes--open {
+  animation-duration: 7s;
+}
+@keyframes av-blink {
+  0%, 94%, 100% { transform: scaleY(1); }
+  96% { transform: scaleY(0.08); }
+  98% { transform: scaleY(1); }
+}
+
+/* ── 숨쉬기 ── */
+.av--idle .av-breath,
+.av--working .av-breath,
+.av--waiting .av-breath,
+.av--listening .av-breath {
+  animation: av-breathe 4s ease-in-out infinite;
+}
+.av--sleep .av-breath {
+  animation: av-breathe-slow 6s ease-in-out infinite;
+}
+@keyframes av-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.02); }
+}
+@keyframes av-breathe-slow {
+  0%, 100% { transform: scale(1, 1); }
+  50% { transform: scale(1.012, 1.018); }
+}
+
+/* ── working: 작은 끄덕임, 잎 흔들림 ── */
+.av--working .av-face {
+  animation: av-nod 1.6s ease-in-out infinite;
+}
+.av--working .av-sprout {
+  animation: av-sway 1.4s ease-in-out infinite;
+}
+@keyframes av-nod {
+  0%, 100% { transform: translateY(0); }
+  45% { transform: translateY(1.4px); }
+}
+@keyframes av-sway {
+  0%, 100% { transform: rotate(-6deg); }
+  50% { transform: rotate(7deg); }
+}
+
+/* ── waiting: 6초마다 살짝 뜀, 잎 맥동 빛 ── */
+.av--waiting .av-rig {
+  animation: av-hop 6s ease-in-out infinite;
+}
+.av--waiting .av-shadow {
+  animation: av-hop-shadow 6s ease-in-out infinite;
+}
+.av--waiting .av-leaf-shape {
+  animation: av-glow 2.4s ease-in-out infinite;
+}
+@keyframes av-hop {
+  0%, 84%, 100% { transform: translateY(0) scale(1, 1); }
+  87% { transform: translateY(0) scale(1.03, 0.96); }
+  91% { transform: translateY(-7px) scale(0.98, 1.03); }
+  95% { transform: translateY(0) scale(1.02, 0.98); }
+  97.5% { transform: translateY(-1.5px) scale(1, 1); }
+}
+@keyframes av-hop-shadow {
+  0%, 84%, 100% { transform: scaleX(1); opacity: 0.1; }
+  91% { transform: scaleX(0.82); opacity: 0.06; }
+  95% { transform: scaleX(1.02); opacity: 0.1; }
+}
+@keyframes av-glow {
+  0%, 100% { filter: drop-shadow(0 0 1.5px var(--leaf)); }
+  50% { filter: drop-shadow(0 0 5px var(--leaf)) drop-shadow(0 0 2px var(--leaf)); }
+}
+
+/* ── alert: 들어올 때 한 번 흔들림, 그 뒤 맥동 ── */
+.av--alert .av-rig {
+  animation:
+    av-shake 0.55s ease-in-out 1,
+    av-pulse 1.5s ease-in-out 0.55s infinite;
+}
+.av--alert .av-leaf-shape {
+  animation: av-glow 1.5s ease-in-out infinite;
+}
+@keyframes av-shake {
+  0%, 100% { transform: translateX(0) rotate(0); }
+  20% { transform: translateX(-3px) rotate(-3deg); }
+  40% { transform: translateX(3px) rotate(3deg); }
+  60% { transform: translateX(-2px) rotate(-2deg); }
+  80% { transform: translateX(1.5px) rotate(1deg); }
+}
+@keyframes av-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.035); }
+}
+
+/* ── done: 작은 점프와 반짝임 ── */
+.av--done .av-rig {
+  animation: av-jump 0.75s cubic-bezier(0.3, 0.7, 0.4, 1) 2;
+}
+.av--done .av-shadow {
+  animation: av-jump-shadow 0.75s cubic-bezier(0.3, 0.7, 0.4, 1) 2;
+}
+.av-spark {
+  fill: var(--leaf);
+  transform-origin: center;
+  transform-box: fill-box;
+  animation: av-twinkle 1.3s ease-in-out infinite;
+}
+.av-spark--2 { animation-delay: 0.35s; }
+.av-spark--3 { animation-delay: 0.7s; }
+@keyframes av-jump {
+  0%, 100% { transform: translateY(0) scale(1, 1); }
+  15% { transform: translateY(0) scale(1.04, 0.95); }
+  45% { transform: translateY(-9px) scale(0.98, 1.03); }
+  75% { transform: translateY(0) scale(1.03, 0.97); }
+}
+@keyframes av-jump-shadow {
+  0%, 100% { transform: scaleX(1); opacity: 0.1; }
+  45% { transform: scaleX(0.78); opacity: 0.05; }
+}
+@keyframes av-twinkle {
+  0%, 100% { opacity: 0.25; transform: scale(0.6) rotate(0deg); }
+  50% { opacity: 1; transform: scale(1.1) rotate(20deg); }
+}
+
+/* ── sleep: 떠오르는 z ── */
+.av-z {
+  fill: #8C80B8;
+  font-family: ui-rounded, "Segoe UI", system-ui, sans-serif;
+  font-weight: 700;
+  opacity: 0;
+  animation: av-float 3.6s ease-out infinite;
+}
+.av-z--2 { animation-delay: 1.2s; }
+.av-z--3 { animation-delay: 2.4s; }
+@keyframes av-float {
+  0% { opacity: 0; transform: translate(6px, 8px); }
+  20% { opacity: 0.9; }
+  80% { opacity: 0.5; }
+  100% { opacity: 0; transform: translate(-4px, -6px); }
+}
+
+/* ── listening: 앞으로 기울임, 잎 기울임 ── */
+.av--listening .av-rig {
+  transform: rotate(-5deg) translateY(0.5px);
+}
+.av--listening .av-leaf {
+  transform: rotate(-16deg);
+}
+.av--listening .av-sprout {
+  animation: av-perk 2.2s ease-in-out infinite;
+}
+@keyframes av-perk {
+  0%, 100% { transform: rotate(0deg); }
+  50% { transform: rotate(-4deg); }
+}
+
+/* ── 움직임 줄이기: 색과 눈 모양만 바꾼다 ── */
+@media (prefers-reduced-motion: reduce) {
+  .av *,
+  .av {
+    animation: none !important;
+    transition: none !important;
+  }
+  .av--waiting .av-leaf-shape,
+  .av--alert .av-leaf-shape {
+    filter: drop-shadow(0 0 3.5px var(--leaf));
+  }
+  .av-z--1 { opacity: 0.55; }
+  .av-z--2 { opacity: 0.8; }
+  .av-z--3 { opacity: 0; }
+  .av-spark { opacity: 0.9; }
+}
+:root[data-motion='reduce'] .av *,
+:root[data-motion='reduce'] .av {
+  animation: none !important;
+  transition: none !important;
+}
+:root[data-motion='reduce'] .av--waiting .av-leaf-shape,
+:root[data-motion='reduce'] .av--alert .av-leaf-shape {
+  filter: drop-shadow(0 0 3.5px var(--leaf));
+}
+:root[data-motion='reduce'] .av-z--1 { opacity: 0.55; }
+:root[data-motion='reduce'] .av-z--2 { opacity: 0.8; }
+:root[data-motion='reduce'] .av-spark { opacity: 0.9; }

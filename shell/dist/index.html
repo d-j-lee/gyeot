@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>곁</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --body: #f4efe6;
+        --shade: #e6ddcf;
+        --ink: #2b2622;
+        --line: rgba(58, 53, 48, 0.18);
+        --leaf: #9db89a;
+        --card: rgba(250, 247, 242, 0.96);
+        --muted: #6b625a;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+        font-family: "Pretendard", "Malgun Gothic", "맑은 고딕", system-ui, sans-serif;
+        font-size: 14px;
+        color: var(--ink);
+        user-select: none;
+      }
+      main {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 8px;
+        max-width: calc(100% - 32px);
+      }
+      #card {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 8px;
+      }
+      .bubble {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 12px 14px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+        max-width: 300px;
+        line-height: 1.5;
+      }
+      .bubble[hidden] {
+        display: none;
+      }
+      .title {
+        font-weight: 600;
+        margin: 0 0 4px;
+      }
+      .reason {
+        margin: 0 0 10px;
+        color: var(--muted);
+        word-break: break-word;
+        white-space: pre-wrap;
+        user-select: text;
+      }
+      .hint {
+        margin: 0 0 10px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .actions {
+        display: flex;
+        gap: 6px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+      }
+      button {
+        font: inherit;
+        border: 1px solid var(--line);
+        background: #fff;
+        color: var(--ink);
+        border-radius: 999px;
+        padding: 5px 12px;
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--ink);
+        color: #fff;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      button:focus-visible {
+        outline: 2px solid #7fa7d9;
+        outline-offset: 2px;
+      }
+      svg {
+        width: 96px;
+        height: 96px;
+        display: block;
+      }
+      body.error .leaf {
+        fill: #e8735a;
+        filter: drop-shadow(0 0 4px rgba(232, 115, 90, 0.7));
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --card: rgba(40, 37, 34, 0.96);
+          --ink: #f4efe6;
+          --muted: #c9c0b5;
+          --line: rgba(244, 239, 230, 0.2);
+        }
+        button {
+          background: #3a3530;
+        }
+        button.primary {
+          background: #f4efe6;
+          color: #2b2622;
+        }
+        svg .eye {
+          fill: #2b2622;
+        }
+      }
+    </style>
+    <script src="fallback.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <div id="card">
+        <section class="bubble" id="loading">
+          <p class="title">곁을 깨우는 중…</p>
+        </section>
+        <section class="bubble" id="error" hidden>
+          <p class="title">곁 데몬에 연결하지 못했어요</p>
+          <p class="reason" id="reason"></p>
+          <p class="hint">트레이 아이콘의 메뉴에서도 다시 시작할 수 있어요. 자세한 기록은 %LOCALAPPDATA%\gyeot\shell.log 에 있어요.</p>
+          <div class="actions">
+            <button type="button" id="restart">데몬 다시 시작</button>
+            <button type="button" class="primary" id="retry">다시 시도</button>
+          </div>
+        </section>
+        <svg viewBox="0 0 120 120" aria-hidden="true">
+          <defs>
+            <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0.7" stop-color="#f4efe6" />
+              <stop offset="1" stop-color="#e6ddcf" />
+            </linearGradient>
+          </defs>
+          <ellipse cx="60" cy="110" rx="34" ry="5" fill="#000" opacity="0.1" />
+          <path d="M74 28 Q72 18 78 10" stroke="#7f9c7c" stroke-width="3" fill="none" stroke-linecap="round" />
+          <path class="leaf" d="M78 10 Q92 0 102 4 Q94 16 78 10 Z" fill="#9db89a" />
+          <path
+            d="M60 24 C96 24 104 32 104 66 C104 100 96 106 60 106 C24 106 16 100 16 66 C16 32 24 24 60 24 Z"
+            fill="url(#g)"
+            stroke="#3a3530"
+            stroke-opacity="0.18"
+            stroke-width="1.5"
+          />
+          <ellipse class="eye" cx="47.5" cy="60" rx="4" ry="6" fill="#2b2622" />
+          <ellipse class="eye" cx="72.5" cy="60" rx="4" ry="6" fill="#2b2622" />
+          <circle cx="46.5" cy="58" r="1.4" fill="#fff" />
+          <circle cx="71.5" cy="58" r="1.4" fill="#fff" />
+          <circle cx="38" cy="71" r="5" fill="#f2b8a0" opacity="0.45" />
+          <circle cx="82" cy="71" r="5" fill="#f2b8a0" opacity="0.45" />
+        </svg>
+      </div>
+    </main>
+  </body>
+</html>

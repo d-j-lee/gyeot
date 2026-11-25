@@ -1,0 +1,39 @@
+[package]
+name = "gyeot-shell"
+version = "0.1.0"
+description = "곁(gyeot) Windows 데스크톱 셸 — 투명 오버레이(UI만, 서버는 gyeotd)"
+edition = "2021"
+rust-version = "1.82"
+publish = false
+
+# 저장소 루트의 Cargo 워크스페이스와 섞이지 않도록 이 폴더를 따로 된 워크스페이스 루트로 둔다.
+# (루트 `cargo test --workspace`가 Tauri와 WebView 시스템 라이브러리를 끌어오지 않게)
+[workspace]
+
+[[bin]]
+name = "gyeot-shell"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2.5"
+tauri-plugin-global-shortcut = "2.4"
+tauri-plugin-autostart = "2.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# 시험에서 가짜 런타임으로 실제 capabilities(ACL)를 확인한다(src/acl_tests.rs).
+tauri = { version = "2.12", features = ["tray-icon", "test"] }
+
+[target.'cfg(windows)'.dependencies]
+# tauri-plugin-autostart(auto-launch)가 이미 쓰는 판. Run 값의 경로를 따옴표로 감싸 다시 쓰는 데만 쓴다.
+windows-registry = "0.6"
+
+[profile.release]
+# CI 시간을 아끼려고 thin LTO. 패닉은 기본(unwind)으로 둬서 뒤 스레드 하나의 패닉이 트레이 앱 전체를 끝내지 않게 한다.
+lto = "thin"
+strip = true

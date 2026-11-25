@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "overlay-local",
+  "description": "셸에 들어 있는 대체 화면(데몬에 닿지 않을 때)에는 클릭 영역과 다시 시도만 준다.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["allow-set-hit-rect", "allow-set-expanded", "allow-retry-connect"]
+}

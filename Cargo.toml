@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+# shell/(Tauri)은 Windows CI에서만 따로 빌드하므로 워크스페이스에 넣지 않는다.
+members = [
+    "crates/gyeot-core",
+    "crates/gyeot-server",
+    "crates/gyeotd",
+    "crates/gyeot-hook",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+gyeot-core = { path = "crates/gyeot-core" }
+gyeot-server = { path = "crates/gyeot-server" }
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "7"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ureq = { version = "3", default-features = false }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "debuginfo"

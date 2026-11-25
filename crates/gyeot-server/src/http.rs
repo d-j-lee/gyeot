@@ -1,0 +1,985 @@
+//! 라우터·보안 검사·처리기(계약 §7)와 SSE(§8).
+
+use crate::face;
+use crate::hub::{Channels, Hub, gyeot_event};
+use crate::store::{now_ms, random_hex};
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
+use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use futures_util::Stream;
+use gyeot_core::text::{mask, truncate_chars};
+use gyeot_core::{ActError, Action, EventBody, ItemState, Source, normalize};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
+
+/// 본문 최대 크기(1 MiB).
+pub const BODY_LIMIT: usize = 1024 * 1024;
+/// SSE ping 간격.
+pub const PING_EVERY: Duration = Duration::from_secs(15);
+/// 사람에게 보이는 channel 없음 안내(계약 §7).
+pub const NO_CHANNEL: &str =
+    "channel 없음 — 세션을 --dangerously-load-development-channels server:gyeot 로 시작하세요";
+/// `/v1/say` 글 최대 길이(§10.1).
+pub const SAY_MAX: usize = 32_000;
+/// `/v1/channel/reply` 글 최대 길이(§10.1).
+pub const REPLY_MAX: usize = 16_000;
+/// 결정 질문 최대 길이(§10.1).
+pub const QUESTION_MAX: usize = 300;
+/// 결정 선택지 최대 길이(§10.1).
+pub const OPTION_MAX: usize = 60;
+const RECEIVED_MAX_AGE_MS: i64 = 30 * 86_400_000;
+
+/// 처리기들이 함께 쓰는 상태.
+#[derive(Debug)]
+pub struct Shared {
+    /// 실제로 묶인 포트(Host·Origin 검사용).
+    pub port: u16,
+    /// 토큰.
+    pub token: String,
+    /// 얼굴 폴더.
+    pub face_dir: Option<PathBuf>,
+    /// 엔진 허브.
+    pub hub: Mutex<Hub>,
+    /// channel 연결.
+    pub channels: StdMutex<Channels>,
+    /// 결정 id → 그 결정을 연 channel.
+    pub decisions: StdMutex<HashMap<String, String>>,
+    /// 끝내기 신호.
+    pub shutdown: watch::Receiver<bool>,
+    chat_seq: AtomicU64,
+}
+
+impl Shared {
+    /// 새 공유 상태.
+    pub fn new(
+        port: u16,
+        token: String,
+        face_dir: Option<PathBuf>,
+        hub: Hub,
+        shutdown: watch::Receiver<bool>,
+    ) -> Shared {
+        Shared {
+            port,
+            token,
+            face_dir,
+            hub: Mutex::new(hub),
+            channels: StdMutex::new(Channels::default()),
+            decisions: StdMutex::new(HashMap::new()),
+            shutdown,
+            chat_seq: AtomicU64::new(1),
+        }
+    }
+
+    fn channels(&self) -> std::sync::MutexGuard<'_, Channels> {
+        self.channels.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn decisions(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.decisions.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn new_chat_id(&self) -> String {
+        format!("m{}", self.chat_seq.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// channel을 닫는다(`channel_close` 이벤트를 기록하고 연결을 지운다).
+    pub async fn close_channel(&self, cid: &str) {
+        let mut hub = self.hub.lock().await;
+        if let Some(ch) = hub.engine.channel(cid) {
+            let now = now_ms();
+            let ev = gyeot_event(
+                now,
+                ch.session.clone(),
+                Some(ch.cwd.clone()),
+                EventBody::ChannelClose {
+                    cid: ch.cid,
+                    pid: ch.pid,
+                    ppid: ch.ppid,
+                    cwd: ch.cwd,
+                },
+            );
+            hub.ingest(ev, now);
+        }
+        self.channels().remove(cid);
+        self.decisions().retain(|_, c| c != cid);
+    }
+}
+
+type St = Arc<Shared>;
+
+fn json_resp(status: StatusCode, v: Value) -> Response {
+    (status, axum::Json(v)).into_response()
+}
+
+fn err(status: StatusCode, msg: &str) -> Response {
+    json_resp(status, json!({ "ok": false, "error": msg }))
+}
+
+fn ok() -> Response {
+    json_resp(StatusCode::OK, json!({ "ok": true }))
+}
+
+/// 본문을 읽지 못함(400).
+struct BadBody(String);
+
+impl IntoResponse for BadBody {
+    fn into_response(self) -> Response {
+        err(StatusCode::BAD_REQUEST, &self.0)
+    }
+}
+
+fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, BadBody> {
+    serde_json::from_slice(body).map_err(|e| BadBody(format!("본문 JSON을 읽지 못했어요: {e}")))
+}
+
+// ───────────────────────── 보안 검사 ─────────────────────────
+
+fn host_ok(host: Option<&str>, port: u16) -> bool {
+    let Some(h) = host else {
+        return false;
+    };
+    let h = h.trim().to_ascii_lowercase();
+    h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}")
+}
+
+fn is_tauri(origin: &str) -> bool {
+    matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    )
+}
+
+fn origin_ok(origin: &str, port: u16) -> bool {
+    origin == format!("http://127.0.0.1:{port}")
+        || origin == format!("http://localhost:{port}")
+        || is_tauri(origin)
+}
+
+/// 상수 시간 비교(길이는 숨기지 않는다. 토큰 길이는 공개된 64자다).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut d = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        d |= x ^ y;
+    }
+    std::hint::black_box(d) == 0
+}
+
+fn presented_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    if let Some(v) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        && let Some((scheme, tok)) = v.trim().split_once(' ')
+        && scheme.eq_ignore_ascii_case("bearer")
+    {
+        out.push(tok.trim());
+    }
+    if let Some(q) = uri.query() {
+        for pair in q.split('&') {
+            if let Some(t) = pair.strip_prefix("t=") {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+fn cors(resp: &mut Response, origin: &str) {
+    let h = resp.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(origin) {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+    }
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("authorization, content-type"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("600"),
+    );
+    h.append(header::VARY, HeaderValue::from_static("Origin"));
+}
+
+/// Host(421) → Origin(403) → 토큰(401, `/v1/*`만) 순으로 검사한다. Tauri 출처에만 CORS를 반사한다.
+async fn guard(State(st): State<St>, req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    if !host_ok(host, st.port) {
+        return err(StatusCode::MISDIRECTED_REQUEST, "Host가 맞지 않아요");
+    }
+    let origin = match req.headers().get(header::ORIGIN) {
+        None => None,
+        Some(v) => match v.to_str() {
+            Ok(o) if origin_ok(o, st.port) => Some(o.to_owned()),
+            _ => return err(StatusCode::FORBIDDEN, "허용하지 않는 Origin이에요"),
+        },
+    };
+    let tauri = origin.as_deref().filter(|o| is_tauri(o)).map(str::to_owned);
+    if req.method() == Method::OPTIONS {
+        let mut r = StatusCode::NO_CONTENT.into_response();
+        if let Some(o) = &tauri {
+            cors(&mut r, o);
+        }
+        return r;
+    }
+    let path = req.uri().path();
+    if path == "/v1" || path.starts_with("/v1/") {
+        let authed = presented_token(req.headers(), req.uri())
+            .into_iter()
+            .any(|t| ct_eq(t.as_bytes(), st.token.as_bytes()));
+        if !authed {
+            let mut r = err(StatusCode::UNAUTHORIZED, "토큰이 없거나 맞지 않아요");
+            if let Some(o) = &tauri {
+                cors(&mut r, o);
+            }
+            return r;
+        }
+    }
+    let mut r = next.run(req).await;
+    if let Some(o) = &tauri {
+        cors(&mut r, o);
+    }
+    r
+}
+
+/// 라우터.
+pub fn router(st: St) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/", get(index))
+        .route("/index.html", get(index))
+        .route("/v1/ingest/{source}", post(ingest))
+        .route("/v1/state", get(state))
+        .route("/v1/stream", get(stream))
+        .route("/v1/items/{id}/action", post(item_action))
+        .route("/v1/focus", post(focus))
+        .route("/v1/presence/listening", post(listening))
+        .route("/v1/say", post(say))
+        .route("/v1/decisions/{id}", post(decision_choice))
+        .route("/v1/proposals/{id}", post(proposal))
+        .route("/v1/adjustments/{kind}", post(adjustment))
+        .route("/v1/channel/register", post(ch_register))
+        .route("/v1/channel/stream", get(ch_stream))
+        .route("/v1/channel/reply", post(ch_reply))
+        .route("/v1/channel/decision", post(ch_decision))
+        .route("/v1/channel/unregister", post(ch_unregister))
+        .fallback(fallback)
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(middleware::from_fn_with_state(st.clone(), guard))
+        .with_state(st)
+}
+
+// ───────────────────────── 처리기 ─────────────────────────
+
+async fn health() -> Response {
+    json_resp(
+        StatusCode::OK,
+        json!({ "ok": true, "version": gyeot_core::VERSION }),
+    )
+}
+
+async fn index(State(st): State<St>) -> Response {
+    face::index_response(st.face_dir.as_deref(), &st.token).await
+}
+
+async fn fallback(State(st): State<St>, method: Method, uri: Uri) -> Response {
+    let path = uri.path();
+    if path == "/v1" || path.starts_with("/v1/") {
+        return err(StatusCode::NOT_FOUND, "없는 API예요");
+    }
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    face::static_response(st.face_dir.as_deref(), path, &st.token).await
+}
+
+/// 심의 봉투 `{"payload", "pid_hint", "received_ms"}`를 벗긴다. 봉투가 아니면 본문 전체가 페이로드다.
+pub fn unwrap_envelope(v: Value, now: i64) -> (Value, Option<u32>, i64) {
+    let is_env = v.as_object().is_some_and(|o| {
+        o.contains_key("payload") && (o.contains_key("received_ms") || o.contains_key("pid_hint"))
+    });
+    if !is_env {
+        return (v, None, now);
+    }
+    let Value::Object(mut o) = v else {
+        return (Value::Null, None, now);
+    };
+    let pid = o
+        .get("pid_hint")
+        .and_then(Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok());
+    let recv = o
+        .get("received_ms")
+        .and_then(Value::as_i64)
+        .map_or(now, |r| r.clamp(now - RECEIVED_MAX_AGE_MS, now));
+    let payload = o.remove("payload").unwrap_or(Value::Null);
+    (payload, pid, recv)
+}
+
+async fn ingest(State(st): State<St>, Path(source): Path<String>, body: Bytes) -> Response {
+    let Some(src) = Source::parse(&source).filter(|s| s.is_ingestible()) else {
+        return err(StatusCode::BAD_REQUEST, "알 수 없는 source예요");
+    };
+    let v: Value = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r.into_response(),
+    };
+    let now = now_ms();
+    let (payload, pid, recv) = unwrap_envelope(v, now);
+    let events = normalize(src, &payload, recv, pid);
+    let n = events.len();
+    let mut hub = st.hub.lock().await;
+    for ev in events {
+        hub.ingest(ev, now);
+    }
+    json_resp(StatusCode::ACCEPTED, json!({ "accepted": n }))
+}
+
+async fn state(State(st): State<St>) -> Response {
+    let s = st.hub.lock().await.snapshot_json(now_ms());
+    let mut r = (StatusCode::OK, s).into_response();
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+fn act_error(e: &ActError) -> Response {
+    let status = match e {
+        ActError::UnknownItem | ActError::UnknownProposal | ActError::UnknownDecision => {
+            StatusCode::NOT_FOUND
+        }
+        _ => StatusCode::BAD_REQUEST,
+    };
+    err(status, &e.to_string())
+}
+
+#[derive(Deserialize)]
+struct ActionBody {
+    action: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    minutes: Option<i64>,
+}
+
+async fn item_action(State(st): State<St>, Path(id): Path<String>, body: Bytes) -> Response {
+    let b: ActionBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    let Some(action) = Action::parse(&b.action).filter(|a| a.is_item_action()) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "action은 open·done·dismiss·snooze 가운데 하나예요",
+        );
+    };
+    let now = now_ms();
+    let mut hub = st.hub.lock().await;
+    match hub
+        .engine
+        .act(&id, action, b.reason.as_deref(), b.minutes, now)
+    {
+        Ok((ev, fx)) => {
+            hub.record(ev, fx, now);
+            ok()
+        }
+        Err(e) => act_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct FocusBody {
+    on: bool,
+    #[serde(default)]
+    minutes: Option<i64>,
+}
+
+async fn focus(State(st): State<St>, body: Bytes) -> Response {
+    let b: FocusBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    let now = now_ms();
+    let mut hub = st.hub.lock().await;
+    match hub.engine.set_focus(b.on, b.minutes, now) {
+        Ok((ev, fx)) => {
+            hub.record(ev, fx, now);
+            let until = hub.engine.presence().focus_mode_until_ms;
+            json_resp(StatusCode::OK, json!({ "ok": true, "until_ms": until }))
+        }
+        Err(e) => act_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct OnBody {
+    on: bool,
+}
+
+async fn listening(State(st): State<St>, body: Bytes) -> Response {
+    let b: OnBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    let now = now_ms();
+    let mut hub = st.hub.lock().await;
+    let (ev, fx) = hub.engine.set_listening(b.on, now);
+    hub.record(ev, fx, now);
+    ok()
+}
+
+/// 넘치면 자르고 자른 것을 밝힌다.
+fn limit_text(s: &str, max: usize) -> String {
+    const MARK: &str = "…(잘렸어요)";
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let keep = max.saturating_sub(MARK.chars().count());
+    let mut out: String = s.chars().take(keep).collect();
+    out.push_str(MARK);
+    out
+}
+
+#[derive(Deserialize)]
+struct SayBody {
+    text: String,
+    #[serde(default)]
+    session: Option<String>,
+}
+
+async fn say(State(st): State<St>, body: Bytes) -> Response {
+    let b: SayBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    if b.text.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "보낼 글이 비었어요");
+    }
+    let text = limit_text(&b.text, SAY_MAX);
+    let target = {
+        let hub = st.hub.lock().await;
+        match b.session.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) if !hub.engine.has_session(s) => Err("그 세션을 찾지 못했어요"),
+            Some(s) => hub
+                .engine
+                .channel_of_session(s)
+                .map(|c| (s.to_owned(), c))
+                .ok_or(NO_CHANNEL),
+            None => hub.engine.latest_channel_session().ok_or(NO_CHANNEL),
+        }
+    };
+    match target {
+        Ok((session, cid)) => {
+            let chat_id = st.new_chat_id();
+            let msg = json!({ "chat_id": chat_id, "text": text, "kind": "say" }).to_string();
+            if st.channels().push(&cid, msg) {
+                json_resp(
+                    StatusCode::OK,
+                    json!({ "delivered_to": session, "reason": "channel에 넘겼어요", "chat_id": chat_id }),
+                )
+            } else {
+                json_resp(
+                    StatusCode::OK,
+                    json!({ "delivered_to": null, "reason": NO_CHANNEL }),
+                )
+            }
+        }
+        Err(reason) => json_resp(
+            StatusCode::OK,
+            json!({ "delivered_to": null, "reason": reason }),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct ChoiceBody {
+    choice: String,
+}
+
+async fn decision_choice(State(st): State<St>, Path(id): Path<String>, body: Bytes) -> Response {
+    let b: ChoiceBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    let now = now_ms();
+    let mut hub = st.hub.lock().await;
+    let Some(info) = hub.engine.decision(&id) else {
+        return err(StatusCode::NOT_FOUND, "그런 결정이 없어요");
+    };
+    if info.state == ItemState::Done {
+        return json_resp(
+            StatusCode::CONFLICT,
+            json!({ "delivered_to": null, "reason": "이미 답한 결정이에요" }),
+        );
+    }
+    if !info.options.iter().any(|o| o == &b.choice) {
+        return err(StatusCode::BAD_REQUEST, "선택지에 없는 답이에요");
+    }
+    let msg = json!({ "chat_id": id, "text": format!("[선택] {}", b.choice), "kind": "choice" })
+        .to_string();
+    let via_session = hub.engine.channel_of_session(&info.session);
+    let opener = st.decisions().get(&id).cloned();
+    let delivered = {
+        let mut ch = st.channels();
+        [via_session, opener]
+            .into_iter()
+            .flatten()
+            .any(|cid| ch.push(&cid, msg.clone()))
+    };
+    if !delivered {
+        return json_resp(
+            StatusCode::OK,
+            json!({ "delivered_to": null, "reason": NO_CHANNEL }),
+        );
+    }
+    if let Ok((ev, fx)) = hub.engine.decide(&id, now) {
+        hub.record(ev, fx, now);
+    }
+    st.decisions().remove(&id);
+    json_resp(StatusCode::OK, json!({ "delivered_to": info.session }))
+}
+
+#[derive(Deserialize)]
+struct AcceptBody {
+    accept: bool,
+}
+
+async fn proposal(State(st): State<St>, Path(id): Path<String>, body: Bytes) -> Response {
+    let b: AcceptBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    let now = now_ms();
+    let mut hub = st.hub.lock().await;
+    match hub.engine.respond_proposal(&id, b.accept, now) {
+        Ok((ev, fx)) => {
+            hub.record(ev, fx, now);
+            ok()
+        }
+        Err(e) => act_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct QuietBody {
+    quiet: bool,
+}
+
+/// 받아들인 조정 되돌리기(계약 §5 "설정 화면에서 언제든 되돌린다"). 켜기는 제안으로만 한다.
+async fn adjustment(State(st): State<St>, Path(kind): Path<String>, body: Bytes) -> Response {
+    let b: QuietBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    if b.quiet {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "조용히 알리기는 제안을 받아들일 때만 켜져요",
+        );
+    }
+    let now = now_ms();
+    let mut hub = st.hub.lock().await;
+    match hub.engine.act(&kind, Action::Unquiet, None, None, now) {
+        Ok((ev, fx)) => {
+            hub.record(ev, fx, now);
+            ok()
+        }
+        Err(_) => err(StatusCode::NOT_FOUND, "그런 종류가 없어요"),
+    }
+}
+
+// ───────────────────────── channel ─────────────────────────
+
+#[derive(Deserialize)]
+struct RegisterBody {
+    pid: u32,
+    ppid: u32,
+    cwd: String,
+}
+
+async fn ch_register(State(st): State<St>, body: Bytes) -> Response {
+    let b: RegisterBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    let cwd = truncate_chars(b.cwd.trim(), 4096);
+    let cid = format!("ch_{}", random_hex(8));
+    let now = now_ms();
+    let mut hub = st.hub.lock().await;
+    let ev = gyeot_event(
+        now,
+        None,
+        Some(cwd.clone()),
+        EventBody::ChannelOpen {
+            cid: cid.clone(),
+            pid: b.pid,
+            ppid: b.ppid,
+            cwd,
+        },
+    );
+    hub.ingest(ev, now);
+    let session = hub.engine.channel(&cid).and_then(|c| c.session);
+    st.channels().register(&cid);
+    json_resp(StatusCode::OK, json!({ "cid": cid, "session": session }))
+}
+
+#[derive(Deserialize)]
+struct CidBody {
+    cid: String,
+}
+
+async fn ch_unregister(State(st): State<St>, body: Bytes) -> Response {
+    let b: CidBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    st.close_channel(&b.cid).await;
+    ok()
+}
+
+/// `chat_id` 꼴: `[A-Za-z0-9_-]{1,64}`(§10.1).
+pub fn valid_chat_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn known_channel(st: &Shared, hub: &Hub, cid: &str) -> bool {
+    st.channels().contains(cid) && hub.engine.channel(cid).is_some()
+}
+
+#[derive(Deserialize)]
+struct ReplyBody {
+    cid: String,
+    chat_id: String,
+    text: String,
+}
+
+async fn ch_reply(State(st): State<St>, body: Bytes) -> Response {
+    let b: ReplyBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    let hub = st.hub.lock().await;
+    if !known_channel(&st, &hub, &b.cid) {
+        return err(StatusCode::NOT_FOUND, "모르는 channel이에요");
+    }
+    if !valid_chat_id(&b.chat_id) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "chat_id는 [A-Za-z0-9_-] 1–64자여야 해요",
+        );
+    }
+    if b.text.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "답 글이 비었어요");
+    }
+    if b.text.chars().count() > REPLY_MAX {
+        return err(StatusCode::BAD_REQUEST, "답 글은 16,000자까지예요");
+    }
+    let session = hub.engine.channel(&b.cid).and_then(|c| c.session);
+    let project = session
+        .as_deref()
+        .and_then(|s| hub.engine.session_project(s));
+    hub.send(
+        "reply",
+        &json!({
+            "session": session,
+            "project": project,
+            "chat_id": b.chat_id,
+            "text": mask(&b.text),
+            "at_ms": now_ms(),
+        }),
+    );
+    ok()
+}
+
+#[derive(Deserialize)]
+struct DecisionBody {
+    cid: String,
+    question: String,
+    options: Vec<String>,
+}
+
+async fn ch_decision(State(st): State<St>, body: Bytes) -> Response {
+    let b: DecisionBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    let now = now_ms();
+    let mut hub = st.hub.lock().await;
+    if !known_channel(&st, &hub, &b.cid) {
+        return err(StatusCode::NOT_FOUND, "모르는 channel이에요");
+    }
+    let question = b.question.trim();
+    if question.is_empty() || question.chars().count() > QUESTION_MAX {
+        return err(StatusCode::BAD_REQUEST, "질문은 1–300자여야 해요");
+    }
+    if !(2..=4).contains(&b.options.len()) {
+        return err(StatusCode::BAD_REQUEST, "선택지는 2–4개여야 해요");
+    }
+    let options: Vec<String> = b.options.iter().map(|o| o.trim().to_owned()).collect();
+    if options
+        .iter()
+        .any(|o| o.is_empty() || o.chars().count() > OPTION_MAX)
+    {
+        return err(StatusCode::BAD_REQUEST, "선택지는 각각 1–60자여야 해요");
+    }
+    let mut uniq = options.clone();
+    uniq.sort();
+    uniq.dedup();
+    if uniq.len() != options.len() {
+        return err(StatusCode::BAD_REQUEST, "선택지가 겹쳐요");
+    }
+    let Some(ch) = hub.engine.channel(&b.cid) else {
+        return err(StatusCode::NOT_FOUND, "모르는 channel이에요");
+    };
+    let decision_id = format!("d{}", random_hex(6));
+    let ev = gyeot_event(
+        now,
+        ch.session.clone(),
+        Some(ch.cwd.clone()),
+        EventBody::DecisionOpen {
+            decision_id: decision_id.clone(),
+            question: mask(question),
+            options: options.iter().map(|o| mask(o)).collect(),
+        },
+    );
+    hub.ingest(ev, now);
+    st.decisions().insert(decision_id.clone(), b.cid.clone());
+    json_resp(StatusCode::OK, json!({ "decision_id": decision_id }))
+}
+
+// ───────────────────────── SSE ─────────────────────────
+
+type SseItem = Result<SseEvent, Infallible>;
+
+fn sse_from(rx: mpsc::Receiver<SseItem>) -> Sse<impl Stream<Item = SseItem>> {
+    let mut rx = rx;
+    Sse::new(futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx)))
+}
+
+fn ping_timer() -> tokio::time::Interval {
+    let mut iv = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
+    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    iv
+}
+
+fn ev_msg(event: &str, data: &str) -> SseItem {
+    Ok(SseEvent::default().event(event).data(data))
+}
+
+async fn stream(State(st): State<St>) -> Response {
+    let (mut rx, snap) = {
+        let mut hub = st.hub.lock().await;
+        let rx = hub.subscribe();
+        (rx, hub.snapshot_json(now_ms()))
+    };
+    let (tx, out) = mpsc::channel::<SseItem>(256);
+    let mut shutdown = st.shutdown.clone();
+    let st2 = st.clone();
+    tokio::spawn(async move {
+        if tx.send(ev_msg("snapshot", &snap)).await.is_err() {
+            return;
+        }
+        let mut ping = ping_timer();
+        loop {
+            tokio::select! {
+                m = rx.recv() => {
+                    let item = match m {
+                        Ok(m) => ev_msg(m.event, &m.data),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let s = st2.hub.lock().await.snapshot_json(now_ms());
+                            ev_msg("snapshot", &s)
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    };
+                    if tx.send(item).await.is_err() {
+                        return;
+                    }
+                }
+                _ = ping.tick() => {
+                    if tx.send(Ok(SseEvent::default().comment("ping"))).await.is_err() {
+                        return;
+                    }
+                }
+                () = tx.closed() => return,
+                _ = shutdown.changed() => return,
+            }
+        }
+    });
+    sse_from(out).into_response()
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    cid: String,
+}
+
+async fn ch_stream(State(st): State<St>, Query(q): Query<StreamQuery>) -> Response {
+    let attached = {
+        let hub = st.hub.lock().await;
+        if hub.engine.channel(&q.cid).is_none() {
+            None
+        } else {
+            st.channels().attach(&q.cid)
+        }
+    };
+    let Some((generation, notify)) = attached else {
+        return err(StatusCode::NOT_FOUND, "모르는 channel이에요");
+    };
+    let (tx, out) = mpsc::channel::<SseItem>(64);
+    let mut shutdown = st.shutdown.clone();
+    let cid = q.cid.clone();
+    tokio::spawn(async move {
+        let mut ping = ping_timer();
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // 쌓인 메시지를 먼저 보낸다.
+            loop {
+                let next = st.channels().next_for(&cid, generation);
+                match next {
+                    Err(_) => return,
+                    Ok(None) => break,
+                    Ok(Some(m)) => {
+                        if tx.send(ev_msg("message", &m)).await.is_err() {
+                            let mut ch = st.channels();
+                            ch.unshift(&cid, m);
+                            ch.detach(&cid, generation);
+                            return;
+                        }
+                    }
+                }
+            }
+            tokio::select! {
+                () = &mut notified => {}
+                _ = ping.tick() => {
+                    if tx.send(Ok(SseEvent::default().comment("ping"))).await.is_err() {
+                        st.channels().detach(&cid, generation);
+                        return;
+                    }
+                }
+                () = tx.closed() => {
+                    st.channels().detach(&cid, generation);
+                    return;
+                }
+                _ = shutdown.changed() => return,
+            }
+        }
+    });
+    sse_from(out).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_and_origin_rules() {
+        assert!(host_ok(Some("127.0.0.1:47321"), 47321));
+        assert!(host_ok(Some("LOCALHOST:47321"), 47321));
+        assert!(!host_ok(Some("127.0.0.1"), 47321));
+        assert!(!host_ok(Some("evil.com:47321"), 47321));
+        assert!(!host_ok(Some("127.0.0.1:1"), 47321));
+        assert!(!host_ok(None, 47321));
+        assert!(origin_ok("http://127.0.0.1:47321", 47321));
+        assert!(origin_ok("http://localhost:47321", 47321));
+        assert!(origin_ok("tauri://localhost", 47321));
+        assert!(origin_ok("http://tauri.localhost", 47321));
+        assert!(origin_ok("https://tauri.localhost", 47321));
+        assert!(!origin_ok("https://127.0.0.1:47321", 47321));
+        assert!(!origin_ok("null", 47321));
+        assert!(!origin_ok("http://evil.com", 47321));
+    }
+
+    #[test]
+    fn constant_time_compare() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn token_sources() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer  xyz "),
+        );
+        let uri: Uri = "/v1/stream?a=1&t=qq".parse().unwrap();
+        assert_eq!(presented_token(&h, &uri), vec!["xyz", "qq"]);
+        let h = HeaderMap::new();
+        let uri: Uri = "/v1/state".parse().unwrap();
+        assert!(presented_token(&h, &uri).is_empty());
+    }
+
+    #[test]
+    fn envelope_unwrapping() {
+        let now = 1_000_000_000_000;
+        let (p, pid, r) = unwrap_envelope(
+            json!({"payload": {"x": 1}, "pid_hint": 42, "received_ms": now - 5}),
+            now,
+        );
+        assert_eq!(p, json!({"x": 1}));
+        assert_eq!(pid, Some(42));
+        assert_eq!(r, now - 5);
+        // 미래·아주 옛날 시각은 묶는다
+        assert_eq!(
+            unwrap_envelope(json!({"payload": 1, "received_ms": now + 99}), now).2,
+            now
+        );
+        assert_eq!(
+            unwrap_envelope(json!({"payload": 1, "received_ms": 0}), now).2,
+            now - RECEIVED_MAX_AGE_MS
+        );
+        // 봉투가 아니면 그대로
+        let raw = json!({"hook_event_name": "Stop", "payload": "x"});
+        assert_eq!(unwrap_envelope(raw.clone(), now), (raw, None, now));
+    }
+
+    #[test]
+    fn chat_ids_and_limits() {
+        assert!(valid_chat_id("m17"));
+        assert!(valid_chat_id("d_ab-12"));
+        assert!(valid_chat_id(&"a".repeat(64)));
+        assert!(!valid_chat_id(&"a".repeat(65)));
+        assert!(!valid_chat_id(""));
+        assert!(!valid_chat_id("a b"));
+        assert!(!valid_chat_id("한"));
+        assert_eq!(limit_text("abc", 3), "abc");
+        let long = "가".repeat(40);
+        let cut = limit_text(&long, 20);
+        assert_eq!(cut.chars().count(), 20);
+        assert!(cut.ends_with("…(잘렸어요)"));
+    }
+}

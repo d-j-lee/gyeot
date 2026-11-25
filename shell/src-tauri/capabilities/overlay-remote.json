@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/remote-schema.json",
+  "identifier": "overlay-remote",
+  "description": "곁 데몬이 서빙하는 얼굴(http://127.0.0.1:47321)에는 클릭 영역·펼침 두 명령만 준다. 그 밖의 Tauri·플러그인 API는 주지 않는다.",
+  "local": false,
+  "remote": {
+    "urls": ["http://127.0.0.1:47321/*", "http://localhost:47321/*"]
+  },
+  "windows": ["main"],
+  "permissions": ["allow-set-hit-rect", "allow-set-expanded"]
+}
