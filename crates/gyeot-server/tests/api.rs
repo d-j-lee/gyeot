@@ -1320,3 +1320,38 @@ async fn channel_closes_ten_seconds_after_stream_drops() {
     );
     srv.stop().await;
 }
+
+/// `POST /v1/boot`는 본문을 다 읽은 뒤 답한다. 본문을 남긴 채 연결을 닫으면 Windows는 RST를 보내
+/// 클라이언트가 이미 받은 응답까지 잃는다(CI windows-latest에서 상태 0으로 관찰). 머리와 본문이
+/// 따로 도착해도 응답을 온전히 받아야 한다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boot_reads_body_before_answering() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let d = tempfile::tempdir().unwrap();
+    let srv = TestServer::start(d.path()).await;
+    for _ in 0..3 {
+        let mut s = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        s.set_nodelay(true).unwrap();
+        let head = format!(
+            "POST /v1/boot HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
+            srv.host(),
+            srv.token
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        // 서버가 본문을 기다리지 않으면 이 사이에 답하고 닫는다.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut buf = Vec::new();
+        let first = tokio::time::timeout(Duration::from_millis(50), s.read_buf(&mut buf)).await;
+        assert!(
+            first.is_err() || buf.is_empty(),
+            "본문을 받기 전에 답했다: {}",
+            String::from_utf8_lossy(&buf)
+        );
+        let _ = s.write_all(b"{}").await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 200"), "응답: {text}");
+    }
+    srv.stop().await;
+}

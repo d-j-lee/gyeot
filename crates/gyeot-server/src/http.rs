@@ -328,7 +328,10 @@ async fn index(State(st): State<St>, headers: HeaderMap) -> Response {
 }
 
 /// `POST /v1/boot`(Bearer만): 120초 동안 한 번 쓸 수 있는 얼굴 열기 코드.
-async fn boot(State(st): State<St>) -> Response {
+///
+/// 본문은 쓰지 않지만 끝까지 읽은 뒤 답한다(`_body`). 읽지 않은 본문을 남긴 채 닫으면 Windows가
+/// RST를 보내 클라이언트가 응답을 잃는다(CI windows-latest, 2026-11-26).
+async fn boot(State(st): State<St>, _body: axum::body::Bytes) -> Response {
     let now = now_ms();
     let issued = st.boot_codes().issue(now);
     match issued {

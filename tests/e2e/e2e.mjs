@@ -363,20 +363,31 @@ async function shootFace(dir) {
     console.log('건너뜀  Chrome 없음 — 스크린샷 생략');
     return null;
   }
-  const cdpPort = await freePort();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'gyeot-e2e-chrome-'));
-  const proc = spawn(chrome, ['--headless=new', '--no-sandbox', '--disable-gpu', `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${profile}`, 'about:blank'], { stdio: 'ignore' });
+  // 포트는 Chrome이 고르게 하고(빈 포트를 미리 잡았다 놓는 경쟁을 없앤다), 고른 포트는
+  // 프로필의 DevToolsActivePort 파일에서 읽는다. Chrome의 stderr는 산출물 폴더에 남긴다.
+  fs.mkdirSync(dir, { recursive: true });
+  const errLog = fs.openSync(path.join(dir, 'chrome-stderr.log'), 'w');
+  const proc = spawn(chrome, ['--headless=new', '--no-sandbox', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], { stdio: ['ignore', 'ignore', errLog] });
+  const started = Date.now();
+  let cdpPort = 0;
   const ver = await waitFor(async () => {
     try {
+      if (!cdpPort) {
+        const first = fs.readFileSync(path.join(profile, 'DevToolsActivePort'), 'utf8').split(/\r?\n/)[0];
+        cdpPort = Number(first) || 0;
+        if (!cdpPort) return null;
+      }
       return await (await fetch(`http://127.0.0.1:${cdpPort}/json/version`)).json();
     } catch {
       return null;
     }
-  }, 15000, 200);
+  }, 45000, 200);
   if (!ver) {
-    check('Chrome 원격 디버깅 연결', false);
+    check('Chrome 원격 디버깅 연결', false, `${Date.now() - started}ms, 포트 ${cdpPort || '없음'}, stderr는 ${path.join(dir, 'chrome-stderr.log')}`);
     return proc;
   }
+  console.log(`정보  Chrome 원격 디버깅 연결까지 ${Date.now() - started}ms`);
   const target = await (await fetch(`http://127.0.0.1:${cdpPort}/json/new?about:blank`, { method: 'PUT' })).json();
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((r) => ws.addEventListener('open', r, { once: true }));
