@@ -149,7 +149,7 @@ try {
             foreach ($key in @('port', 'stale_minutes', 'nudge_min', 'interrupt_min', 'approval_interrupt', 'quiet_hours', 'utc_offset_minutes', 'retention_days')) {
                 Assert-Gyeot ($cfgText -match "(?m)^#?[ \t]*$key[ \t]*=") "설정 견본에 맨 위 키 $key 가 있다(§6)"
             }
-            Assert-Gyeot ($cfgText -match '(?m)^#?[ \t]*approval_interrupt[ \t]*=[ \t]*false[ \t]*$') '설정 견본의 approval_interrupt 는 기본값 false(§13.3)'
+            Assert-Gyeot ($cfgText -match '(?m)^#?[ \t]*approval_interrupt[ \t]*=[ \t]*false[ \t\r]*$') '설정 견본의 approval_interrupt 는 기본값 false(§13.3)'
             $firstTable = $cfgText.IndexOf("`n[")
             $commentedTable = $cfgText.IndexOf("`n# [[tail]]")
             $ai = $cfgText.IndexOf('approval_interrupt =')
