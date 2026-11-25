@@ -359,6 +359,8 @@ pub struct SettingsView {
     pub quiet_hours: Vec<String>,
     /// 조용히 알리기로 한 종류.
     pub quiet_kinds: Vec<ItemKind>,
+    /// 승인·병합 대기를 소리까지 올리는가(§13.3).
+    pub approval_interrupt: bool,
 }
 
 /// 상태 전체(계약 §7).
@@ -592,10 +594,12 @@ mod tests {
             stale_minutes: 30,
             quiet_hours: vec![],
             quiet_kinds: vec![ItemKind::Unread],
+            approval_interrupt: false,
         };
         let j = serde_json::to_string(&v).unwrap();
         assert!(j.contains("\"nudge_min\":80,"), "{j}");
         assert!(j.contains("\"interrupt_min\":95.5"), "{j}");
         assert!(j.contains("\"quiet_kinds\":[\"unread\"]"), "{j}");
+        assert!(j.contains("\"approval_interrupt\":false"), "{j}");
     }
 }

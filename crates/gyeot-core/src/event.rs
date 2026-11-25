@@ -177,6 +177,10 @@ pub enum EventBody {
         /// 도구 이름.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<String>,
+        /// `PostToolBatch`의 도구 이름 목록(`tool_calls[].tool_name`, 겹침 없이 64개까지, §13.2).
+        /// 비었으면 JSON에 쓰지 않는다(옛 로그와 같은 모양).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
     },
     /// 하위 에이전트 시작.
     SubagentStart {
@@ -375,7 +379,10 @@ impl EventBody {
                 p(tool, 80);
                 p(error, 120);
             }
-            EventBody::Activity { tool } => po(tool, 80),
+            EventBody::Activity { tool, tools } => {
+                po(tool, 80);
+                *tools = crate::normalize::tool_list(tools.iter().map(String::as_str));
+            }
             EventBody::SubagentStart { agent_type } | EventBody::SubagentStop { agent_type } => {
                 po(agent_type, 80)
             }
@@ -423,6 +430,9 @@ pub struct Event {
     pub source: Source,
     /// 에이전트.
     pub agent: Option<Agent>,
+    /// 하위 에이전트 id(Claude Code 훅 입력의 `agent_id`, 128자까지, §13.2). 주 에이전트면 `None`.
+    /// JSON에는 값이 있을 때만 쓴다(옛 로그와 같은 모양).
+    pub agent_id: Option<String>,
     /// 세션 id.
     pub session: Option<String>,
     /// 작업 폴더.
@@ -450,6 +460,8 @@ struct EventWire {
     source: Source,
     #[serde(default)]
     agent: Option<Agent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
     #[serde(default)]
     session: Option<String>,
     #[serde(default)]
@@ -488,6 +500,7 @@ impl Serialize for Event {
             ts_ms: self.ts_ms,
             source: self.source,
             agent: self.agent,
+            agent_id: self.agent_id.clone(),
             session: self.session.clone(),
             cwd: self.cwd.clone(),
             pid_hint: self.pid_hint,
@@ -508,6 +521,7 @@ impl<'de> Deserialize<'de> for Event {
             ts_ms: w.ts_ms,
             source: w.source,
             agent: w.agent,
+            agent_id: w.agent_id,
             session: w.session,
             cwd: w.cwd,
             pid_hint: w.pid_hint,
@@ -552,10 +566,51 @@ mod tests {
             r#"{"ts_ms":1,"source":"codex","kind":"activity","agent":null,"session":"s"}"#,
         )
         .unwrap();
-        assert_eq!(ev.body, EventBody::Activity { tool: None });
+        assert_eq!(
+            ev.body,
+            EventBody::Activity {
+                tool: None,
+                tools: vec![]
+            }
+        );
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["detail"], serde_json::json!({}));
         assert_eq!(v["agent"], Value::Null);
+        assert!(v.get("agent_id").is_none(), "{v}");
+    }
+
+    /// 계약 §13.2: `agent_id`와 activity의 `tools`가 없던 옛 로그 줄도 그대로 재생된다.
+    #[test]
+    fn old_lines_without_agent_id_or_tools_replay() {
+        let old = r#"{"id":"1-0","ts_ms":1,"source":"claude-code","agent":"claude-code","session":"s","cwd":"/w","pid_hint":3,"kind":"activity","raw_event":"PostToolBatch","detail":{}}"#;
+        let ev: Event = serde_json::from_str(old).unwrap();
+        assert_eq!(ev.agent_id, None);
+        assert_eq!(
+            ev.body,
+            EventBody::Activity {
+                tool: None,
+                tools: vec![]
+            }
+        );
+        // 옛 줄은 다시 써도 같은 모양(새 필드는 값이 있을 때만 쓴다)
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::from_str::<Value>(old).unwrap()
+        );
+        let new = r#"{"id":"1-0","ts_ms":1,"source":"claude-code","agent":"claude-code","agent_id":"a1","session":"s","cwd":null,"pid_hint":null,"kind":"activity","raw_event":"PostToolBatch","detail":{"tools":["Read","Bash"]}}"#;
+        let ev: Event = serde_json::from_str(new).unwrap();
+        assert_eq!(ev.agent_id.as_deref(), Some("a1"));
+        assert_eq!(
+            ev.body,
+            EventBody::Activity {
+                tool: None,
+                tools: vec!["Read".into(), "Bash".into()]
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::from_str::<Value>(new).unwrap()
+        );
     }
 
     #[test]
@@ -615,6 +670,11 @@ mod tests {
             },
             EventBody::Activity {
                 tool: Some("Read".into()),
+                tools: vec![],
+            },
+            EventBody::Activity {
+                tool: None,
+                tools: vec!["Read".into(), "Bash".into()],
             },
             EventBody::SubagentStart { agent_type: None },
             EventBody::SubagentStop {
@@ -659,12 +719,13 @@ mod tests {
                 options: vec!["a".into(), "b".into()],
             },
         ];
-        for body in bodies {
+        for (i, body) in bodies.into_iter().enumerate() {
             let ev = Event {
                 id: "1-0".into(),
                 ts_ms: 1,
                 source: Source::Gyeot,
                 agent: None,
+                agent_id: (i % 2 == 0).then(|| format!("a{i}")),
                 session: Some("s".into()),
                 cwd: None,
                 pid_hint: None,

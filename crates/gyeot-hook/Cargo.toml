@@ -13,7 +13,11 @@ path = "src/main.rs"
 [dependencies]
 gyeot-core = { workspace = true }
 dirs = { workspace = true }
+getrandom = { workspace = true }
+# 데몬 확인(계약 §13.1). 서버와 같은 판(hmac 0.12 = digest 0.10 = sha2 0.10).
+hmac = "0.12"
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 ureq = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

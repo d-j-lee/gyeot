@@ -1,12 +1,15 @@
 //! 곁 훅 심(`docs/contracts.md` §9).
 //!
 //! 지키는 것: stdout에 아무것도 쓰지 않는다. 언제나 exit 0. 패닉하지 않는다(해도 삼킨다).
-//! 데몬과 주고받는 시간은 모두 합쳐 400ms 안이다.
+//! 데몬과 주고받는 시간은 모두 합쳐 400ms 안이다(데몬 확인 포함).
+//! 토큰과 페이로드는 그 포트의 서버가 같은 토큰을 안다고 증명한 뒤에만 보낸다(§13.1).
 
 use gyeot_core::Source;
 use gyeot_core::paths::{HomeEnv, resolve_home, spool_file_name};
 use gyeot_core::sanitize_payload;
+use hmac::{Hmac, Mac};
 use serde_json::{Map, Value, json};
+use sha2::Sha256;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
@@ -30,6 +33,8 @@ const DRAIN_MAX: usize = 50;
 /// 스풀에 쌓아 두는 최대 파일 수(데몬이 오래 없을 때 디스크를 지킨다).
 const SPOOL_CAP: usize = 10_000;
 const DEFAULT_URL: &str = "http://127.0.0.1:47321";
+/// 데몬 확인 응답(`{"v":1,"proof":"<64 hex>"}`)으로 읽는 최대 바이트.
+const HELLO_BODY_MAX: u64 = 4096;
 
 fn main() {
     // 패닉 메시지도 내지 않는다.
@@ -204,10 +209,11 @@ fn payload_from_bytes(bytes: &[u8], truncated: bool) -> Option<Value> {
 }
 
 /// 잘린 입력에서 건지는 최상위 문자열 필드(정규화가 읽는 것).
-const KEEP: [&str; 28] = [
+const KEEP: [&str; 29] = [
     "session_id",
     "cwd",
     "hook_event_name",
+    "agent_id",
     "permission_mode",
     "notification_type",
     "message",
@@ -303,15 +309,90 @@ fn agent_for(left: Duration) -> ureq::Agent {
         .into()
 }
 
-fn post(ctx: &Ctx, source: &str, body: &[u8]) -> bool {
-    let (Some(base), Some(token), Some(left)) = (&ctx.base, &ctx.token, ctx.remaining()) else {
+/// 데몬 확인(§13.1)을 통과한 연결 대상. 토큰을 보내는 함수는 이것만 받는다(확인 없이 보낼 길이 없다).
+struct Verified<'a> {
+    ctx: &'a Ctx,
+    base: &'a str,
+    token: &'a str,
+}
+
+/// URL(`http://<호스트>[:<포트>]`, [`daemon_url`]이 거른 꼴)의 포트. 없으면 80.
+fn port_of(base: &str) -> Option<u16> {
+    let host = base.strip_prefix("http://")?;
+    match host.rsplit_once(':') {
+        Some((_, p)) => p.parse().ok(),
+        None => Some(80),
+    }
+}
+
+/// 32바이트 난수의 소문자 hex 64자.
+fn nonce() -> Option<String> {
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).ok()?;
+    Some(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// `proof == hex(HMAC-SHA256(key=토큰 UTF-8, msg="gyeot-hello/v1|<포트>|<n>"))`인가(상수 시간 비교).
+fn proof_ok(token: &str, port: u16, n: &str, proof: &str) -> bool {
+    let Some(tag) = decode_hex(proof).filter(|t| t.len() == 32) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(token.as_bytes()) else {
+        return false;
+    };
+    mac.update(format!("gyeot-hello/v1|{port}|{n}").as_bytes());
+    mac.verify_slice(&tag).is_ok()
+}
+
+/// 그 포트의 서버가 같은 토큰을 아는지 확인한다(`GET /v1/hello?n=`, 인증 머리 없음). 포트는 심이 연결한 포트다.
+/// 다르거나 오류·시간 초과면 `None`(곁 데몬으로 보지 않는다). 남은 통신 시간 안에서만 기다린다.
+fn hello(ctx: &Ctx) -> Option<Verified<'_>> {
+    let (Some(base), Some(token)) = (ctx.base.as_deref(), ctx.token.as_deref()) else {
+        return None;
+    };
+    let port = port_of(base)?;
+    let n = nonce()?;
+    let left = ctx.remaining()?;
+    let mut resp = agent_for(left)
+        .get(&format!("{base}/v1/hello?n={n}"))
+        .call()
+        .ok()?;
+    if resp.status() != 200 {
+        return None;
+    }
+    let text = resp
+        .body_mut()
+        .with_config()
+        .limit(HELLO_BODY_MAX)
+        .read_to_string()
+        .ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    if v.get("v").and_then(Value::as_u64) != Some(1) {
+        return None;
+    }
+    let proof = v.get("proof").and_then(Value::as_str)?;
+    proof_ok(token, port, &n, proof).then_some(Verified { ctx, base, token })
+}
+
+fn post(v: &Verified<'_>, source: &str, body: &[u8]) -> bool {
+    let Some(left) = v.ctx.remaining() else {
         return false;
     };
     let agent = agent_for(left);
-    let url = format!("{base}/v1/ingest/{source}");
+    let url = format!("{}/v1/ingest/{source}", v.base);
     match agent
         .post(&url)
-        .header("Authorization", &format!("Bearer {token}"))
+        .header("Authorization", &format!("Bearer {}", v.token))
         .header("Content-Type", "application/json")
         .send(body)
     {
@@ -324,10 +405,12 @@ fn deliver(ctx: &Ctx, source: &str, envelope: &Value) {
     let Ok(body) = serde_json::to_vec(envelope) else {
         return;
     };
-    if post(ctx, source, &body) {
-        drain(ctx);
-    } else {
-        spool(&ctx.spool, source, envelope);
+    // 확인과 전송을 합쳐 [`NET_BUDGET`] 안. 확인이 안 되면 토큰도 페이로드도 보내지 않고 스풀에만 둔다.
+    match hello(ctx) {
+        Some(v) if post(&v, source, &body) => drain(&v),
+        _ => {
+            spool(&ctx.spool, source, envelope);
+        }
     }
 }
 
@@ -384,8 +467,9 @@ fn spool(dir: &Path, source: &str, envelope: &Value) -> Option<PathBuf> {
     None
 }
 
-/// 스풀에 남은 것을 이름 순으로 최대 50개 보낸다. 실패하면 멈춘다.
-fn drain(ctx: &Ctx) {
+/// 스풀에 남은 것을 이름 순으로 최대 50개 보낸다(같은 확인 결과로). 실패하면 멈춘다.
+fn drain(v: &Verified<'_>) {
+    let ctx = v.ctx;
     let Ok(rd) = fs::read_dir(&ctx.spool) else {
         return;
     };
@@ -419,7 +503,7 @@ fn drain(ctx: &Ctx) {
             continue;
         };
         let body = serde_json::to_vec(&Value::Object(entry)).unwrap_or_default();
-        if post(ctx, &source, &body) {
+        if post(v, &source, &body) {
             let _ = fs::remove_file(&claimed);
         } else {
             let _ = fs::rename(&claimed, &path);
@@ -528,11 +612,12 @@ mod tests {
     #[test]
     fn truncated_payload_is_salvaged() {
         let mut s = String::from(
-            r#"{"session_id":"abc","transcript_path":"/t","cwd":"C:\\work\\proj","hook_event_name":"Stop","last_assistant_message":"끝\n할까요?","tool_response":""#,
+            r#"{"session_id":"abc","transcript_path":"/t","cwd":"C:\\work\\proj","hook_event_name":"Stop","agent_id":"a1","last_assistant_message":"끝\n할까요?","tool_response":""#,
         );
         s.push_str(&"y".repeat(5000));
         let p = payload_from_bytes(s.as_bytes(), true).unwrap();
         assert_eq!(p["session_id"], "abc");
+        assert_eq!(p["agent_id"], "a1");
         assert_eq!(p["cwd"], "C:\\work\\proj");
         assert_eq!(p["hook_event_name"], "Stop");
         assert_eq!(p["last_assistant_message"], "끝\n할까요?");
@@ -603,5 +688,91 @@ mod tests {
         let p = ppid::agent_pid();
         assert!(p.is_some());
         assert_ne!(p, Some(std::process::id()));
+    }
+
+    const TOK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// 계약 §13.1의 식. 기대값은 파이썬 `hmac`으로 따로 계산했다.
+    #[test]
+    fn hello_proof_follows_contract_formula() {
+        let n = format!("{}{}", "00".repeat(16), "ff".repeat(16));
+        let p47321 = "c4c3f5b005a77115e7607b3924e1dbc59a84de16446cfad6d7fcc17f20999a86";
+        let p47322 = "52cd99f84ef74af1d3cdeb8ae16914b4c8ba06e4a512b6706586a6d640068101";
+        assert!(proof_ok(TOK, 47321, &n, p47321));
+        assert!(proof_ok(TOK, 47321, &n, &p47321.to_uppercase()));
+        assert!(proof_ok(TOK, 47322, &n, p47322));
+        // 다른 포트용 proof(중계), 다른 토큰, 다른 n
+        assert!(!proof_ok(TOK, 47321, &n, p47322));
+        assert!(!proof_ok(&"a".repeat(64), 47321, &n, p47321));
+        assert!(!proof_ok(TOK, 47321, &"11".repeat(32), p47321));
+        // 꼴이 틀린 것
+        let bad_char = p47321.replacen('c', "g", 1);
+        let long = format!("{p47321}00");
+        for bad in ["", "zz", &p47321[..62], &long, &bad_char, &p47321[..63]] {
+            assert!(!proof_ok(TOK, 47321, &n, bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn nonce_and_port() {
+        let a = nonce().unwrap();
+        let b = nonce().unwrap();
+        assert_eq!(a.len(), 64);
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+            "{a}"
+        );
+        assert_ne!(a, b);
+        assert_eq!(port_of("http://127.0.0.1:47321"), Some(47321));
+        assert_eq!(port_of("http://localhost:5000"), Some(5000));
+        assert_eq!(port_of("http://127.0.0.1"), Some(80));
+        assert_eq!(port_of("https://127.0.0.1:1"), None);
+    }
+
+    /// 연결만 받고 아무 말도 하지 않는 서버(받은 연결은 붙잡아 둔다). 받은 요청줄을 차례로 돌려준다.
+    fn silent_server() -> (u16, mpsc::Receiver<String>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for mut s in l.incoming().flatten() {
+                let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let _ = tx.send(text.lines().next().unwrap_or("").to_owned());
+                held.push(s);
+            }
+        });
+        (port, rx)
+    }
+
+    /// 확인과 전송을 합쳐 400ms 통신 한도 안(답하지 않는 서버). 보내지 않고 스풀에 남긴다.
+    #[test]
+    fn hello_and_send_share_the_net_budget() {
+        let (port, rx) = silent_server();
+        let d = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        let ctx = Ctx {
+            base: Some(format!("http://127.0.0.1:{port}")),
+            token: Some(TOK.into()),
+            spool: d.path().join("spool"),
+            deadline: start + NET_BUDGET,
+        };
+        deliver(
+            &ctx,
+            "claude-code",
+            &json!({"payload": {"session_id": "s"}, "pid_hint": null, "received_ms": 1}),
+        );
+        let took = start.elapsed();
+        assert!(took < NET_BUDGET + Duration::from_millis(100), "{took:?}");
+        assert!(took >= NET_BUDGET - Duration::from_millis(50), "{took:?}");
+        assert_eq!(fs::read_dir(d.path().join("spool")).unwrap().count(), 1);
+        let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(first.starts_with("GET /v1/hello?n="), "{first}");
+        // 확인에서 시간을 다 썼으므로 토큰을 싣는 요청은 없다
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
     }
 }

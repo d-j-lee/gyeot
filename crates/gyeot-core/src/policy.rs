@@ -90,6 +90,9 @@ pub struct Policy {
     pub quiet_hours: Vec<QuietRange>,
     /// 현지 시각 = UTC + 이 분.
     pub utc_offset_minutes: i32,
+    /// 승인·병합 대기를 대기 시간으로 소리(interrupt)까지 올릴까(계약 §13.3, 기본 `false`).
+    #[serde(default)]
+    pub approval_interrupt: bool,
 }
 
 impl Default for Policy {
@@ -100,6 +103,7 @@ impl Default for Policy {
             interrupt_min: 95.0,
             quiet_hours: Vec::new(),
             utc_offset_minutes: 0,
+            approval_interrupt: false,
         }
     }
 }

@@ -146,6 +146,7 @@ pub fn gyeot_event(
         ts_ms,
         source: Source::Gyeot,
         agent: None,
+        agent_id: None,
         session,
         cwd,
         pid_hint: None,

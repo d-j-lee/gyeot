@@ -29,6 +29,7 @@ struct FileConfig {
     stale_minutes: Option<u32>,
     nudge_min: Option<f64>,
     interrupt_min: Option<f64>,
+    approval_interrupt: Option<bool>,
     quiet_hours: Option<Vec<String>>,
     utc_offset_minutes: Option<i32>,
     retention_days: Option<u32>,
@@ -52,6 +53,8 @@ pub struct ServerConfig {
     pub nudge_min: f64,
     /// 소리 기준 점수.
     pub interrupt_min: f64,
+    /// 승인·병합 대기를 소리(interrupt)까지 올릴지(계약 §13.3, 기본 false).
+    pub approval_interrupt: bool,
     /// 조용한 시간(현지 시각 `HH:MM-HH:MM`).
     pub quiet_hours: Vec<String>,
     /// 현지 오프셋(분). `None`이면 시스템 현지 시간대를 따른다.
@@ -104,6 +107,7 @@ impl ServerConfig {
             stale_minutes: 30,
             nudge_min: 80.0,
             interrupt_min: 95.0,
+            approval_interrupt: false,
             quiet_hours: Vec::new(),
             utc_offset_minutes: None,
             retention_days: 14,
@@ -176,6 +180,9 @@ impl ServerConfig {
             }
             cfg.interrupt_min = v;
         }
+        if let Some(v) = f.approval_interrupt {
+            cfg.approval_interrupt = v;
+        }
         if let Some(q) = f.quiet_hours {
             Policy::parse_quiet_hours(&q).map_err(anyhow::Error::msg)?;
             cfg.quiet_hours = q.iter().map(|s| s.trim().to_owned()).collect();
@@ -217,6 +224,7 @@ impl ServerConfig {
             interrupt_min: self.interrupt_min,
             quiet_hours: Policy::parse_quiet_hours(&self.quiet_hours).unwrap_or_default(),
             utc_offset_minutes: self.effective_utc_offset(),
+            approval_interrupt: self.approval_interrupt,
         }
     }
 
@@ -262,6 +270,7 @@ impl ServerConfig {
             stale_minutes: u32,
             nudge_min: f64,
             interrupt_min: f64,
+            approval_interrupt: bool,
             quiet_hours: &'a [String],
             utc_offset_minutes: i32,
             retention_days: u32,
@@ -272,6 +281,7 @@ impl ServerConfig {
             stale_minutes: self.stale_minutes,
             nudge_min: self.nudge_min,
             interrupt_min: self.interrupt_min,
+            approval_interrupt: self.approval_interrupt,
             quiet_hours: &self.quiet_hours,
             utc_offset_minutes: self.effective_utc_offset(),
             retention_days: self.retention_days,
@@ -313,6 +323,7 @@ port = 47321
 stale_minutes = 30
 nudge_min = 80
 interrupt_min = 95
+approval_interrupt = false      # 승인·병합 대기를 소리(interrupt)까지 올릴지(§13.3)
 quiet_hours = ["22:00-08:00"]
 utc_offset_minutes = 540
 retention_days = 14
@@ -340,6 +351,24 @@ cwd = "C:/work/proj"
     fn empty_is_defaults() {
         let c = ServerConfig::parse(PathBuf::from("/h"), "").unwrap();
         assert_eq!(c, ServerConfig::defaults(PathBuf::from("/h")));
+    }
+
+    /// 계약 §6·§13.3: 최상위 키 `approval_interrupt`(기본 false)를 엔진 정책으로 넘긴다.
+    #[test]
+    fn approval_interrupt_reaches_policy() {
+        let c = ServerConfig::parse(PathBuf::from("/h"), "").unwrap();
+        assert!(!c.approval_interrupt);
+        assert!(!c.policy().approval_interrupt);
+        assert!(c.to_toml().contains("approval_interrupt = false"));
+        let c = ServerConfig::parse(PathBuf::from("/h"), "approval_interrupt = true").unwrap();
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert!(c.approval_interrupt);
+        assert!(c.policy().approval_interrupt);
+        assert!(c.to_toml().contains("approval_interrupt = true"));
+        let c = ServerConfig::parse(PathBuf::from("/h"), "approval_interrupt = false").unwrap();
+        assert!(!c.policy().approval_interrupt);
+        assert!(ServerConfig::parse(PathBuf::from("/h"), "approval_interrupt = \"yes\"").is_err());
+        assert!(ServerConfig::parse(PathBuf::from("/h"), "approval_interrupt = 1").is_err());
     }
 
     #[test]

@@ -10,6 +10,45 @@ pub const PREVIEW_MAX: usize = 300;
 pub const LAST_MESSAGE_MAX: usize = 280;
 /// 짧은 필드(오류·할 일 제목) 길이.
 pub const SHORT_MAX: usize = 120;
+/// 하위 에이전트 id 길이(계약 §13.2).
+pub const AGENT_ID_MAX: usize = 128;
+/// `PostToolBatch`에서 보는 도구 호출 수(계약 §13.2).
+pub const TOOL_CALLS_MAX: usize = 64;
+/// 도구 이름 길이.
+const TOOL_NAME_MAX: usize = 80;
+
+/// 훅 입력의 `agent_id`: 앞뒤 공백을 지우고 128자로 자른다(다시 해도 같다). 비었거나 글이 아니면 `None`.
+pub fn agent_id_of(o: &Map<String, Value>) -> Option<String> {
+    let t = o.get("agent_id")?.as_str()?.trim();
+    let cut: String = t.chars().take(AGENT_ID_MAX).collect();
+    let cut = cut.trim_end();
+    (!cut.is_empty()).then(|| cut.to_owned())
+}
+
+/// `tool_calls[]`에서 도구 이름이 있는(비지 않은 글) 호출만, 앞에서 64개까지의 이름.
+pub fn batch_tool_names(o: &Map<String, Value>) -> Vec<&str> {
+    match o.get("tool_calls") {
+        Some(Value::Array(calls)) => calls
+            .iter()
+            .filter_map(|c| c.get("tool_name").and_then(Value::as_str))
+            .filter(|n| !n.trim().is_empty())
+            .take(TOOL_CALLS_MAX)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 도구 이름 목록: 비지 않은 이름 앞 64개를 미리보기(80자)로 바꾸고 겹친 것은 뺀다(처음 순서).
+pub fn tool_list<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for n in names.filter(|n| !n.trim().is_empty()).take(TOOL_CALLS_MAX) {
+        let p = preview(n, TOOL_NAME_MAX);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
 
 /// 원본 페이로드를 정규화한다. 버릴 것이면 빈 목록이다.
 ///
@@ -71,6 +110,7 @@ fn base_event(source: Source, agent: Option<Agent>, raw_event: &str, body: Event
         ts_ms: 0,
         source,
         agent,
+        agent_id: None,
         session: None,
         cwd: None,
         pid_hint: None,
@@ -224,11 +264,15 @@ fn hook_event(raw: &Value, source: Source, agent: Agent) -> Option<Event> {
                 SHORT_MAX,
             ),
         },
-        "PreToolUse" | "PostToolUse" | "PostToolBatch" | "UserPromptExpansion" => {
-            EventBody::Activity {
-                tool: s(o, "tool_name").map(|t| preview(t, 80)),
-            }
-        }
+        "PreToolUse" | "PostToolUse" | "UserPromptExpansion" => EventBody::Activity {
+            tool: s(o, "tool_name").map(|t| preview(t, TOOL_NAME_MAX)),
+            tools: Vec::new(),
+        },
+        // 묶음의 도구 이름들(§13.2). 목록이 없으면 '모르는 도구'다(G-016).
+        "PostToolBatch" => EventBody::Activity {
+            tool: s(o, "tool_name").map(|t| preview(t, TOOL_NAME_MAX)),
+            tools: tool_list(batch_tool_names(o).into_iter()),
+        },
         "TaskCompleted" => EventBody::TaskDone {
             subject: preview(
                 s(o, "task_subject")
@@ -248,6 +292,7 @@ fn hook_event(raw: &Value, source: Source, agent: Agent) -> Option<Event> {
         _ => return None,
     };
     let mut ev = base_event(source, Some(agent), name, body);
+    ev.agent_id = agent_id_of(o);
     ev.session = s(o, "session_id").map(str::to_owned);
     ev.cwd = s(o, "cwd").map(str::to_owned);
     Some(ev)
@@ -334,7 +379,7 @@ fn harness(raw: &Value, source: Source, name: &str, received_ms: i64) -> Option<
     Some(ev)
 }
 
-/// `custom`: 이미 정규화된 모양(`kind`, `detail`, `session?`, `cwd?`, `agent?`)을 받는다.
+/// `custom`: 이미 정규화된 모양(`kind`, `detail`, `session?`, `cwd?`, `agent?`, `agent_id?`)을 받는다.
 /// 내부 전용 종류는 받지 않고, 글자 필드는 모두 마스킹하고 자른다.
 fn custom(raw: &Value) -> Option<Event> {
     let o = raw.as_object()?;
@@ -349,6 +394,7 @@ fn custom(raw: &Value) -> Option<Event> {
         .cloned()
         .and_then(|a| serde_json::from_value::<Agent>(a).ok());
     let mut ev = base_event(Source::Custom, agent, kind, body);
+    ev.agent_id = agent_id_of(o);
     ev.session = s(o, "session").map(str::to_owned);
     ev.cwd = s(o, "cwd").map(str::to_owned);
     Some(ev)
@@ -667,13 +713,119 @@ mod tests {
             assert_eq!(
                 ev.body,
                 EventBody::Activity {
-                    tool: Some("Read".into())
+                    tool: Some("Read".into()),
+                    tools: vec![]
                 },
                 "{name}"
             );
         }
         let ev = one(hook("PostToolBatch", json!({})));
-        assert_eq!(ev.body, EventBody::Activity { tool: None });
+        assert_eq!(
+            ev.body,
+            EventBody::Activity {
+                tool: None,
+                tools: vec![]
+            }
+        );
+    }
+
+    /// 계약 §13.2: 하위 에이전트의 `agent_id`를 이벤트에 싣는다(128자까지). 없으면 `None`.
+    #[test]
+    fn agent_id_is_carried() {
+        let ev = one(hook(
+            "PostToolUse",
+            json!({"tool_name": "Read", "agent_id": " agent-a1 ", "agent_type": "Explore"}),
+        ));
+        assert_eq!(ev.agent_id.as_deref(), Some("agent-a1"));
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["agent_id"], "agent-a1");
+        assert_eq!(serde_json::from_value::<Event>(v).unwrap(), ev);
+        // 모든 Claude Code 이벤트에서
+        for (name, extra) in [
+            (
+                "Notification",
+                json!({"notification_type": "permission_prompt", "message": "m"}),
+            ),
+            (
+                "PermissionRequest",
+                json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+            ),
+            ("PostToolUseFailure", json!({"tool_name": "Bash"})),
+            ("PostToolBatch", json!({})),
+            ("SubagentStop", json!({})),
+            ("Stop", json!({})),
+        ] {
+            let mut x = extra;
+            x["agent_id"] = json!("a2");
+            assert_eq!(one(hook(name, x)).agent_id.as_deref(), Some("a2"), "{name}");
+        }
+        // 128자까지
+        let long = format!("{}  {}", "a".repeat(127), "b".repeat(50));
+        let ev = one(hook("PostToolUse", json!({ "agent_id": long })));
+        let id = ev.agent_id.unwrap();
+        assert_eq!(id, "a".repeat(127));
+        // 없거나 비었거나 글이 아니면 None, JSON에도 없다
+        for extra in [json!({}), json!({"agent_id": "  "}), json!({"agent_id": 7})] {
+            let ev = one(hook("PostToolUse", extra));
+            assert_eq!(ev.agent_id, None);
+            let v = serde_json::to_value(&ev).unwrap();
+            assert!(v.get("agent_id").is_none(), "{v}");
+        }
+        // Codex 훅도 같은 표
+        let ev = &normalize(
+            Source::Codex,
+            &hook("PostToolUse", json!({"agent_id": "c1"})),
+            T,
+            None,
+        )[0];
+        assert_eq!(ev.agent_id.as_deref(), Some("c1"));
+    }
+
+    /// 계약 §13.2: `PostToolBatch`의 activity는 `tool_calls[]`의 도구 이름 목록(64개까지)을 싣는다.
+    #[test]
+    fn post_tool_batch_lists_tools() {
+        let ev = one(hook(
+            "PostToolBatch",
+            json!({"tool_calls": [
+                {"tool_name": "Read", "tool_use_id": "t1", "tool_input": {"file_path": "/w/a"}, "tool_response": "x"},
+                {"tool_name": "Bash", "tool_use_id": "t2"},
+                {"tool_name": "Read", "tool_use_id": "t3"},
+                {"tool_use_id": "t4"},
+                {"tool_name": "  "},
+                "junk"
+            ]}),
+        ));
+        assert_eq!(
+            ev.body,
+            EventBody::Activity {
+                tool: None,
+                tools: vec!["Read".into(), "Bash".into()]
+            }
+        );
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["detail"], json!({"tools": ["Read", "Bash"]}));
+        // 64개까지만 본다
+        let calls: Vec<Value> = (0..100)
+            .map(|i| json!({"tool_name": format!("T{i}")}))
+            .collect();
+        let ev = one(hook("PostToolBatch", json!({ "tool_calls": calls })));
+        let EventBody::Activity { tools, .. } = ev.body else {
+            panic!()
+        };
+        assert_eq!(tools.len(), 64);
+        assert_eq!(tools[63], "T63");
+        // 다른 이벤트의 tool_calls는 보지 않는다
+        let ev = one(hook(
+            "PostToolUse",
+            json!({"tool_name": "Read", "tool_calls": [{"tool_name": "Bash"}]}),
+        ));
+        assert_eq!(
+            ev.body,
+            EventBody::Activity {
+                tool: Some("Read".into()),
+                tools: vec![]
+            }
+        );
     }
 
     #[test]
