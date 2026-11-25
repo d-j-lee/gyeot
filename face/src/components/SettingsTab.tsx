@@ -240,6 +240,20 @@ export function SettingsTab(p: SettingsTabProps) {
               </dd>
             </div>
             <div>
+              <dt>승인 대기 소리 알림</dt>
+              <dd>
+                {p.settings.approval_interrupt ? (
+                  <>
+                    켜짐 — 승인·병합을 2분 넘게 기다리면 소리까지 내요 <code>approval_interrupt</code>
+                  </>
+                ) : (
+                  <>
+                    꺼짐 — 켜려면 config.toml에 <code>approval_interrupt = true</code>
+                  </>
+                )}
+              </dd>
+            </div>
+            <div>
               <dt>표정으로만 알리는 종류</dt>
               <dd>
                 {p.settings.quiet_kinds.length ? p.settings.quiet_kinds.map(kindLabel).join(', ') : '없음'} <code>quiet_kinds</code>

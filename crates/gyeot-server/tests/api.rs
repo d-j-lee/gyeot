@@ -911,9 +911,10 @@ fn face_dir_with_token_meta() -> tempfile::TempDir {
     face
 }
 
-/// R1 H1·M1·L3(계약 §7·§12.1): 얼굴 쪽에 토큰을 싣지 않고, 쿠키 없이는 안내 쪽(401)을 보인다.
+/// R3 H1(계약 §7·§12.1, G-030): `GET /`·`/index.html`은 인증 없이 `index.html` 그대로(비밀 없음).
+/// 서버는 `?boot=`를 읽지 않고(코드를 쓰지 않는다) 쿠키도 달지 않는다.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn index_needs_session_and_never_contains_token() {
+async fn index_is_public_and_never_contains_token() {
     let d = tempfile::tempdir().unwrap();
     let face = face_dir_with_token_meta();
     std::fs::write(d.path().join("secret.txt"), "nope").unwrap();
@@ -921,39 +922,39 @@ async fn index_needs_session_and_never_contains_token() {
     cfg.face_dir = Some(face.path().to_path_buf());
     let srv = TestServer::start_with(cfg).await;
     let host = srv.host();
-    // 쿠키 없음 → 한국어 안내 쪽(401), 토큰 없음
-    for path in ["/", "/index.html", "/%69ndex.html", "/?mode=overlay"] {
-        let r = srv.raw("GET", path, &[("Host", &host)], None).await;
+    let code = srv.boot().await["code"].as_str().unwrap().to_owned();
+    for path in [
+        "/".to_owned(),
+        "/index.html".to_owned(),
+        "/?mode=overlay".to_owned(),
+        format!("/?mode=overlay&boot={code}"),
+        format!("/index.html?boot={code}"),
+    ] {
+        let r = srv.raw("GET", &path, &[("Host", &host)], None).await;
+        assert_eq!(r.status, 200, "{path}: {}", r.text());
         let t = r.text();
-        assert!(!t.contains(&srv.token), "{path}");
-        assert!(!t.contains("얼굴</body>"), "{path}: 얼굴이 새면 안 됨");
-        if path == "/%69ndex.html" {
-            assert_eq!(r.status, 404, "{path}");
-            continue;
-        }
-        assert_eq!(r.status, 401, "{path}");
-        assert!(r.header("content-type").unwrap().starts_with("text/html"));
-        assert!(t.contains("곁 열기"), "{t}");
-        assert!(t.contains("gyeotd --open"), "{t}");
-        assert_face_headers(&r, true, path);
-    }
-    // 틀린·없는 쿠키도 안내 쪽
-    let r = srv.with_cookie("GET", "/", &"0".repeat(64)).await;
-    assert_eq!(r.status, 401);
-    let r = srv.with_cookie("GET", "/", "garbage").await;
-    assert_eq!(r.status, 401);
-    // 쿠키가 있으면 얼굴(토큰을 채우지 않는다)
-    let cookie = srv.open_session().await;
-    for path in ["/", "/index.html"] {
-        let r = srv.with_cookie("GET", path, &cookie).await;
-        assert_eq!(r.status, 200, "{path}");
-        let t = r.text();
-        assert!(t.contains("얼굴</body>"), "{t}");
+        assert!(t.contains("얼굴</body>"), "{path}: {t}");
         assert!(t.contains(r#"<meta name="gyeot-token" content="">"#), "{t}");
-        assert!(!t.contains(&srv.token));
-        assert_face_headers(&r, true, path);
+        assert!(!t.contains(&srv.token), "{path}");
+        assert!(r.header("content-type").unwrap().starts_with("text/html"));
+        assert!(r.header("location").is_none(), "{path}: 넘겨주기 없음");
+        assert_no_set_cookie(&r, &path);
+        assert_face_headers(&r, true, &path);
     }
-    // 정적 파일은 쿠키 없이도(비밀 없음), 보안 머리를 붙인다
+    // 쿠키를 실어도 같은 쪽(쿠키는 아무 뜻이 없다)
+    let r = srv.with_cookie("GET", "/", &"0".repeat(64)).await;
+    assert_eq!(r.status, 200);
+    // 서버가 `?boot=`를 쓰지 않았으니 그 코드는 아직 세션으로 바꿀 수 있다
+    let r = srv
+        .session_raw(json!({ "code": code }).to_string().as_bytes())
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    // 맨 위 index.html을 인코딩한 경로로는 주지 않는다(그대로)
+    let r = srv
+        .raw("GET", "/%69ndex.html", &[("Host", &host)], None)
+        .await;
+    assert_eq!(r.status, 404);
+    // 정적 파일도 인증 없이, 보안 머리를 붙인다
     let r = srv
         .raw("GET", "/assets/app.js", &[("Host", &host)], None)
         .await;
@@ -982,14 +983,12 @@ async fn index_needs_session_and_never_contains_token() {
     srv.stop().await;
 }
 
-/// 부트 코드: Bearer로만 받고, 한 번만 쓰며, 쓰면 세션 쿠키를 달고 boot만 뺀 주소로 303.
+/// R3 H1(계약 §12.1): 부트 코드(Bearer 토큰으로만 받음) → `POST /v1/session`(인증 머리 없음) → 세션 열쇠.
+/// 코드는 한 번만, 틀림·재사용은 401. 열쇠는 `Authorization: Bearer`로 쓴다.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn boot_code_opens_a_cookie_session_once() {
+async fn boot_code_becomes_a_session_key_once() {
     let d = tempfile::tempdir().unwrap();
-    let face = face_dir_with_token_meta();
-    let mut cfg = config(d.path());
-    cfg.face_dir = Some(face.path().to_path_buf());
-    let srv = TestServer::start_with(cfg).await;
+    let srv = TestServer::start(d.path()).await;
     let host = srv.host();
     let port = srv.addr.port();
     let before = now_ms();
@@ -1005,107 +1004,402 @@ async fn boot_code_opens_a_cookie_session_once() {
     assert!(exp >= before + 120_000 && exp <= now_ms() + 120_000, "{b}");
     assert_ne!(srv.boot().await["code"], b["code"], "코드마다 다르다");
 
-    // 다른 쿼리는 남기고 boot만 뺀다
-    let r = srv
-        .raw(
-            "GET",
-            &format!("/?mode=overlay&boot={code}&x=1"),
-            &[("Host", &host)],
-            None,
-        )
-        .await;
-    assert_eq!(r.status, 303, "{}", r.text());
-    assert_eq!(r.header("location"), Some("/?mode=overlay&x=1"));
-    let set = r.header("set-cookie").unwrap().to_owned();
-    let cookie = cookie_of(&r).unwrap();
-    assert_eq!(cookie.len(), 64);
-    assert!(cookie.bytes().all(|c| c.is_ascii_hexdigit()));
-    assert_eq!(
-        set,
-        format!("gyeot_session={cookie}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000")
-    );
-    assert_ne!(cookie, code);
-    assert!(!r.text().contains(&srv.token));
-    assert_eq!(r.header("cache-control"), Some("no-store"));
-    assert_eq!(r.header("referrer-policy"), Some("no-referrer"));
-
-    // 한 번만 쓴다
-    let r = srv
-        .raw("GET", &format!("/?boot={code}"), &[("Host", &host)], None)
-        .await;
-    assert_eq!(r.status, 401);
-    assert!(r.header("set-cookie").is_none());
-    let t = r.text();
-    assert!(t.contains("gyeotd --open") && t.contains("곁 열기"), "{t}");
-    assert_face_headers(&r, true, "used boot");
-    // 틀린 코드·빈 코드
-    for bad in [
-        "/?boot=nope",
-        "/?boot=",
-        &format!("/?boot={}", "a".repeat(64)),
-    ] {
-        let r = srv.raw("GET", bad, &[("Host", &host)], None).await;
-        assert_eq!(r.status, 401, "{bad}");
-        assert!(r.header("set-cookie").is_none());
-    }
-    // 다른 경로에서도 같고, 경로는 그대로 둔다
-    let code2 = srv.boot().await["code"].as_str().unwrap().to_owned();
-    let r = srv
-        .raw(
-            "GET",
-            &format!("/index.html?boot={code2}"),
-            &[("Host", &host)],
-            None,
-        )
-        .await;
-    assert_eq!(r.status, 303);
-    assert_eq!(r.header("location"), Some("/index.html"));
-    // 프로토콜 상대 주소로 보내지 않는다
-    let code3 = srv.boot().await["code"].as_str().unwrap().to_owned();
-    let r = srv
-        .raw(
-            "GET",
-            &format!("//evil.example/?boot={code3}"),
-            &[("Host", &host)],
-            None,
-        )
-        .await;
-    assert_eq!(r.status, 303, "{}", r.text());
-    assert_eq!(r.header("location"), Some("/"));
-
-    // 쿠키로 API·SSE를 쓴다
-    let r = srv.with_cookie("GET", "/v1/state", &cookie).await;
+    // 인증 머리 없이 바꾼다
+    let body = json!({ "code": code }).to_string();
+    let r = srv.session_raw(body.as_bytes()).await;
     assert_eq!(r.status, 200, "{}", r.text());
-    let c = format!("gyeot_session={cookie}");
-    let mut s = Sse::open(srv.addr, &host, "/v1/stream", None).await;
-    assert_eq!(s.status, 401, "쿠키·토큰 없는 SSE");
-    drop(s);
-    let mixed = format!("other=1; {c}; x=y");
-    let mut face = Sse::open_with(srv.addr, &host, "/v1/stream", &[("Cookie", &mixed)]).await;
-    assert_eq!(face.status, 200, "쿠키로 여는 얼굴 SSE");
-    assert_eq!(face.next(S).await.unwrap().event, "snapshot");
-    // 쿠키로는 부트 코드를 만들 수 없다
-    let r = srv.with_cookie("POST", "/v1/boot", &cookie).await;
-    assert_eq!(r.status, 401);
+    assert_no_set_cookie(&r, "/v1/session");
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    let v = r.json();
+    assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
+    let key = v["session"].as_str().unwrap().to_owned();
+    assert_eq!(key.len(), 64);
+    assert!(
+        key.bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
+    assert_ne!(key, code);
+    assert_ne!(key, srv.token);
+    let sexp = v["expires_ms"].as_i64().unwrap();
+    let week = 7 * 86_400_000;
+    assert!(
+        sexp >= before + week && sexp <= now_ms() + week,
+        "세션은 만든 때부터 7일: {v}"
+    );
+
+    // 한 번만
+    let r = srv.session_raw(body.as_bytes()).await;
+    assert_eq!(r.status, 401, "{}", r.text());
+    let e = r.json();
+    assert_eq!(e["ok"], false);
+    assert!(e["error"].as_str().unwrap().contains("코드"), "{e}");
+    assert_no_set_cookie(&r, "used code");
+    // 틀린 코드·빈 코드·대문자로 바꾼 코드
+    for bad in [
+        "nope".to_owned(),
+        String::new(),
+        "a".repeat(64),
+        srv.boot().await["code"]
+            .as_str()
+            .unwrap()
+            .to_ascii_uppercase(),
+    ] {
+        let r = srv
+            .session_raw(json!({ "code": bad }).to_string().as_bytes())
+            .await;
+        assert_eq!(r.status, 401, "{bad}");
+        assert_eq!(r.json()["ok"], false);
+    }
+    // 본문 꼴이 틀리면 400
+    for bad in [&b"{not json"[..], br#"{}"#, br#"{"code":1}"#] {
+        let r = srv.session_raw(bad).await;
+        assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(bad));
+    }
+    // Host·Origin 규칙은 그대로
+    let fresh = srv.boot().await["code"].as_str().unwrap().to_owned();
+    let fb = json!({ "code": fresh }).to_string();
     let r = srv
         .raw(
             "POST",
-            "/v1/boot",
-            &[
-                ("Host", &host),
-                ("Cookie", &c),
-                ("Authorization", "Bearer nope"),
-            ],
+            "/v1/session",
+            &[("Host", &host), ("Origin", "http://evil.example")],
+            Some(fb.as_bytes()),
+        )
+        .await;
+    assert_eq!(r.status, 403);
+    let r = srv
+        .raw(
+            "POST",
+            "/v1/session",
+            &[("Host", "evil.example")],
+            Some(fb.as_bytes()),
+        )
+        .await;
+    assert_eq!(r.status, 421);
+    // 막힌 요청은 코드를 쓰지 않았다
+    let same = format!("http://127.0.0.1:{port}");
+    let r = srv
+        .raw(
+            "POST",
+            "/v1/session",
+            &[("Host", &host), ("Origin", &same)],
+            Some(fb.as_bytes()),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    // 열쇠로 API·SSE를 쓴다
+    let r = srv.with_key("GET", "/v1/state", &key, None).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let auth = format!("Bearer {key}");
+    let mut face = Sse::open(srv.addr, &host, "/v1/stream", Some(&auth)).await;
+    assert_eq!(face.status, 200, "열쇠로 여는 얼굴 SSE");
+    assert_eq!(face.next(S).await.unwrap().event, "snapshot");
+    // 틀린 열쇠·없는 열쇠는 401
+    let r = srv
+        .with_key("GET", "/v1/state", &"f".repeat(64), None)
+        .await;
+    assert_eq!(r.status, 401);
+    let s = Sse::open(srv.addr, &host, "/v1/stream", None).await;
+    assert_eq!(s.status, 401);
+    srv.stop().await;
+}
+
+/// R2 N4·R3 M1(계약 §7 표, G-031): 세션 열쇠는 "세션: 예" 경로만 연다. 그 밖(`/v1/boot`·`/v1/ingest/*`·
+/// `/v1/channel/*`·모르는 경로)은 403 `{"ok":false,"error":"이 열쇠로는 쓸 수 없어요"}`이고 아무 일도 하지 않는다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_key_opens_only_face_routes() {
+    let d = tempfile::tempdir().unwrap();
+    let srv = TestServer::start(d.path()).await;
+    let key = srv.open_session().await;
+    let denied: Vec<(&str, String, Option<Value>)> = vec![
+        ("POST", "/v1/boot".into(), Some(json!({}))),
+        (
+            "POST",
+            "/v1/ingest/claude-code".into(),
+            Some(perm_prompt("forged")),
+        ),
+        (
+            "POST",
+            "/v1/ingest/custom".into(),
+            Some(json!({"kind": "turn_failed", "session": "forged"})),
+        ),
+        (
+            "POST",
+            "/v1/channel/register".into(),
+            Some(json!({"pid": 1, "ppid": 2, "cwd": "/w"})),
+        ),
+        ("GET", "/v1/channel/stream?cid=ch_x".into(), None),
+        (
+            "POST",
+            "/v1/channel/reply".into(),
+            Some(json!({"cid": "ch_x", "chat_id": "m1", "text": "x"})),
+        ),
+        (
+            "POST",
+            "/v1/channel/decision".into(),
+            Some(json!({"cid": "ch_x", "question": "q", "options": ["a", "b"]})),
+        ),
+        (
+            "POST",
+            "/v1/channel/unregister".into(),
+            Some(json!({"cid": "ch_x"})),
+        ),
+        ("GET", "/v1/nope".into(), None),
+        ("GET", "/v1".into(), None),
+        ("POST", "/v1//boot".into(), Some(json!({}))),
+        ("POST", "/v1/%62oot".into(), Some(json!({}))),
+    ];
+    for (m, p, body) in &denied {
+        let r = srv.with_key(m, p, &key, body.clone()).await;
+        assert_eq!(r.status, 403, "{m} {p}: {}", r.text());
+        assert_eq!(
+            r.json(),
+            json!({"ok": false, "error": "이 열쇠로는 쓸 수 없어요"}),
+            "{m} {p}"
+        );
+    }
+    // 막힌 요청은 아무 일도 하지 않았다
+    let st = srv.state().await;
+    assert!(items(&st).is_empty(), "{st}");
+    assert!(st["sessions"].as_array().unwrap().is_empty(), "{st}");
+    // 얼굴이 쓰는 경로는 열린다(401·403이 아니다)
+    let allowed: Vec<(&str, &str, Option<Value>)> = vec![
+        ("GET", "/v1/state", None),
+        (
+            "POST",
+            "/v1/items/nope/action",
+            Some(json!({"action": "open"})),
+        ),
+        ("POST", "/v1/focus", Some(json!({"on": false}))),
+        ("POST", "/v1/presence/listening", Some(json!({"on": false}))),
+        ("POST", "/v1/say", Some(json!({"text": "안녕"}))),
+        ("POST", "/v1/decisions/dnope", Some(json!({"choice": "a"}))),
+        (
+            "POST",
+            "/v1/proposals/pnope",
+            Some(json!({"accept": false})),
+        ),
+        (
+            "POST",
+            "/v1/adjustments/unread",
+            Some(json!({"quiet": false})),
+        ),
+    ];
+    for (m, p, body) in &allowed {
+        let r = srv.with_key(m, p, &key, body.clone()).await;
+        assert!(
+            r.status != 401 && r.status != 403 && r.status != 0,
+            "{m} {p}: {} {}",
+            r.status,
+            r.text()
+        );
+    }
+    let auth = format!("Bearer {key}");
+    let s = Sse::open(srv.addr, &srv.host(), "/v1/stream", Some(&auth)).await;
+    assert_eq!(s.status, 200);
+    drop(s);
+    // 토큰은 막힌 경로를 모두 쓴다
+    assert_eq!(srv.post("/v1/boot", json!({})).await.status, 200);
+    let r = srv
+        .post(
+            "/v1/channel/register",
+            json!({"pid": 1, "ppid": 2, "cwd": "/w"}),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(srv.get("/v1/nope").await.status, 404);
+    srv.stop().await;
+}
+
+/// R3 H1(G-030): 쿠키는 어떤 `/v1`도 열지 않는다(살아 있는 세션 열쇠·토큰을 쿠키로 실어도 401).
+/// 어떤 응답에도 `Set-Cookie`가 없다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cookies_never_authenticate_and_nothing_sets_one() {
+    let d = tempfile::tempdir().unwrap();
+    let face = face_dir_with_token_meta();
+    let mut cfg = config(d.path());
+    cfg.face_dir = Some(face.path().to_path_buf());
+    let srv = TestServer::start_with(cfg).await;
+    let host = srv.host();
+    let key = srv.open_session().await;
+    let routes = [
+        ("GET", "/v1/state"),
+        ("GET", "/v1/stream"),
+        ("POST", "/v1/say"),
+        ("POST", "/v1/focus"),
+        ("POST", "/v1/presence/listening"),
+        ("POST", "/v1/items/x/action"),
+        ("POST", "/v1/decisions/d1"),
+        ("POST", "/v1/proposals/p1"),
+        ("POST", "/v1/adjustments/unread"),
+        ("POST", "/v1/boot"),
+        ("POST", "/v1/ingest/claude-code"),
+        ("POST", "/v1/channel/register"),
+        ("GET", "/v1/channel/stream?cid=x"),
+        ("POST", "/v1/channel/reply"),
+        ("POST", "/v1/channel/decision"),
+        ("POST", "/v1/channel/unregister"),
+    ];
+    for secret in [key.as_str(), srv.token.as_str()] {
+        for (m, p) in routes {
+            for cookie in [
+                format!("gyeot_session={secret}"),
+                format!("a=1; gyeot_session={secret}; b=2"),
+                format!("session={secret}"),
+                format!("token={secret}"),
+            ] {
+                let r = srv
+                    .raw(m, p, &[("Host", &host), ("Cookie", &cookie)], None)
+                    .await;
+                assert_eq!(r.status, 401, "{m} {p} Cookie: {cookie}");
+                assert_no_set_cookie(&r, p);
+            }
+        }
+    }
+    // 열쇠 자체는 살아 있다(쿠키라서 막혔다)
+    assert_eq!(
+        srv.with_key("GET", "/v1/state", &key, None).await.status,
+        200
+    );
+    // 어떤 응답에도 Set-Cookie가 없다
+    let code = srv.boot().await["code"].as_str().unwrap().to_owned();
+    let mut seen = Vec::new();
+    for p in [
+        "/".to_owned(),
+        "/index.html".to_owned(),
+        format!("/?boot={code}"),
+        "/?boot=nope".to_owned(),
+        "/assets/app.js".to_owned(),
+        "/nope".to_owned(),
+        "/health".to_owned(),
+        format!("/v1/hello?n={}", "ab".repeat(32)),
+        "/v1/hello?n=zz".to_owned(),
+        "/v1/state".to_owned(),
+    ] {
+        seen.push((
+            p.clone(),
+            srv.raw("GET", &p, &[("Host", &host)], None).await,
+        ));
+    }
+    seen.push(("state(token)".into(), srv.get("/v1/state").await));
+    seen.push((
+        "state(key)".into(),
+        srv.with_key("GET", "/v1/state", &key, None).await,
+    ));
+    seen.push(("boot".into(), srv.post("/v1/boot", json!({})).await));
+    seen.push((
+        "session ok".into(),
+        srv.session_raw(json!({ "code": code }).to_string().as_bytes())
+            .await,
+    ));
+    seen.push((
+        "session bad".into(),
+        srv.session_raw(json!({ "code": code }).to_string().as_bytes())
+            .await,
+    ));
+    seen.push((
+        "forbidden".into(),
+        srv.with_key("POST", "/v1/boot", &key, Some(json!({})))
+            .await,
+    ));
+    for (what, r) in &seen {
+        assert!(r.status != 0, "{what}");
+        assert_no_set_cookie(r, what);
+    }
+    srv.stop().await;
+}
+
+/// R3 M2(계약 §13.1, G-032): `GET /v1/hello?n=`는 인증 없이
+/// `hex(HMAC-SHA256(토큰, "gyeot-hello/v1|<실제 포트>|<n>"))`를 준다. 포트·토큰·n이 바뀌면 증명도 바뀐다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_proves_token_port_and_nonce() {
+    let token = "c0ffee".repeat(10) + "abcd";
+    assert_eq!(token.len(), 64);
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    std::fs::write(da.path().join("token"), &token).unwrap();
+    std::fs::write(db.path().join("token"), &token).unwrap();
+    let a = TestServer::start(da.path()).await;
+    let b = TestServer::start(db.path()).await;
+    let c = TestServer::start(dc.path()).await;
+    assert_eq!(a.token, token);
+    assert_eq!(b.token, token);
+    assert_ne!(c.token, token);
+    let (pa, pb) = (a.addr.port(), b.addr.port());
+    assert_ne!(pa, pb);
+    let n = "ab".repeat(32);
+    let proof = |r: &Resp| -> String {
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["v"], 1, "{v}");
+        assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
+        v["proof"].as_str().unwrap().to_owned()
+    };
+    // 인증 머리 없이 받는다
+    let r = a.hello(&n).await;
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_no_set_cookie(&r, "hello");
+    let got_a = proof(&r);
+    assert_eq!(got_a.len(), 64);
+    assert_eq!(got_a, expected_proof(&token, pa, &n));
+    // 같은 토큰이라도 묶인 포트가 다르면 다르다(포트 0으로 묶어도 실제 포트를 쓴다)
+    let got_b = proof(&b.hello(&n).await);
+    assert_eq!(got_b, expected_proof(&token, pb, &n));
+    assert_ne!(got_a, got_b);
+    // 토큰이 다르면 다르다
+    let got_c = proof(&c.hello(&n).await);
+    assert_eq!(got_c, expected_proof(&c.token, c.addr.port(), &n));
+    assert_ne!(got_c, expected_proof(&token, c.addr.port(), &n));
+    // n이 다르면 다르다. 경계 길이 16·128자, 대문자 hex도 받는다(그대로 묶는다)
+    for m in [
+        "cd".repeat(32),
+        "0".repeat(16),
+        "f".repeat(128),
+        "AB".repeat(8),
+    ] {
+        let got = proof(&a.hello(&m).await);
+        assert_eq!(got, expected_proof(&token, pa, &m), "{m}");
+        assert_ne!(got, got_a, "{m}");
+    }
+    // 토큰을 붙여도 같은 답(인증과 무관)
+    assert_eq!(proof(&a.get(&format!("/v1/hello?n={n}")).await), got_a);
+    // 잘못된 n은 400
+    let host = a.host();
+    for q in [
+        "/v1/hello".to_owned(),
+        "/v1/hello?".to_owned(),
+        "/v1/hello?n=".to_owned(),
+        format!("/v1/hello?n={}", "a".repeat(15)),
+        format!("/v1/hello?n={}", "a".repeat(129)),
+        format!("/v1/hello?n={}", "zz".repeat(16)),
+        format!("/v1/hello?n={}%20", "a".repeat(16)),
+        format!("/v1/hello?m={n}"),
+        format!("/v1/hello?nn={n}"),
+    ] {
+        let r = a.raw("GET", &q, &[("Host", &host)], None).await;
+        assert_eq!(r.status, 400, "{q}: {}", r.text());
+        assert_eq!(r.json()["ok"], false, "{q}");
+    }
+    // Host·Origin 규칙은 그대로
+    let q = format!("/v1/hello?n={n}");
+    let r = a.raw("GET", &q, &[("Host", "evil.example")], None).await;
+    assert_eq!(r.status, 421);
+    let r = a
+        .raw(
+            "GET",
+            &q,
+            &[("Host", &host), ("Origin", "http://evil.example")],
             None,
         )
         .await;
-    assert_eq!(r.status, 401);
-    // 틀린 쿠키로는 API를 쓸 수 없다
-    let r = srv.with_cookie("GET", "/v1/state", &"f".repeat(64)).await;
-    assert_eq!(r.status, 401);
-    s = srv.sse("/v1/stream").await;
-    assert_eq!(s.status, 200);
-    srv.stop().await;
+    assert_eq!(r.status, 403);
+    a.stop().await;
+    b.stop().await;
+    c.stop().await;
 }
 
 /// 열린 코드는 8개까지(넘으면 가장 오래된 것부터 버린다).
@@ -1117,43 +1411,34 @@ async fn at_most_eight_open_boot_codes() {
     for _ in 0..9 {
         codes.push(srv.boot().await["code"].as_str().unwrap().to_owned());
     }
-    let host = srv.host();
-    let r = srv
-        .raw(
-            "GET",
-            &format!("/?boot={}", codes[0]),
-            &[("Host", &host)],
-            None,
-        )
-        .await;
+    let redeem = |c: &str| json!({ "code": c }).to_string();
+    let r = srv.session_raw(redeem(&codes[0]).as_bytes()).await;
     assert_eq!(r.status, 401, "가장 오래된 코드는 버렸다");
     for c in &codes[1..] {
-        let r = srv
-            .raw("GET", &format!("/?boot={c}"), &[("Host", &host)], None)
-            .await;
-        assert_eq!(r.status, 303);
+        let r = srv.session_raw(redeem(c).as_bytes()).await;
+        assert_eq!(r.status, 200, "{}", r.text());
     }
     srv.stop().await;
 }
 
-/// 세션은 SHA-256만 0600 파일에 남기고, 데몬을 다시 띄워도 이어진다. 최대 20개.
+/// 세션은 SHA-256만 0600 파일에 남기고, 만든 때부터 7일, 데몬을 다시 띄워도 이어진다. 최대 20개.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sessions_are_hashed_on_disk_and_survive_restart() {
     let d = tempfile::tempdir().unwrap();
     let srv = TestServer::start(d.path()).await;
-    let mut cookies = Vec::new();
+    let mut keys = Vec::new();
     for _ in 0..21 {
-        cookies.push(srv.open_session().await);
+        keys.push(srv.open_session().await);
     }
     // 가장 오래 안 쓴 첫 세션이 밀려났다
     assert_eq!(
-        srv.with_cookie("GET", "/v1/state", &cookies[0])
+        srv.with_key("GET", "/v1/state", &keys[0], None)
             .await
             .status,
         401
     );
-    for c in &cookies[1..] {
-        assert_eq!(srv.with_cookie("GET", "/v1/state", c).await.status, 200);
+    for k in &keys[1..] {
+        assert_eq!(srv.with_key("GET", "/v1/state", k, None).await.status, 200);
     }
     srv.stop().await;
     let path = d.path().join("sessions.json");
@@ -1161,14 +1446,14 @@ async fn sessions_are_hashed_on_disk_and_survive_restart() {
     let v: Value = serde_json::from_str(&text).unwrap();
     let list = v["sessions"].as_array().unwrap();
     assert_eq!(list.len(), 20);
-    for c in &cookies {
-        assert!(!text.contains(c.as_str()), "세션 값이 그대로 남으면 안 됨");
+    for k in &keys {
+        assert!(!text.contains(k.as_str()), "세션 값이 그대로 남으면 안 됨");
     }
     for e in list {
         let h = e["sha256"].as_str().unwrap();
         assert_eq!(h.len(), 64);
         let created = e["created_ms"].as_i64().unwrap();
-        assert_eq!(e["expires_ms"].as_i64().unwrap(), created + 30 * 86_400_000);
+        assert_eq!(e["expires_ms"].as_i64().unwrap(), created + 7 * 86_400_000);
         assert!(e["last_ms"].as_i64().unwrap() >= created);
     }
     #[cfg(unix)]
@@ -1179,13 +1464,13 @@ async fn sessions_are_hashed_on_disk_and_survive_restart() {
     }
     let srv = TestServer::start(d.path()).await;
     assert_eq!(
-        srv.with_cookie("GET", "/v1/state", &cookies[20])
+        srv.with_key("GET", "/v1/state", &keys[20], None)
             .await
             .status,
         200
     );
     assert_eq!(
-        srv.with_cookie("GET", "/v1/state", &cookies[0])
+        srv.with_key("GET", "/v1/state", &keys[0], None)
             .await
             .status,
         401
@@ -1193,24 +1478,108 @@ async fn sessions_are_hashed_on_disk_and_survive_restart() {
     srv.stop().await;
 }
 
+/// 얼굴 폴더가 없을 때의 안내 쪽도 인증 없이, 보안 머리를 붙여 준다.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builtin_page_without_face() {
     let d = tempfile::tempdir().unwrap();
     let srv = TestServer::start(d.path()).await;
-    let r = srv.raw("GET", "/", &[("Host", &srv.host())], None).await;
-    assert_eq!(r.status, 401);
-    let cookie = srv.open_session().await;
-    let r = srv.with_cookie("GET", "/", &cookie).await;
-    assert_eq!(r.status, 200);
-    let t = r.text();
-    assert!(t.contains("npm run build"), "{t}");
-    assert!(t.contains("GYEOT_FACE_DIR"));
-    assert!(!t.contains(&srv.token));
-    assert_face_headers(&r, true, "builtin");
+    for path in ["/", "/index.html", "/?boot=x"] {
+        let r = srv.raw("GET", path, &[("Host", &srv.host())], None).await;
+        assert_eq!(r.status, 200, "{path}");
+        let t = r.text();
+        assert!(t.contains("npm run build"), "{t}");
+        assert!(t.contains("GYEOT_FACE_DIR"));
+        assert!(!t.contains(&srv.token));
+        assert_face_headers(&r, true, "builtin");
+        assert_no_set_cookie(&r, path);
+    }
     let r = srv
         .raw("GET", "/assets/x.js", &[("Host", &srv.host())], None)
         .await;
     assert_eq!(r.status, 404);
+    srv.stop().await;
+}
+
+/// R3 L3·L4(계약 §13.4): Unix에서 데이터 폴더·하위 폴더는 0700, 파일은 0600으로 만든다.
+/// 이미 있던 느슨한 것도 시작할 때 맞춘다.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_home_is_private_on_unix() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path().join("home");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let loosen = |p: &std::path::Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    // 처음 만들 때
+    let srv = TestServer::start(&home).await;
+    srv.post(
+        "/v1/ingest/claude-code",
+        hook("PreToolUse", "s1", json!({"tool_name": "Bash"})),
+    )
+    .await;
+    srv.open_session().await;
+    srv.stop().await;
+    for dir in [home.clone(), home.join("events"), home.join("spool")] {
+        assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+    }
+    let logs: Vec<_> = std::fs::read_dir(home.join("events"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(!logs.is_empty());
+    for f in logs
+        .iter()
+        .cloned()
+        .chain(["token", "sessions.json", "learn.json"].map(|n| home.join(n)))
+    {
+        assert_eq!(mode(&f), 0o600, "{}", f.display());
+    }
+    // 이미 있던 느슨한 것: 폴더 0755, 파일 0644
+    let yesterday = gyeot_core::paths::event_log_name(now_ms() - 86_400_000);
+    let old_log = home.join("events").join(&yesterday);
+    std::fs::write(&old_log, "").unwrap();
+    std::fs::create_dir_all(home.join("open")).unwrap();
+    std::fs::write(home.join("gyeotd.log"), "x\n").unwrap();
+    std::fs::write(home.join("tails.json"), "{}").unwrap();
+    for dir in [
+        home.clone(),
+        home.join("events"),
+        home.join("spool"),
+        home.join("open"),
+    ] {
+        loosen(&dir, 0o755);
+    }
+    let files = [
+        old_log.clone(),
+        home.join("token"),
+        home.join("sessions.json"),
+        home.join("learn.json"),
+        home.join("gyeotd.log"),
+        home.join("tails.json"),
+    ];
+    for f in &files {
+        loosen(f, 0o644);
+    }
+    // 데이터 폴더 밖을 가리키는 링크는 따라가 바꾸지 않는다
+    let outside = d.path().join("outside.txt");
+    std::fs::write(&outside, "x").unwrap();
+    loosen(&outside, 0o644);
+    std::os::unix::fs::symlink(&outside, home.join("events").join("2000-01-01.jsonl")).unwrap();
+    let srv = TestServer::start(&home).await;
+    for dir in [
+        home.clone(),
+        home.join("events"),
+        home.join("spool"),
+        home.join("open"),
+    ] {
+        assert_eq!(mode(&dir), 0o700, "시작할 때 맞춘다: {}", dir.display());
+    }
+    for f in &files {
+        assert_eq!(mode(f), 0o600, "시작할 때 맞춘다: {}", f.display());
+    }
+    assert_eq!(mode(&outside), 0o644, "링크를 따라가지 않는다");
     srv.stop().await;
 }
 

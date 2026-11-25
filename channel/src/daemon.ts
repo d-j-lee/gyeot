@@ -1,5 +1,10 @@
 // 곁 데몬(contracts §7)에 말하는 작은 HTTP 클라이언트. 토큰은 오류 문구·기록에 절대 싣지 않는다.
+//
+// 토큰을 보내기 전에 늘 §13.1로 확인한다(G-032): `GET /v1/hello?n=<32바이트 난수 hex>`의 `proof`가
+// hex(HMAC-SHA256(열쇠 = 토큰 UTF-8 바이트, 글 = "gyeot-hello/v1|<연결한 포트>|<n>"))와 같아야 한다(상수 시간 비교).
+// 확인은 연결(등록·스트림)마다 한다. 스트림이 끊기거나 요청이 실패하면 다시 확인한다.
 
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 export type DaemonErrorKind =
@@ -9,6 +14,8 @@ export type DaemonErrorKind =
   | 'unauthorized'
   /** 404·410: 데몬이 이 cid를 모름(데몬 재시작 등) */
   | 'unknown_cid'
+  /** §13.1 확인 실패: 이 포트의 서버가 내 토큰을 모름(다른 사용자·다른 프로그램). 토큰을 보내지 않았다 */
+  | 'not_daemon'
   /** 그 밖의 거절·계약과 다른 응답 */
   | 'rejected';
 
@@ -24,6 +31,33 @@ export class DaemonError extends Error {
 }
 
 const TOKEN_RE = /^[0-9a-f]{64}$/;
+const PROOF_RE = /^[0-9a-fA-F]{64}$/;
+
+/** 확인에 실패했을 때의 이유 머리(셸·`gyeotd --open`과 같은 말). */
+export const NOT_MINE = '이 포트의 서버는 내 곁 데몬이 아니에요(다른 사용자나 프로그램일 수 있어요)';
+
+/** §13.1 증명(소문자 hex). */
+export function helloProof(token: string, port: number, nonce: string): string {
+  return helloMac(token, port, nonce).toString('hex');
+}
+
+function helloMac(token: string, port: number, nonce: string): Buffer {
+  return createHmac('sha256', Buffer.from(token, 'utf8')).update(`gyeot-hello/v1|${port}|${nonce}`, 'utf8').digest();
+}
+
+/** `/v1/hello` 응답 본문이 이 토큰·포트·난수의 증명이면 undefined, 아니면 이유. 비교는 상수 시간이다. */
+export function helloProblem(body: unknown, token: string, port: number, nonce: string): string | undefined {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return '확인 응답이 JSON 객체가 아닙니다';
+  const { v, proof } = body as { v?: unknown; proof?: unknown };
+  if (v !== 1) return '확인 응답의 판(v)이 1이 아닙니다';
+  if (typeof proof !== 'string' || !PROOF_RE.test(proof)) return '확인 응답에 64자 hex 증명이 없습니다';
+  const expected = helloMac(token, port, nonce);
+  const got = Buffer.from(proof, 'hex');
+  if (got.length !== expected.length || !timingSafeEqual(got, expected)) {
+    return '확인 값이 맞지 않습니다(이 서버는 내 토큰을 모릅니다)';
+  }
+  return undefined;
+}
 
 export interface DaemonClientOptions {
   /** 검사를 마친 데몬 출처(`http://127.0.0.1:47321`). 없으면 configError를 쓴다. */
@@ -40,8 +74,15 @@ export interface PostOptions {
 
 export class DaemonClient {
   private token: string | undefined;
+  /** 지금 이어 쓰는 데몬을 §13.1로 확인했다. 연결이 끊기거나 요청이 실패하면 지운다. */
+  private verified = false;
 
   constructor(private readonly opts: DaemonClientOptions) {}
+
+  /** 다음 요청 전에 다시 확인하게 한다(스트림이 끊겼을 때 = 다시 연결할 때). */
+  forgetVerification(): void {
+    this.verified = false;
+  }
 
   get tokenFile(): string {
     return this.opts.tokenFile;
@@ -57,6 +98,7 @@ export class DaemonClient {
     const token = await this.readToken();
     const timer = new Deadline(opts.timeoutMs);
     try {
+      await this.verify(origin, token, timer);
       const res = await fetch(new URL(path, origin), {
         method: 'POST',
         headers: {
@@ -76,7 +118,7 @@ export class DaemonClient {
         throw new DaemonError('rejected', '데몬 응답이 JSON이 아닙니다', res.status);
       }
     } catch (err) {
-      throw this.normalize(err, timer, token);
+      throw this.fail(err, timer, token);
     } finally {
       timer.dispose();
     }
@@ -94,11 +136,12 @@ export class DaemonClient {
   ): Promise<ReadableStream<Uint8Array>> {
     const origin = this.requireOrigin();
     const token = await this.readToken();
+    // 토큰은 Authorization 머리로만 보낸다(§7: 쿼리 ?t= 는 받지 않는다, URL에 비밀을 싣지 않는다).
     const url = new URL('/v1/channel/stream', origin);
     url.searchParams.set('cid', cid);
-    url.searchParams.set('t', token);
     const timer = new Deadline(connectTimeoutMs, signal);
     try {
+      await this.verify(origin, token, timer);
       const headers: Record<string, string> = {
         Authorization: `Bearer ${token}`,
         Accept: 'text/event-stream',
@@ -117,8 +160,50 @@ export class DaemonClient {
       return res.body;
     } catch (err) {
       timer.dispose();
-      throw this.normalize(err, timer, token);
+      throw this.fail(err, timer, token);
     }
+  }
+
+  /**
+   * §13.1 확인. 이미 확인했으면 그대로 둔다. 확인 요청에는 토큰을 싣지 않는다.
+   * 실패하면 'not_daemon'(토큰도 페이로드도 보내지 않는다).
+   */
+  private async verify(origin: string, token: string, timer: Deadline): Promise<void> {
+    if (this.verified) return;
+    const port = portOf(origin);
+    const nonce = randomBytes(32).toString('hex');
+    const url = new URL('/v1/hello', origin);
+    url.searchParams.set('n', nonce);
+    const res = await fetch(url, { headers: { Accept: 'application/json' }, redirect: 'error', signal: timer.signal });
+    if (res.status !== 200) {
+      await res.body?.cancel().catch(() => {});
+      throw this.notMine(port, `/v1/hello가 HTTP ${res.status}를 돌려줬습니다(곁 데몬이 아니거나 확인을 모르는 옛 판)`);
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(await res.text());
+    } catch {
+      throw this.notMine(port, '확인 응답이 JSON이 아닙니다');
+    }
+    const problem = helloProblem(body, token, port, nonce);
+    if (problem !== undefined) throw this.notMine(port, problem);
+    this.verified = true;
+  }
+
+  private notMine(port: number, why: string): DaemonError {
+    // 토큰 파일이 바뀌었을 수 있다(다시 설치 등). 다음 시도에서 다시 읽는다.
+    this.invalidateToken();
+    return new DaemonError(
+      'not_daemon',
+      `${NOT_MINE} — 포트 ${port}: ${why}. 내 토큰 파일(${this.opts.tokenFile})이 그 포트의 곁 데몬 것과 같은지도 확인하세요`,
+    );
+  }
+
+  /** 오류를 정리하고, 거절('rejected')이 아니면 다음 요청 전에 다시 확인하게 한다. */
+  private fail(err: unknown, timer: Deadline, token: string): unknown {
+    const e = this.normalize(err, timer, token);
+    if (!(e instanceof DaemonError && e.kind === 'rejected')) this.verified = false;
+    return e;
   }
 
   private requireOrigin(): string {
@@ -234,6 +319,12 @@ function describeFetchError(err: unknown): string {
       return causeMsg && causeMsg !== msg ? `${msg}: ${causeMsg}` : msg;
     }
   }
+}
+
+/** 연결할 포트(증명에 넣는다). 기본 포트면 80. */
+function portOf(origin: string): number {
+  const url = new URL(origin);
+  return url.port === '' ? 80 : Number(url.port);
 }
 
 function scrub(err: DaemonError, token: string): DaemonError {

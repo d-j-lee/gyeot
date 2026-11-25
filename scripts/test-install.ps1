@@ -142,6 +142,60 @@ try {
         Assert-Gyeot (((@($cx['hooks'].Keys) | Sort-Object) -join ',') -eq ((@($script:GyeotCodexEvents) | Sort-Object) -join ',')) 'Codex 견본 이벤트 = 설치 이벤트'
         $mx = Read-GyeotTree (Join-Path $examples 'mcp.json')
         Assert-Gyeot ($mx['mcpServers'].Contains('gyeot')) 'mcp 견본 서버 이름 gyeot'
+        $cfgPath = Join-Path $examples 'gyeot-config.toml'
+        Assert-Gyeot (Test-Path -LiteralPath $cfgPath) '설정 견본(gyeot-config.toml)이 있다'
+        if (Test-Path -LiteralPath $cfgPath) {
+            $cfgText = Read-GyeotTextFile $cfgPath
+            foreach ($key in @('port', 'stale_minutes', 'nudge_min', 'interrupt_min', 'approval_interrupt', 'quiet_hours', 'utc_offset_minutes', 'retention_days')) {
+                Assert-Gyeot ($cfgText -match "(?m)^#?[ \t]*$key[ \t]*=") "설정 견본에 맨 위 키 $key 가 있다(§6)"
+            }
+            Assert-Gyeot ($cfgText -match '(?m)^#?[ \t]*approval_interrupt[ \t]*=[ \t]*false[ \t]*$') '설정 견본의 approval_interrupt 는 기본값 false(§13.3)'
+            $firstTable = $cfgText.IndexOf("`n[")
+            $commentedTable = $cfgText.IndexOf("`n# [[tail]]")
+            $ai = $cfgText.IndexOf('approval_interrupt =')
+            Assert-Gyeot ($ai -ge 0 -and ($firstTable -lt 0 -or $ai -lt $firstTable) -and ($commentedTable -lt 0 -or $ai -lt $commentedTable)) 'approval_interrupt 는 [[tail]] 표보다 앞(맨 위 키)'
+        }
+    }
+
+    Write-Host '== 0b. 폴더 권한 계획·판정(§13.4) — OS와 상관없는 함수' -ForegroundColor White
+    $savedLad = $env:LOCALAPPDATA
+    try {
+        $lad = Join-GyeotTestPath ([System.IO.Path]::GetTempPath()) 'fake-user\AppData\Local'
+        $env:LOCALAPPDATA = $lad
+        $inside = Join-GyeotTestPath $lad 'gyeot'
+        $outsideDir = Join-GyeotTestPath ([System.IO.Path]::GetTempPath()) 'gyeot-elsewhere'
+        Assert-Gyeot (@(Get-GyeotPrivateFolderPlan @($inside, $null, '')).Count -eq 0) '%LOCALAPPDATA% 안은 좁히지 않는다'
+        $plan = @(Get-GyeotPrivateFolderPlan @($outsideDir, $inside, ($outsideDir + [System.IO.Path]::DirectorySeparatorChar)))
+        Assert-Gyeot ($plan.Count -eq 1 -and $plan[0] -eq $outsideDir) "%LOCALAPPDATA% 밖만, 한 번씩: $($plan -join ' | ')"
+        Assert-Gyeot (@(Get-GyeotPrivateFolderPlan @(($lad + '-other'))).Count -eq 1) '이름만 비슷한 옆 폴더(Local-other)는 밖이다'
+        $env:LOCALAPPDATA = ''
+        Assert-Gyeot (@(Get-GyeotPrivateFolderPlan @($inside)).Count -eq 1) 'LOCALAPPDATA를 모르면 밖으로 본다(좁히는 쪽)'
+    } finally {
+        $env:LOCALAPPDATA = $savedLad
+    }
+    $want = @('C:\gyeot', '/inheritance:r', '/grant:r', '*S-1-5-21-1-2-3-1001:(OI)(CI)F', '/grant:r', '*S-1-5-18:(OI)(CI)F')
+    $gotArgs = @(Get-GyeotIcaclsArgument 'C:\gyeot' 'S-1-5-21-1-2-3-1001')
+    Assert-Gyeot (($gotArgs -join ' ') -ceq ($want -join ' ')) "icacls 인자 = §13.4 ($($gotArgs -join ' '))"
+    $me = 'S-1-5-21-1-2-3-1001'
+    function New-GyeotTestRule([string]$Sid, [string]$Type = 'Allow', [string]$Rights = 'FullControl') {
+        return [pscustomobject]@{ Sid = $Sid; Type = $Type; Rights = $Rights; Inherited = $false }
+    }
+    function New-GyeotTestSummary([object[]]$Rules, [bool]$Protected = $true, [string]$Owner = $me) {
+        return [pscustomobject]@{ Protected = $Protected; Rules = $Rules; Owner = $Owner }
+    }
+    $good = New-GyeotTestSummary @((New-GyeotTestRule $me), (New-GyeotTestRule 'S-1-5-18'))
+    Assert-Gyeot (@(Get-GyeotAclProblem -Summary $good -UserSid $me).Count -eq 0) '그 사용자·SYSTEM 모든 권한 + 상속 끊김 = 문제 없음'
+    $adminOwned = New-GyeotTestSummary @((New-GyeotTestRule $me), (New-GyeotTestRule 'S-1-5-18')) $true 'S-1-5-32-544'
+    Assert-Gyeot (@(Get-GyeotAclProblem -Summary $adminOwned -UserSid $me).Count -eq 0) '주인이 Administrators면 받아들인다(관리자 셸에서 만든 폴더)'
+    foreach ($case in @(
+            @{ Name = '다른 주체(Authenticated Users)가 남음'; S = (New-GyeotTestSummary @((New-GyeotTestRule $me), (New-GyeotTestRule 'S-1-5-18'), (New-GyeotTestRule 'S-1-5-11' 'Allow' 'Modify'))) },
+            @{ Name = '상속이 끊기지 않음'; S = (New-GyeotTestSummary @((New-GyeotTestRule $me), (New-GyeotTestRule 'S-1-5-18')) $false) },
+            @{ Name = 'SYSTEM이 없음'; S = (New-GyeotTestSummary @(, (New-GyeotTestRule $me))) },
+            @{ Name = '그 사용자 권한이 모든 권한이 아님'; S = (New-GyeotTestSummary @((New-GyeotTestRule $me 'Allow' 'ReadAndExecute'), (New-GyeotTestRule 'S-1-5-18'))) },
+            @{ Name = '거부 항목'; S = (New-GyeotTestSummary @((New-GyeotTestRule $me), (New-GyeotTestRule 'S-1-5-18'), (New-GyeotTestRule $me 'Deny' 'Write'))) },
+            @{ Name = '주인이 다른 사용자'; S = (New-GyeotTestSummary @((New-GyeotTestRule $me), (New-GyeotTestRule 'S-1-5-18')) $true 'S-1-5-21-9-9-9-1002') }
+        )) {
+        Assert-Gyeot (@(Get-GyeotAclProblem -Summary $case.S -UserSid $me).Count -gt 0) "문제로 본다: $($case.Name)"
     }
 
     Write-Host '== 1. 미리보기는 아무것도 바꾸지 않는다' -ForegroundColor White
@@ -288,6 +342,61 @@ try {
     Write-Host '== 7. -PurgeData 는 폴더 전체를 지운다' -ForegroundColor White
     $code = Invoke-GyeotScript 'uninstall.ps1' @('-InstallRoot', $root, '-ClaudeSettingsPath', $settings, '-PurgeData')
     Assert-Gyeot ($code -eq 0 -and -not (Test-Path -LiteralPath $root)) '설치 폴더 전체를 지웠다'
+
+    Write-Host '== 8. %LOCALAPPDATA% 밖에 설치하면 상속을 끊고 그 사용자와 SYSTEM만 남긴다(§13.4, Windows)' -ForegroundColor White
+    if (-not (Test-GyeotWindowsHost)) {
+        Write-Host '  skip Windows가 아니라 폴더 권한(icacls·Get-Acl) 시험을 건너뜀' -ForegroundColor Yellow
+    } else {
+        $outside = $null
+        foreach ($base in @("$env:SystemDrive\", $env:PUBLIC)) {
+            if (-not $base -or $base -eq '\') { continue }
+            $candidate = Join-Path $base ('gyeot-acl-test-' + [guid]::NewGuid().ToString('N'))
+            if (Test-GyeotUnderLocalAppData $candidate) { continue }
+            try {
+                New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
+                $outside = $candidate
+                break
+            } catch {
+                Write-Verbose "임시 폴더를 만들지 못함($candidate): $($_.Exception.Message)"
+            }
+        }
+        if (-not $outside) {
+            Write-Host '  skip %LOCALAPPDATA% 밖에 임시 폴더를 만들지 못해 건너뜀' -ForegroundColor Yellow
+        } else {
+            try {
+                $aclRoot = Join-Path $outside 'root'
+                $aclArgs = @('-SourceDir', $SourceDir, '-InstallRoot', $aclRoot, '-ClaudeSettingsPath', (Join-Path $outside 'settings.json'), '-NoInit')
+                Assert-Gyeot (-not (Test-GyeotUnderLocalAppData $aclRoot)) "시험 폴더는 %LOCALAPPDATA% 밖: $aclRoot"
+                $run = Invoke-GyeotScriptOutput 'install.ps1' ($aclArgs + @('-DryRun'))
+                Assert-Gyeot ($run.Code -eq 0) "밖 폴더 DryRun 종료 코드 0 (받은 값 $($run.Code))"
+                Assert-Gyeot ($run.Text -match 'icacls' -and $run.Text -match '/inheritance:r' -and $run.Text -match '\*S-1-5-18:\(OI\)\(CI\)F') 'DryRun은 할 icacls 명령을 보인다'
+                Assert-Gyeot (-not (Test-Path -LiteralPath $aclRoot)) 'DryRun은 밖 폴더를 만들지도 권한을 바꾸지도 않는다'
+                $run = Invoke-GyeotScriptOutput 'install.ps1' $aclArgs
+                Assert-Gyeot ($run.Code -eq 0) "밖 폴더 설치 종료 코드 0 (받은 값 $($run.Code))"
+                Assert-Gyeot ($run.Text -match 'S-1-5-18') '설치 출력이 권한 결과(SYSTEM SID 포함)를 보인다'
+                $meSid = Get-GyeotCurrentUserSid
+                $rootAcl = Get-GyeotAclSummary $aclRoot
+                Write-Host "  …   $(Format-GyeotAclSummary $rootAcl)"
+                Assert-Gyeot ($rootAcl.Protected) '설치 폴더: 상속이 끊겼다'
+                $sids = @($rootAcl.Rules | ForEach-Object { $_.Sid } | Sort-Object -Unique)
+                Assert-Gyeot ((($sids | Sort-Object) -join ',') -eq ((@($meSid, 'S-1-5-18') | Sort-Object) -join ',')) "설치 폴더: 허용 주체는 그 사용자와 SYSTEM뿐 ($($sids -join ','))"
+                Assert-Gyeot (@(Get-GyeotAclProblem -Summary $rootAcl -UserSid $meSid).Count -eq 0) "설치 폴더: §13.4 문제 없음 ($((Get-GyeotAclProblem -Summary $rootAcl -UserSid $meSid) -join '; '))"
+                foreach ($child in @('bin', 'bin\gyeot-hook.exe', 'bin\gyeotd.exe', 'bin\face\index.html', 'snippets\mcp.json')) {
+                    $childPath = Join-Path $aclRoot $child
+                    if (-not (Test-Path -LiteralPath $childPath)) { Assert-Gyeot $false "있어야 함: $child"; continue }
+                    $childAcl = Get-GyeotAclSummary $childPath
+                    $childProblems = @(Get-GyeotAclProblem -Summary $childAcl -UserSid $meSid -Child)
+                    Assert-Gyeot ($childProblems.Count -eq 0) "$child`: 그 사용자·SYSTEM만 ($($childProblems -join '; '))"
+                }
+                # 다시 설치(이미 좁힌 폴더)도 그대로 통과한다.
+                $code = Invoke-GyeotScript 'install.ps1' $aclArgs
+                Assert-Gyeot ($code -eq 0 -and @(Get-GyeotAclProblem -Summary (Get-GyeotAclSummary $aclRoot) -UserSid $meSid).Count -eq 0) '다시 설치해도 그 사용자·SYSTEM만'
+            } finally {
+                Remove-Item -LiteralPath $outside -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Assert-Gyeot (-not (Test-Path -LiteralPath $outside)) '밖 시험 폴더를 지웠다'
+        }
+    }
 } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

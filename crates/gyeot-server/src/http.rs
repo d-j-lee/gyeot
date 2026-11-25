@@ -43,6 +43,12 @@ pub const QUESTION_MAX: usize = 300;
 pub const OPTION_MAX: usize = 60;
 /// 발급하지 않은 `chat_id`로 답했을 때(계약 §12.4).
 pub const NOT_ISSUED: &str = "발급하지 않은 chat_id";
+/// 세션 열쇠로 토큰 전용 경로를 부를 때(계약 §7, G-031).
+pub const KEY_NOT_ALLOWED: &str = "이 열쇠로는 쓸 수 없어요";
+/// 토큰도 살아 있는 세션 열쇠도 아닐 때(계약 §7).
+pub const UNAUTHORIZED: &str = "토큰이나 세션 열쇠가 없거나 맞지 않아요";
+/// 부트 코드가 틀렸거나 지났거나 이미 썼을 때(계약 §12.1).
+pub const BAD_BOOT_CODE: &str = "열기 코드가 틀렸거나, 120초가 지났거나, 이미 쓴 코드예요. 트레이의 곁 열기나 gyeotd --open으로 다시 여세요";
 const RECEIVED_MAX_AGE_MS: i64 = 30 * 86_400_000;
 
 /// 처리기들이 함께 쓰는 상태.
@@ -102,20 +108,16 @@ impl Shared {
         self.sessions.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// `Authorization: Bearer <토큰>`이 맞는가(상수 시간 비교).
-    fn bearer_ok(&self, headers: &HeaderMap) -> bool {
-        bearer_token(headers).is_some_and(|t| ct_eq(t.as_bytes(), self.token.as_bytes()))
-    }
-
-    /// 살아 있는 세션 쿠키가 있는가(있으면 마지막 사용 시각을 갱신한다).
-    fn cookie_ok(&self, headers: &HeaderMap) -> bool {
-        let ids = auth::session_cookies(headers);
-        if ids.is_empty() {
-            return false;
+    /// `Authorization: Bearer <값>`이 누구인가(계약 §7). 토큰(상수 시간 비교)을 먼저 보고, 아니면
+    /// 세션 열쇠(해시 대조, 맞으면 마지막 사용 시각 갱신). 쿠키·쿼리는 보지 않는다.
+    fn caller(&self, headers: &HeaderMap) -> Option<Caller> {
+        let v = bearer_token(headers)?;
+        if ct_eq(v.as_bytes(), self.token.as_bytes()) {
+            return Some(Caller::Token);
         }
-        let now = now_ms();
-        let mut s = self.sessions();
-        ids.into_iter().any(|id| s.validate(id, now))
+        self.sessions()
+            .validate(v, now_ms())
+            .then_some(Caller::Session)
     }
 
     fn channels(&self) -> std::sync::MutexGuard<'_, Channels> {
@@ -154,6 +156,15 @@ impl Shared {
 }
 
 type St = Arc<Shared>;
+
+/// 인증한 쪽.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    /// 토큰: 모든 `/v1/*`.
+    Token,
+    /// 얼굴의 세션 열쇠: [`session_may_use`] 경로만.
+    Session,
+}
 
 fn json_resp(status: StatusCode, v: Value) -> Response {
     (status, axum::Json(v)).into_response()
@@ -222,10 +233,31 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then(|| tok.trim())
 }
 
-/// Host(421) → Origin(403) → 인증 순으로 검사한다. CORS 헤더는 내지 않는다(같은 출처만).
+/// 인증 없이 받는 `/v1` 경로(계약 §7 표의 "없어도 됨"). 본문·쿼리 검사는 처리기가 한다.
+fn is_public_v1(path: &str) -> bool {
+    path == "/v1/hello" || path == "/v1/session"
+}
+
+/// 세션 열쇠로 쓸 수 있는 경로(계약 §7 표의 "세션: 예", G-031). 허용 목록이다: 여기 없는 `/v1/*`
+/// (`/v1/boot`·`/v1/ingest/*`·`/v1/channel/*`·모르는 경로·인코딩한 경로)는 토큰만 쓴다.
+pub fn session_may_use(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/state" | "/v1/stream" | "/v1/focus" | "/v1/presence/listening" | "/v1/say"
+    ) || [
+        "/v1/items/",
+        "/v1/decisions/",
+        "/v1/proposals/",
+        "/v1/adjustments/",
+    ]
+    .iter()
+    .any(|p| path.starts_with(p))
+}
+
+/// Host(421) → Origin(403) → 인증(401) → 열쇠의 권한(403) 순으로 검사한다. CORS 헤더는 내지 않는다.
 ///
-/// - `/v1/boot`: Bearer만. 그 밖의 `/v1/*`: Bearer 또는 세션 쿠키(§7).
-/// - 얼굴 쪽 `GET`에 `?boot=`가 있으면 코드를 쓰고 세션을 연다(§12.1).
+/// 인증은 `Authorization: Bearer` 하나다. 쿠키는 어떤 경로에서도 보지 않고, `Set-Cookie`도 내지 않는다
+/// (G-030). 얼굴 쪽(`/`·`/assets/*`)과 `/health`·`/v1/hello`·`/v1/session`은 인증 없이 받는다.
 async fn guard(State(st): State<St>, req: Request, next: Next) -> Response {
     if !host_ok(request_host(req.headers(), req.uri()), st.port) {
         return err(StatusCode::MISDIRECTED_REQUEST, "Host가 맞지 않아요");
@@ -237,49 +269,15 @@ async fn guard(State(st): State<St>, req: Request, next: Next) -> Response {
         }
     }
     let path = req.uri().path();
-    if path == "/v1" || path.starts_with("/v1/") {
-        let authed = if path == "/v1/boot" {
-            st.bearer_ok(req.headers())
-        } else {
-            st.bearer_ok(req.headers()) || st.cookie_ok(req.headers())
-        };
-        if !authed {
-            return err(StatusCode::UNAUTHORIZED, "토큰이 없거나 맞지 않아요");
+    if (path == "/v1" || path.starts_with("/v1/")) && !is_public_v1(path) {
+        match st.caller(req.headers()) {
+            Some(Caller::Token) => {}
+            Some(Caller::Session) if session_may_use(path) => {}
+            Some(Caller::Session) => return err(StatusCode::FORBIDDEN, KEY_NOT_ALLOWED),
+            None => return err(StatusCode::UNAUTHORIZED, UNAUTHORIZED),
         }
-        return next.run(req).await;
-    }
-    if matches!(*req.method(), Method::GET | Method::HEAD)
-        && path != "/health"
-        && let Some((code, rest)) = req.uri().query().and_then(auth::take_boot)
-    {
-        return redeem_boot(&st, path, &code, &rest);
     }
     next.run(req).await
-}
-
-/// `?boot=<코드>`: 맞으면 세션을 만들고 `Set-Cookie`와 함께 `boot`만 뺀 주소로 303. 아니면 안내 쪽(401).
-fn redeem_boot(st: &Shared, path: &str, code: &str, rest: &str) -> Response {
-    let now = now_ms();
-    if !st.boot_codes().redeem(code, now) {
-        return face::guidance(face::Guide::BadBootCode);
-    }
-    let id = match st.sessions().create(now) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!("세션을 만들지 못했어요: {e:#}");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "세션을 만들지 못했어요");
-        }
-    };
-    let mut r = StatusCode::SEE_OTHER.into_response();
-    let h = r.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(&auth::redirect_location(path, rest)) {
-        h.insert(header::LOCATION, v);
-    }
-    if let Ok(v) = HeaderValue::from_str(&auth::set_cookie_value(&id)) {
-        h.insert(header::SET_COOKIE, v);
-    }
-    face::secure_headers(h, true);
-    r
 }
 
 /// 라우터.
@@ -288,7 +286,9 @@ pub fn router(st: St) -> Router {
         .route("/health", get(health))
         .route("/", get(index))
         .route("/index.html", get(index))
+        .route("/v1/hello", get(hello))
         .route("/v1/boot", post(boot))
+        .route("/v1/session", post(session))
         .route("/v1/ingest/{source}", post(ingest))
         .route("/v1/state", get(state))
         .route("/v1/stream", get(stream))
@@ -319,15 +319,65 @@ async fn health() -> Response {
     )
 }
 
-/// `GET /`: 세션 쿠키가 있으면 얼굴, 없으면 안내 쪽(401). 토큰은 어디에도 싣지 않는다.
-async fn index(State(st): State<St>, headers: HeaderMap) -> Response {
-    if !st.cookie_ok(&headers) {
-        return face::guidance(face::Guide::NoSession);
-    }
+/// `GET /`·`/index.html`: 인증 없이 얼굴 `index.html` 그대로(비밀이 없다, 계약 §7). `?boot=`는 서버가
+/// 읽지 않는다(얼굴 스크립트가 `POST /v1/session`으로 바꾼다, §12.1).
+async fn index(State(st): State<St>) -> Response {
     face::index_response(st.face_dir.as_deref()).await
 }
 
-/// `POST /v1/boot`(Bearer만): 120초 동안 한 번 쓸 수 있는 얼굴 열기 코드.
+fn no_store(mut r: Response) -> Response {
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+/// `GET /v1/hello?n=<16–128자 hex>`(인증 없음, 계약 §13.1): 토큰과 실제로 묶인 포트·`n`으로 만든 증명.
+/// 토큰을 가진 쪽이 토큰을 보내기 전에 이 서버가 곁 데몬인지 확인한다.
+async fn hello(State(st): State<St>, uri: Uri) -> Response {
+    let n = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("n=")))
+        .filter(|n| auth::valid_nonce(n));
+    match n {
+        Some(n) => no_store(json_resp(
+            StatusCode::OK,
+            json!({ "v": 1, "proof": auth::hello_proof(&st.token, st.port, n) }),
+        )),
+        None => err(StatusCode::BAD_REQUEST, "n은 16–128자 hex여야 해요"),
+    }
+}
+
+#[derive(Deserialize)]
+struct CodeBody {
+    code: String,
+}
+
+/// `POST /v1/session {"code"}`(인증 머리 없음, 계약 §12.1): 일회용 부트 코드를 세션 열쇠로 바꾼다.
+/// 틀렸거나 지났거나 이미 쓴 코드는 `401`. 열쇠는 응답 본문으로만 준다(쿠키 없음).
+async fn session(State(st): State<St>, body: Bytes) -> Response {
+    let b: CodeBody = match parse_body(&body) {
+        Ok(b) => b,
+        Err(r) => return r.into_response(),
+    };
+    let now = now_ms();
+    let redeemed = st.boot_codes().redeem(&b.code, now);
+    if !redeemed {
+        return err(StatusCode::UNAUTHORIZED, BAD_BOOT_CODE);
+    }
+    let created = st.sessions().create(now);
+    match created {
+        Ok((id, expires_ms)) => no_store(json_resp(
+            StatusCode::OK,
+            json!({ "session": id, "expires_ms": expires_ms }),
+        )),
+        Err(e) => {
+            tracing::error!("세션을 만들지 못했어요: {e:#}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "세션을 만들지 못했어요")
+        }
+    }
+}
+
+/// `POST /v1/boot`(토큰만, G-031): 120초 동안 한 번 쓸 수 있는 얼굴 열기 코드.
 ///
 /// 본문은 쓰지 않지만 끝까지 읽은 뒤 답한다(`_body`). 읽지 않은 본문을 남긴 채 닫으면 Windows가
 /// RST를 보내 클라이언트가 응답을 잃는다(CI windows-latest, 2026-11-26).
@@ -337,13 +387,10 @@ async fn boot(State(st): State<St>, _body: axum::body::Bytes) -> Response {
     match issued {
         Ok((code, expires_ms)) => {
             let url = format!("http://127.0.0.1:{}/?boot={code}", st.port);
-            let mut r = json_resp(
+            no_store(json_resp(
                 StatusCode::OK,
                 json!({ "code": code, "url": url, "expires_ms": expires_ms }),
-            );
-            r.headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            r
+            ))
         }
         Err(e) => {
             tracing::error!("부트 코드를 만들지 못했어요: {e:#}");
@@ -990,6 +1037,45 @@ mod tests {
         assert_eq!(request_host(&h, &uri), None);
         h.insert(header::HOST, HeaderValue::from_static("evil.example"));
         assert_eq!(request_host(&h, &uri), Some("evil.example"));
+    }
+
+    /// G-031: 세션 열쇠는 계약 §7 표의 "세션: 예" 경로만(허용 목록).
+    #[test]
+    fn session_route_allowlist() {
+        for ok in [
+            "/v1/state",
+            "/v1/stream",
+            "/v1/items/i1/action",
+            "/v1/focus",
+            "/v1/presence/listening",
+            "/v1/say",
+            "/v1/decisions/d1",
+            "/v1/proposals/p1",
+            "/v1/adjustments/unread",
+        ] {
+            assert!(session_may_use(ok), "{ok}");
+        }
+        for no in [
+            "/v1/boot",
+            "/v1/ingest/claude-code",
+            "/v1/channel/register",
+            "/v1/channel/stream",
+            "/v1/channel/reply",
+            "/v1/channel/decision",
+            "/v1/channel/unregister",
+            "/v1",
+            "/v1/",
+            "/v1/nope",
+            "/v1//boot",
+            "/v1/%62oot",
+            "/v1/state/x",
+            "/v1/sayx",
+            "/v1/items",
+        ] {
+            assert!(!session_may_use(no), "{no}");
+        }
+        assert!(is_public_v1("/v1/hello") && is_public_v1("/v1/session"));
+        assert!(!is_public_v1("/v1/hello/") && !is_public_v1("/v1/sessions"));
     }
 
     #[test]

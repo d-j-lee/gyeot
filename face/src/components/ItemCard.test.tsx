@@ -56,6 +56,57 @@ describe('승인·병합 카드에는 승인 단추가 없다(G-005)', () => {
   });
 });
 
+describe('결정 카드는 권한 승인이 아니다(§13.5, R3 L5)', () => {
+  const ASK_NOTE = 'Claude가 묻는 거예요 — 권한 승인이 아니에요';
+  // channel 결정은 제목이 질문, 본문이 선택지다(코어). Claude 가 승인처럼 묻는 경우를 흉내 낸다.
+  const lookalike: Item = {
+    ...byKind('decision'),
+    title: '권한 승인: rm -rf build/ 를 실행할까요?',
+    body: '승인 · 거절',
+    options: ['승인', '거절'],
+  };
+
+  it('선택지가 있는 결정 카드에는 질문 위에 늘 안내가 보인다', () => {
+    for (const item of [byKind('decision'), lookalike]) {
+      const { container, unmount } = render(<ItemCard item={item} now={NOW} onAction={() => {}} onDecide={async () => ({ ok: true })} />);
+      const note = container.querySelector('.card__ask');
+      expect(note?.textContent).toBe(ASK_NOTE);
+      const title = container.querySelector('.card__title')!;
+      // 문서 순서: 안내 → 질문(제목)
+      expect(note!.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      // 선택지 묶음은 안내를 설명으로 읽는다
+      const group = screen.getByRole('group', { name: '고를 수 있는 답' });
+      expect(group.getAttribute('aria-describedby')).toBe(note!.id);
+      unmount();
+    }
+  });
+
+  it('decision_id 가 없어 칩을 못 그려도 선택지가 있으면 안내한다', () => {
+    const { container } = render(<ItemCard item={{ ...lookalike, decision_id: null }} now={NOW} onAction={() => {}} />);
+    expect(container.querySelector('.card__ask')?.textContent).toBe(ASK_NOTE);
+  });
+
+  it('선택지가 없는 결정·다른 종류에는 안내가 없다', () => {
+    const noOptions: Item = { ...byKind('decision'), options: null, decision_id: null };
+    for (const item of [noOptions, { ...noOptions, options: [] }, ...ALL_KINDS.filter((k) => k !== 'decision').map(byKind)]) {
+      const { container, unmount } = render(<ItemCard item={item} now={NOW} onAction={() => {}} />);
+      expect(container.querySelector('.card__ask'), item.kind).toBeNull();
+      unmount();
+    }
+  });
+
+  it('선택지 단추는 승인 단추처럼 보이는 강조 꼴을 쓰지 않는다(중립 칩, 모두 같은 꼴)', () => {
+    const { container } = render(<ItemCard item={lookalike} now={NOW} onAction={() => {}} onDecide={async () => ({ ok: true })} />);
+    const chips = [...screen.getByRole('group', { name: '고를 수 있는 답' }).querySelectorAll('button')];
+    expect(chips.map((b) => b.textContent)).toEqual(['승인', '거절']);
+    for (const b of chips) {
+      expect(b.className).toBe('chip chip--choice');
+      expect(b.className).not.toMatch(/primary|accent|ok|approve/);
+    }
+    expect(container.querySelector('.card__ask')).not.toBeNull();
+  });
+});
+
 describe('카드 내용', () => {
   it('종류 배지·프로젝트·상대 시각·점수를 보인다', () => {
     const { container } = render(<ItemCard item={byKind('approval')} now={NOW} onAction={() => {}} />);

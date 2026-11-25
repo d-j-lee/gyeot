@@ -13,7 +13,7 @@ export function connText(conn: ConnState, localNow: number): string {
     case 'demo':
       return '데모 모드 — 데몬 없이 표본 데이터로 보여요';
     case 'auth':
-      return '열쇠가 만료됐어요';
+      return '열쇠가 없거나 만료됐어요';
     case 'retrying': {
       if (conn.retryAt === null) return '곁 데몬에 연결 중…';
       const s = Math.max(0, Math.ceil((conn.retryAt - localNow) / 1000));

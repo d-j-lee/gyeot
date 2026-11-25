@@ -1,7 +1,7 @@
 // Tauri 셸과의 약속(선택, §12.1). 브라우저에서는 아무 일도 하지 않는다.
 //   set_hit_rect {x, y, width, height}  — 클릭을 받을 영역(CSS px). 그 밖은 바탕화면으로 통과.
 //   set_expanded {expanded}              — 패널이 펼쳐졌는지.
-//   renew_session                        — 세션 쿠키가 만료됐다(401). 셸이 새 부트 코드로 이 창을 다시 연다.
+//   renew_session                        — 세션 열쇠가 없거나 만료됐다(401). 셸이 새 부트 코드로 이 창을 다시 연다.
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 
@@ -88,7 +88,7 @@ function readRenewAt(): number | null {
 }
 
 /**
- * 세션 쿠키가 만료됐을 때(401) 셸에 새 열쇠를 청한다. 셸 밖이거나 30초가 안 됐으면 부르지 않고 false.
+ * 세션 열쇠가 없거나 만료됐을 때(401) 셸에 새 열쇠를 청한다. 셸 밖이거나 30초가 안 됐으면 부르지 않고 false.
  * 마지막으로 청한 시각은 이 창의 sessionStorage 에도 둔다 — 셸이 창을 다시 연 뒤 곧바로 또 401 이 나도
  * 다시 열기를 되풀이하지 않게.
  */

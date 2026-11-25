@@ -96,3 +96,10 @@ export const IconClock = (p: P) => (
     <path d="M8 4.6V8l2.4 1.4" />
   </Svg>
 );
+
+/** 말풍선 — Claude 가 묻는 것(결정 카드 안내) */
+export const IconChat = (p: P) => (
+  <Svg {...p}>
+    <path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H8.2L5.4 13.2V11H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" />
+  </Svg>
+);

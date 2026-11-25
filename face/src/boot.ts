@@ -30,6 +30,7 @@ const SCENES: Record<string, { scene: DemoScene; mood: Mood }> = {
  *   open=1                    오버레이에서 패널을 펼친 채로
  *   theme=light|dark          색 모드 고정(기본은 시스템 설정)
  *   motion=reduce             움직임 줄이기 강제
+ * boot=<코드>(일회용 부트 코드)는 여기서 읽지 않는다 — main.tsx 가 가장 먼저 takeBootCode 로 주소에서 지운다(§12.1-3).
  */
 export function parseBoot(search: string): BootConfig {
   const q = new URLSearchParams(search);

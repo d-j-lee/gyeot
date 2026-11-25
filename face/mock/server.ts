@@ -1,11 +1,14 @@
-// 개발용 가짜 곁 데몬. docs/contracts.md §7·§8·§12.1 의 엔드포인트·SSE·열쇠 흐름을 흉내 낸다.
+// 개발용 가짜 곁 데몬. docs/contracts.md §7·§8·§12.1·§13.1 의 엔드포인트·SSE·열쇠 흐름을 흉내 낸다.
 //   npm run mock                 → http://127.0.0.1:47321/ (dist 가 있으면 / 에서 얼굴을 내보낸다)
 //   GYEOT_PORT=47322 npm run mock
 //   GYEOT_TOKEN=<hex> npm run mock (기본: 띄울 때마다 새 난수. 터미널에 보인다)
 //   GYEOT_MOCK_DIST=<폴더>        → 얼굴 폴더(기본 face/dist)
 //   npm run mock -- --quiet      → 저절로 일어나는 일(대본) 없이
-// 열쇠(배포와 같다): 토큰(Bearer)으로 POST /v1/boot → 부트 주소 /?boot=<코드>(120초, 한 번) → 쿠키 + 303.
-//   그 뒤 얼굴의 API·SSE 는 같은 출처 쿠키로만. ?t= 는 받지 않는다. 띄울 때 부트 주소를 보이고, Enter 마다 새로 보인다.
+// 열쇠(배포와 같다): 토큰(Bearer)으로 POST /v1/boot → 부트 주소 /?boot=<코드>(120초, 한 번).
+//   GET / 는 인증 없이 index.html 을 그대로 준다(서버는 ?boot= 를 읽지 않는다). 얼굴 스크립트가 주소에서 boot 를 지우고
+//   POST /v1/session {"code"} 로 세션 열쇠를 받아 sessionStorage 에 두고, 그 뒤 모든 요청을 Authorization: Bearer <세션 열쇠> 로 한다.
+//   세션 열쇠는 얼굴이 쓰는 경로만 연다(ingest·channel·boot·/mock/* 는 403). 쿠키·?t= 는 받지 않는다.
+//   띄울 때 부트 주소를 보이고, Enter 마다 새로 보인다.
 // 손으로 일으키기: curl -H "Authorization: Bearer <토큰>" "http://127.0.0.1:<포트>/mock/trigger?what=interrupt|nudge|reply|alert|done|working|item|reset"
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -23,7 +26,7 @@ import {
   demoNudge,
   demoSessions,
 } from '../src/demo/data.ts';
-import { AuthStore } from './auth.ts';
+import { AuthStore, helloProof, isHelloNonce, type Credential } from './auth.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dist = process.env.GYEOT_MOCK_DIST ? normalize(process.env.GYEOT_MOCK_DIST) : join(here, '..', 'dist');
@@ -148,10 +151,18 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   }
 }
 
-/** §7: 토큰(Bearer) 또는 세션 쿠키. 쿼리 토큰(?t=)은 받지 않는다. */
-function authed(req: IncomingMessage): boolean {
-  return auth.bearerOk(req.headers.authorization) || auth.sessionOk(req.headers.cookie);
+/** §7: `Authorization: Bearer <토큰|세션 열쇠>` 하나. 쿼리 토큰(?t=)·쿠키는 받지 않는다. */
+function credentialOf(req: IncomingMessage): Credential | null {
+  return auth.classify(req.headers.authorization);
 }
+
+/** §7·G-031: 세션 열쇠로는 못 쓰는 길(토큰만). /mock/* 은 가짜 데몬만의 조작이라 토큰만 받는다. */
+function tokenOnly(pathname: string): boolean {
+  return pathname === '/v1/boot' || pathname.startsWith('/v1/ingest/') || pathname.startsWith('/v1/channel/') || pathname.startsWith('/mock/');
+}
+
+const UNAUTHORIZED = { ok: false, error: '열쇠가 없거나 틀렸어요' };
+const FORBIDDEN = { ok: false, error: '이 열쇠로는 쓸 수 없어요' };
 
 let listenPort = PORT;
 const allowedHosts = () => new Set([`127.0.0.1:${listenPort}`, `localhost:${listenPort}`]);
@@ -174,46 +185,6 @@ const FACE_HEADERS: Record<string, string> = {
   'Cache-Control': 'no-store',
 };
 
-const GUIDE_PAGE = `<!doctype html>
-<html lang="ko">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>곁 — 열쇠가 필요해요</title>
-<style>body{font-family:system-ui,"Malgun Gothic",sans-serif;max-width:40rem;margin:3rem auto;padding:0 1.25rem;line-height:1.6}code{background:#ebe5db;border-radius:6px;padding:.1rem .35rem}</style>
-</head>
-<body>
-<h1>곁을 열려면 열쇠가 필요해요</h1>
-<p>트레이의 ‘곁 열기’를 누르거나 터미널에서 <code>gyeotd --open</code>을 실행하세요.</p>
-<p>가짜 데몬(<code>npm run mock</code>)이면 그 터미널에서 Enter 를 누르면 새 주소가 나와요. 주소는 120초 안에 한 번만 쓸 수 있어요.</p>
-</body>
-</html>
-`;
-
-function guide(res: ServerResponse) {
-  res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', ...FACE_HEADERS });
-  res.end(GUIDE_PAGE);
-}
-
-/** §12.1-2: 코드를 쿠키로 바꾸고 같은 경로·같은 쿼리에서 boot 만 뺀 주소로 303. */
-function redeemBoot(res: ServerResponse, url: URL) {
-  const value = auth.redeem(url.searchParams.get('boot') ?? '');
-  if (!value) return guide(res);
-  const q = new URLSearchParams(url.search);
-  q.delete('boot');
-  const rest = q.toString();
-  // '//host' 꼴은 다른 호스트로 읽히므로 앞의 / 를 하나로 접는다.
-  const path = `/${url.pathname.replace(/^\/+/, '')}`;
-  res.writeHead(303, {
-    Location: rest ? `${path}?${rest}` : path,
-    'Set-Cookie': auth.cookieFor(value),
-    'Cache-Control': 'no-store',
-    'Referrer-Policy': 'no-referrer',
-  });
-  res.end();
-  console.log('  ⚿ 부트 코드 → 세션 쿠키');
-}
-
 function issueBoot(port = listenPort) {
   const c = auth.issueCode();
   return { ...c, url: `http://127.0.0.1:${port}/?boot=${c.code}` };
@@ -227,8 +198,8 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
 };
 
-/** §7: index(`/`·확장자 없는 경로)는 쿠키가 있어야, 그 밖의 정적 파일(`/assets/*` 등)은 열쇠 없이. 토큰을 싣지 않는다. */
-async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string) {
+/** §7: 얼굴(`/`·확장자 없는 경로 → index.html)과 정적 파일(`/assets/*` 등)은 열쇠 없이. 페이지에 비밀이 없다. */
+async function serveStatic(res: ServerResponse, pathname: string) {
   let p: string;
   try {
     p = normalize(decodeURIComponent(pathname));
@@ -236,7 +207,6 @@ async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: 
     return json(res, 404, { error: 'not found' });
   }
   const isIndex = p === '/' || p === '/index.html' || !extname(p);
-  if (isIndex && !auth.sessionOk(req.headers.cookie)) return guide(res);
   if (isIndex && !existsSync(join(dist, 'index.html'))) {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', ...FACE_HEADERS });
     res.end('dist 가 없어요. face/ 에서 npm run build 를 하거나, npm run dev 로 띄운 뒤 터미널에 보인 개발 서버 부트 주소를 여세요.\n');
@@ -366,17 +336,37 @@ const server = createServer(async (req, res) => {
 
   try {
     if (method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, version: '0.1.0-mock' });
-    // §7: 부트 코드는 토큰으로만(쿠키로는 부를 수 없다)
+    // §13.1: 데몬 확인. 인증 없이, 토큰·실제로 묶인 포트·n 의 HMAC.
+    if (method === 'GET' && url.pathname === '/v1/hello') {
+      const n = url.searchParams.get('n');
+      if (!isHelloNonce(n)) return json(res, 400, { ok: false, error: 'n 은 16–128자 hex 여야 해요' });
+      return json(res, 200, { v: 1, proof: helloProof(TOKEN, listenPort, n) });
+    }
+    // §12.1-3: 부트 코드 → 세션 열쇠. 인증 없이 코드만으로. 쿠키를 달지 않는다.
+    if (url.pathname === '/v1/session') {
+      if (method !== 'POST') return json(res, 405, { error: 'method' });
+      const key = auth.redeem((await readJson(req)).code);
+      if (!key) return json(res, 401, { ok: false, error: '부트 코드가 틀렸거나 지났거나 이미 썼어요' });
+      console.log('  ⚿ 부트 코드 → 세션 열쇠');
+      return json(res, 200, key);
+    }
+    // §7: 얼굴과 정적 파일은 열쇠 없이. 서버는 ?boot= 를 읽지 않는다(얼굴 스크립트가 쓴다).
+    if (method === 'GET' && !url.pathname.startsWith('/v1/') && !url.pathname.startsWith('/mock/')) {
+      return serveStatic(res, url.pathname);
+    }
+    const cred = credentialOf(req);
+    if (!cred) return json(res, 401, UNAUTHORIZED);
+    if (cred === 'session' && tokenOnly(url.pathname)) return json(res, 403, FORBIDDEN);
+
+    // §7: 부트 코드는 토큰으로만
     if (url.pathname === '/v1/boot') {
       if (method !== 'POST') return json(res, 405, { error: 'method' });
-      if (!auth.bearerOk(req.headers.authorization)) return json(res, 401, { error: 'unauthorized' });
       return json(res, 200, issueBoot());
     }
-    if (method === 'GET' && !url.pathname.startsWith('/v1/') && !url.pathname.startsWith('/mock/')) {
-      if (url.searchParams.has('boot')) return redeemBoot(res, url);
-      return serveStatic(req, res, url.pathname);
+    // 가짜 데몬은 훅 수집·channel 을 흉내 내지 않는다(경계만 계약대로).
+    if (url.pathname.startsWith('/v1/ingest/') || url.pathname.startsWith('/v1/channel/')) {
+      return json(res, 404, { ok: false, error: '가짜 데몬에는 없는 길이에요' });
     }
-    if (!authed(req)) return json(res, 401, { error: 'unauthorized' });
 
     if (method === 'GET' && url.pathname === '/mock/trigger') {
       const what = url.searchParams.get('what') ?? '';
@@ -476,13 +466,14 @@ server.on('error', (e: NodeJS.ErrnoException) => {
   throw e;
 });
 
-/** 부트 주소 두 개(데몬이 내보내는 얼굴 / vite 개발 서버). 코드마다 120초 안에 한 번만 쓴다. */
+/** 부트 주소 두 개(데몬이 내보내는 얼굴 / vite 개발 서버). 코드마다 120초 안에 한 번만 쓴다. 얼굴이 열쇠로 바꾼다. */
 function printBootUrls() {
   const direct = issueBoot();
   const dev = issueBoot(DEV_PORT);
   console.log(`  얼굴 열기(dist, 120초 안에 한 번):  ${direct.url}`);
   console.log(`  개발 서버(npm run dev, 120초 안에 한 번): ${dev.url}`);
   console.log(`    오버레이는 주소 끝에 &mode=overlay — 새 주소는 이 터미널에서 Enter`);
+  console.log(`    열쇠는 그 탭의 sessionStorage 에만 있어요. mock 을 다시 띄우면 열쇠가 사라져 얼굴이 안내를 보여요.`);
 }
 
 server.listen(PORT, '127.0.0.1', () => {

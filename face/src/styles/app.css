@@ -206,28 +206,34 @@ kbd {
   text-decoration-color: currentColor;
 }
 
+/* 칩: 결정 선택지(.chip--choice)와 넘기기 이유(.chip--quiet).
+   §13.5: 결정 선택지는 승인 단추처럼 보이면 안 된다 — 강조색(accent·ok·종류색) 없이 중립색만, 모든 선택지가 같은 꼴.
+   src/styles/contrast.test.ts 가 이 규칙들에 중립 토큰만 쓰는지 잰다. */
 .chip {
   display: inline-flex;
   align-items: center;
   height: 30px;
   padding: 0 12px;
   border-radius: 999px;
-  border: 1px solid var(--k-decision-fg);
+  border: 1px solid var(--border-strong);
   background: var(--surface);
-  color: var(--k-decision-fg);
+  color: var(--text);
   font-size: 13px;
   font-weight: 600;
   transition: background 120ms ease;
 }
 .chip:hover:not(:disabled) {
-  background: var(--k-decision-bg);
+  background: var(--surface-2);
 }
 .chip:disabled {
   opacity: 0.55;
 }
+.chip--choice {
+  font-weight: 500;
+}
 .chip--sending {
   opacity: 1 !important;
-  background: var(--k-decision-bg);
+  background: var(--surface-3);
 }
 .chip--quiet {
   height: 28px;
@@ -1145,6 +1151,19 @@ kbd {
   font-weight: 600;
 }
 .card__note .icon {
+  flex: none;
+}
+/* §13.5: 선택지가 있는 결정 카드 — 질문 위에 "Claude가 묻는 거예요 — 권한 승인이 아니에요" */
+.card__ask {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0 0;
+  color: var(--kind-fg);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.card__ask .icon {
   flex: none;
 }
 .card__actions {

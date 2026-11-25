@@ -310,6 +310,8 @@ function normalizeSettings(s: Record<string, unknown>): Settings {
     stale_minutes: num(s.stale_minutes, 30),
     quiet_hours: strs(s.quiet_hours),
     quiet_kinds: strs(s.quiet_kinds) as Settings['quiet_kinds'],
+    // §13.3: 기본은 꺼짐. 정확히 true 일 때만 켜졌다고 보인다.
+    approval_interrupt: s.approval_interrupt === true,
   };
 }
 

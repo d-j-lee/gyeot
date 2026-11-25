@@ -148,13 +148,13 @@ describe('집중 모드의 답(§12.4)', () => {
 });
 
 const AUTH = { status: 'auth', attempt: 1, retryAt: null } as const;
-const AUTH_TEXT = '열쇠가 만료됐어요 — 트레이의 ‘곁 열기’를 누르거나 터미널에서 gyeotd --open을 실행하세요.';
+const AUTH_TEXT = '열쇠가 없거나 만료됐어요 — 트레이의 ‘곁 열기’를 누르거나 터미널에서 gyeotd --open을 실행하세요.';
 
-describe('열쇠가 만료됐을 때(§12.1-4)', () => {
+describe('열쇠가 없거나 만료됐을 때(§12.1-5)', () => {
   it('기본 화면: 안내를 보이고, 명령은 코드로, 다시 확인은 다시 잇는다', () => {
     const { ctl, backend } = mount('default');
     const retry = vi.spyOn(backend, 'retryNow');
-    expect(screen.queryByText(/열쇠가 만료됐어요/)).toBeNull();
+    expect(screen.queryByText(/열쇠가 없거나 만료됐어요/)).toBeNull();
     act(() => ctl.dispatch({ type: 'conn', conn: AUTH }));
     const notice = document.querySelector('.auth-notice') as HTMLElement;
     expect(notice).not.toBeNull();
@@ -172,7 +172,7 @@ describe('열쇠가 만료됐을 때(§12.1-4)', () => {
     act(() => ctl.dispatch({ type: 'conn', conn: AUTH }));
     const avatar = document.querySelector('.ov-avatar')!;
     expect(avatar.classList.contains('ov-avatar--offline')).toBe(true);
-    expect(avatar.getAttribute('aria-label')).toContain('열쇠가 만료됐어요');
+    expect(avatar.getAttribute('aria-label')).toContain('열쇠가 없거나 만료됐어요');
     fireEvent.click(avatar);
     expect(document.querySelector('.auth-notice .auth-notice__text')!.textContent).toBe(AUTH_TEXT);
   });

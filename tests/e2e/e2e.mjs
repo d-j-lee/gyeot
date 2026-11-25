@@ -7,6 +7,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
@@ -94,7 +95,7 @@ function raw(method, p, { headers = {}, body } = {}) {
   });
 }
 let TOKEN = '';
-let COOKIE = '';
+let SESSION = '';
 const auth = () => ({ Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' });
 async function api(method, p, body) {
   const r = await raw(method, p, { headers: auth(), body });
@@ -170,19 +171,66 @@ try {
   check('쿼리 토큰(?t=)은 받지 않음 → 401', (await raw('GET', `/v1/state?t=${TOKEN}`)).status === 401);
   check('Tauri 출처도 거절 → 403', (await raw('GET', '/v1/state', { headers: { ...auth(), Origin: 'http://tauri.localhost' } })).status === 403);
   const bare = await raw('GET', '/');
-  check('쿠키 없는 GET / → 401 안내 쪽, 토큰 없음', bare.status === 401 && !bare.body.includes(TOKEN) && /gyeotd --open/.test(bare.body));
+  check('GET /는 인증 없이 얼굴, 페이지에 토큰 없음, 쿠키 없음', bare.status === 200 && /<script/.test(bare.body) && !bare.body.includes(TOKEN) && !bare.headers['set-cookie']);
   check('얼굴 응답에 CSP frame-ancestors none·X-Frame-Options DENY', /frame-ancestors 'none'/.test(bare.headers['content-security-policy'] ?? '') && bare.headers['x-frame-options'] === 'DENY');
-  const boot = await api('POST', '/v1/boot');
+
+  // 데몬 확인(§13.1): 포트를 넣은 HMAC
+  const nonce = crypto.randomBytes(32).toString('hex');
+  const hello = await raw('GET', `/v1/hello?n=${nonce}`);
+  const want = crypto.createHmac('sha256', TOKEN).update(`gyeot-hello/v1|${PORT}|${nonce}`).digest('hex');
+  let helloJson = null;
+  try {
+    helloJson = JSON.parse(hello.body);
+  } catch {}
+  check('GET /v1/hello → 토큰·포트·n의 HMAC', hello.status === 200 && helloJson?.proof === want);
+  const otherPort = crypto.createHmac('sha256', TOKEN).update(`gyeot-hello/v1|${PORT + 1}|${nonce}`).digest('hex');
+  check('hello proof는 포트마다 다름(중계 거름)', helloJson?.proof !== otherPort);
+  check('hello의 n이 hex가 아니면 400', (await raw('GET', '/v1/hello?n=zz')).status === 400);
+
+  // 얼굴 열기(§12.1): 부트 코드 → 세션 열쇠
+  const boot = await api('POST', '/v1/boot', {});
   check('POST /v1/boot(토큰) → 일회용 코드', boot.status === 200 && /^[0-9a-f]{64}$/.test(boot.json?.code ?? ''), boot.json?.url);
-  const enter = await raw('GET', `/?mode=overlay&boot=${boot.json?.code}`);
-  const setCookie = String(enter.headers['set-cookie'] ?? '');
-  COOKIE = (setCookie.match(/gyeot_session=([0-9a-f]+)/) ?? [])[1] ?? '';
-  check('부트 코드 → 303 + HttpOnly·SameSite=Strict 쿠키, 주소에서 코드 제거', enter.status === 303 && /HttpOnly/i.test(setCookie) && /SameSite=Strict/i.test(setCookie) && enter.headers.location === '/?mode=overlay' && COOKIE.length === 64, enter.headers.location);
-  check('같은 코드 재사용 → 401', (await raw('GET', `/?boot=${boot.json?.code}`)).status === 401);
-  const face = await raw('GET', '/', { headers: { Cookie: `gyeot_session=${COOKIE}` } });
-  check('쿠키로 GET / → 얼굴, 페이지에 토큰 없음', face.status === 200 && /<div id="app"|<script/.test(face.body) && !face.body.includes(TOKEN));
-  check('쿠키로 /v1/state → 200', (await raw('GET', '/v1/state', { headers: { Cookie: `gyeot_session=${COOKIE}` } })).status === 200);
-  check('쿠키로는 부트 코드를 못 만듦 → 401', (await raw('POST', '/v1/boot', { headers: { Cookie: `gyeot_session=${COOKIE}` } })).status === 401);
+  const sessRes = await raw('POST', '/v1/session', { headers: { 'Content-Type': 'application/json' }, body: { code: boot.json?.code } });
+  let sessJson = null;
+  try {
+    sessJson = JSON.parse(sessRes.body);
+  } catch {}
+  SESSION = sessJson?.session ?? '';
+  check('POST /v1/session(코드) → 세션 열쇠, 쿠키 없음', sessRes.status === 200 && /^[0-9a-f]{64}$/.test(SESSION) && !sessRes.headers['set-cookie']);
+  check('같은 코드 재사용 → 401', (await raw('POST', '/v1/session', { headers: { 'Content-Type': 'application/json' }, body: { code: boot.json?.code } })).status === 401);
+  const asSession = (method, p, body) => raw(method, p, { headers: { Authorization: `Bearer ${SESSION}`, 'Content-Type': 'application/json' }, body });
+  check('세션 열쇠로 /v1/state → 200', (await asSession('GET', '/v1/state')).status === 200);
+  check('세션 열쇠로 ingest → 403(토큰만)', (await asSession('POST', '/v1/ingest/claude-code', { payload: {} })).status === 403);
+  check('세션 열쇠로 channel 등록 → 403(토큰만)', (await asSession('POST', '/v1/channel/register', { pid: 1, ppid: 1, cwd: '/' })).status === 403);
+  check('세션 열쇠로 부트 코드 → 403(토큰만)', (await asSession('POST', '/v1/boot', {})).status === 403);
+  check('세션 값을 쿠키로 보내면 401(쿠키는 인증이 아님)', (await raw('GET', '/v1/state', { headers: { Cookie: `gyeot_session=${SESSION}` } })).status === 401);
+
+  // 포트를 먼저 잡은 다른 서버(§13.1): 토큰도 페이로드도 보내지 않는다
+  const squat = { auth: 0, ingest: 0 };
+  const squatter = http.createServer((req, res) => {
+    if (req.headers.authorization) squat.auth++;
+    if (req.url.startsWith('/v1/ingest')) squat.ingest++;
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url.startsWith('/v1/hello')) return res.end(JSON.stringify({ v: 1, proof: '0'.repeat(64) }));
+    if (req.url === '/health') return res.end('{"ok":true,"version":"0.1.0"}');
+    res.statusCode = 202;
+    res.end('{"accepted":1}');
+  });
+  await new Promise((r) => squatter.listen(0, '127.0.0.1', r));
+  const SQ = squatter.address().port;
+  const SQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'gyeot-e2e-sq-'));
+  fs.writeFileSync(path.join(SQ_HOME, 'token'), TOKEN);
+  const sqEnv = { ...ENV, GYEOT_HOME: SQ_HOME, GYEOT_PORT: String(SQ), GYEOT_URL: `http://127.0.0.1:${SQ}` };
+  const sqHook = spawnSync(HOOK, ['claude-code'], { input: JSON.stringify({ ...common('sq', HOME, 'UserPromptSubmit'), prompt: 'deploy --env prod' }), env: sqEnv, timeout: 5000 });
+  const sqOpen = spawnSync(GYEOTD, ['--open', '--print'], { env: sqEnv, timeout: 10000 });
+  const sqSpool = fs.existsSync(path.join(SQ_HOME, 'spool')) ? fs.readdirSync(path.join(SQ_HOME, 'spool')).length : 0;
+  check('다른 서버가 포트를 잡으면 훅·--open이 토큰을 보내지 않음', squat.auth === 0 && squat.ingest === 0, `auth ${squat.auth}, ingest ${squat.ingest}`);
+  check('그때 훅은 exit 0·스풀에 남김, --open은 exit 1', sqHook.status === 0 && sqSpool > 0 && sqOpen.status === 1, `hook ${sqHook.status}, spool ${sqSpool}, open ${sqOpen.status}`);
+  squatter.close();
+
+  // 실제 데몬에서 --open --print: 주소만 출력
+  const openPrint = spawnSync(GYEOTD, ['--open', '--print'], { env: ENV, timeout: 10000 });
+  check('gyeotd --open --print → 부트 주소', openPrint.status === 0 && new RegExp(`^http://127\\.0\\.0\\.1:${PORT}/\\?boot=[0-9a-f]{64}`).test(openPrint.stdout.toString().trim()), openPrint.stdout.toString().trim().replace(/boot=[0-9a-f]+/, 'boot=…'));
 
   openStream();
   check('SSE 첫 snapshot', await seen('snapshot', (d) => Array.isArray(d.items)));
@@ -311,9 +359,9 @@ try {
   await waitFor(async () => (await raw('GET', '/health').catch(() => null))?.status === 200, 15000, 100);
   const after = (await api('GET', '/v1/state')).json.items.map((i) => `${i.session}:${i.kind}:${i.state}`).sort();
   check('재시작 뒤 같은 항목(재생)', JSON.stringify(before) === JSON.stringify(after), after.join(', '));
-  check('재시작 뒤에도 세션 쿠키 유효(sessions.json)', (await raw('GET', '/v1/state', { headers: { Cookie: `gyeot_session=${COOKIE}` } })).status === 200);
+  check('재시작 뒤에도 세션 열쇠 유효(sessions.json)', (await raw('GET', '/v1/state', { headers: { Authorization: `Bearer ${SESSION}` } })).status === 200);
   const sess = fs.readFileSync(path.join(HOME, 'sessions.json'), 'utf8');
-  check('sessions.json에 세션 값 원문이 없음(해시만)', !sess.includes(COOKIE));
+  check('sessions.json에 세션 값 원문이 없음(해시만)', !sess.includes(SESSION));
   const logs = fs.readdirSync(path.join(HOME, 'events'));
   const logText = logs.map((f) => fs.readFileSync(path.join(HOME, 'events', f), 'utf8')).join('');
   check('프롬프트 본문은 저장하지 않음', !logText.includes('테스트 하네스를 붙여 줘'));
@@ -415,11 +463,20 @@ async function shootFace(dir) {
   await send('Emulation.setDefaultBackgroundColorOverride', { color: { r: 226, g: 231, b: 238, a: 1 } });
 
   await send('Emulation.setDeviceMetricsOverride', { width: 420, height: 700, deviceScaleFactor: 2, mobile: false });
-  const bootShot = await api('POST', '/v1/boot');
+  const bootShot = await api('POST', '/v1/boot', {});
   await send('Page.navigate', { url: `${BASE}/?mode=overlay&boot=${bootShot.json?.code}` });
   await sleep(2500);
   const ovOk = await send('Runtime.evaluate', { expression: '!!document.querySelector(".ov-avatar")', returnByValue: true });
   check('실제 데몬에 붙은 얼굴(오버레이)이 그려짐', ovOk.result?.result?.value === true);
+  const keyState = await send('Runtime.evaluate', {
+    expression: 'JSON.stringify({ search: location.search, cookie: document.cookie, key: (JSON.parse(sessionStorage.getItem("gyeot.session") || "null") || {}).session || "" })',
+    returnByValue: true,
+  });
+  let ks = {};
+  try {
+    ks = JSON.parse(keyState.result?.result?.value ?? '{}');
+  } catch {}
+  check('얼굴: 주소에서 boot가 지워지고 다른 쿼리는 남음, 쿠키 없음, 열쇠는 sessionStorage', ks.search === '?mode=overlay' && ks.cookie === '' && /^[0-9a-f]{64}$/.test(ks.key ?? ''), `${ks.search} · cookie "${ks.cookie}"`);
   await shot('live-overlay.png');
   await send('Runtime.evaluate', { expression: 'document.querySelector(".ov-avatar")?.click()' });
   await sleep(900);

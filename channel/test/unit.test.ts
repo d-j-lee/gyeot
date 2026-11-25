@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { resolveBackoffUnitMs, resolveDaemonUrl, resolveDataDir, tokenPath } from '../src/config.js';
+import { helloProblem, helloProof } from '../src/daemon.js';
 import { backoffDelay } from '../src/link.js';
 import { SseParser, SseSizeError, type SseEvent } from '../src/sse.js';
 import { checkDecision, checkMessage, checkReply, clip, sanitizeMeta } from '../src/validate.js';
@@ -108,7 +109,11 @@ describe('GYEOT_URL', () => {
   });
 
   it('루프백 http만 받는다', () => {
-    expect(resolveDaemonUrl({ GYEOT_URL: 'http://localhost:5000/x' })).toEqual({ ok: true, origin: 'http://localhost:5000' });
+    // localhost는 127.0.0.1로 잇는다: 데몬은 127.0.0.1에만 묶인다(§7). localhost가 ::1로 풀리면 그 주소의 같은
+    // 포트를 잡은 서버가 127.0.0.1의 진짜 데몬으로 확인을 중계해 증명을 통과할 수 있다(포트가 같아서).
+    expect(resolveDaemonUrl({ GYEOT_URL: 'http://localhost:5000/x' })).toEqual({ ok: true, origin: 'http://127.0.0.1:5000' });
+    expect(resolveDaemonUrl({ GYEOT_URL: 'http://LOCALHOST:5000' })).toEqual({ ok: true, origin: 'http://127.0.0.1:5000' });
+    expect(resolveDaemonUrl({ GYEOT_URL: 'http://localhost' })).toEqual({ ok: true, origin: 'http://127.0.0.1' });
     for (const bad of ['https://127.0.0.1:1', 'http://example.com', 'http://192.168.0.2:47321', 'http://[::1]:1', '127.0.0.1:47321']) {
       expect(resolveDaemonUrl({ GYEOT_URL: bad }).ok, bad).toBe(false);
     }
@@ -167,5 +172,41 @@ describe('meta', () => {
     expect(
       sanitizeMeta({ chat_id: 'c', 'chat-id': 'x', 'a.b': 'y', kind: 'say', n: 1 as unknown as string, 한글: 'z', ok_1: 'v' }),
     ).toEqual({ chat_id: 'c', kind: 'say', ok_1: 'v' });
+  });
+});
+
+describe('데몬 확인(contracts §13.1)', () => {
+  const TOKEN = '0123456789abcdef'.repeat(4);
+  const N = 'ab'.repeat(32);
+  const body = (proof: unknown): unknown => ({ v: 1, proof });
+
+  it('증명은 공유 시험 값과 같다(HMAC-SHA256, 열쇠 = 토큰 UTF-8, 글 = "gyeot-hello/v1|<포트>|<n>")', () => {
+    expect(helloProof(TOKEN, 47321, N)).toBe('cb2a3490aa613ccf14c93af5162080aff69a29f105ef62e3ef4777d7f85bd4c5');
+    expect(helloProof(TOKEN, 47322, N)).toBe('c909b0dde49a2587904b41e63cd46b3faa9674ea124aa03d002b4b1235a683a1');
+  });
+
+  it('내 토큰·내가 연결한 포트·이번 난수의 증명만 받는다', () => {
+    const good = helloProof(TOKEN, 47321, N);
+    expect(helloProblem(body(good), TOKEN, 47321, N)).toBeUndefined();
+    expect(helloProblem(body(good.toUpperCase()), TOKEN, 47321, N)).toBeUndefined();
+    // 다른 포트(중계)·다른 토큰(다른 사용자)·다른 난수(옛 응답 되풀이)
+    expect(helloProblem(body(helloProof(TOKEN, 47322, N)), TOKEN, 47321, N)).toMatch(/맞지 않/);
+    expect(helloProblem(body(helloProof('f'.repeat(64), 47321, N)), TOKEN, 47321, N)).toMatch(/맞지 않/);
+    expect(helloProblem(body(helloProof(TOKEN, 47321, 'cd'.repeat(32))), TOKEN, 47321, N)).toMatch(/맞지 않/);
+    for (const bad of [
+      { v: 2, proof: good },
+      { proof: good },
+      { v: 1 },
+      body(good.slice(0, 63)),
+      body(`${good}0`),
+      body(`${good.slice(0, 63)}g`),
+      body(12),
+      { ok: true, version: '0.1.0' },
+      null,
+      '문자열',
+      [good],
+    ]) {
+      expect(helloProblem(bad, TOKEN, 47321, N), JSON.stringify(bad)).toBeTypeOf('string');
+    }
   });
 });

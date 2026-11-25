@@ -16,21 +16,93 @@ pub const SPOOL_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// 다른 쪽이 집어 간 채로 이만큼 지난 스풀 파일은 다시 집는다(그쪽이 죽었다고 본다).
 const STALE_CLAIM: Duration = Duration::from_secs(300);
 
-/// 데이터 폴더와 하위 폴더를 만든다. 스풀 폴더는 사용자 전용(Unix 0700, 계약 §12.5).
+/// 데이터 폴더 아래에서 곁이 쓰는 폴더(Unix 0700, 계약 §12.5·§13.4). `open`은 `gyeotd --open`이 쓴다.
+pub const PRIVATE_SUBDIRS: [&str; 3] = ["events", "spool", "open"];
+/// 데이터 폴더 바로 아래의 사용자 전용 파일(Unix 0600, 계약 §13.4).
+pub const PRIVATE_FILES: [&str; 5] = [
+    "token",
+    "sessions.json",
+    "learn.json",
+    "tails.json",
+    "gyeotd.log",
+];
+
+/// 데이터 폴더와 하위 폴더(`events`·`spool`)를 만들고, Unix에서는 이미 있던 것까지 사용자 전용으로
+/// 맞춘다(폴더 0700, 파일 0600, 계약 §12.5·§13.4). Windows는 `%LOCALAPPDATA%`의 권한을 이어받는다.
 pub fn ensure_dirs(home: &Path) -> Result<()> {
     for d in [home.to_path_buf(), home.join("events"), home.join("spool")] {
-        fs::create_dir_all(&d)
-            .with_context(|| format!("폴더 {}를 만들지 못했어요", d.display()))?;
+        create_private_dir(&d)?;
     }
+    secure_home(home);
+    Ok(())
+}
+
+/// 폴더를 만든다. Unix에서는 새로 만들 때부터 0700이고, 이미 있으면 0700으로 좁힌다(위 폴더는 그대로).
+pub fn create_private_dir(dir: &Path) -> Result<()> {
+    let ctx = || format!("폴더 {}를 만들지 못했어요", dir.display());
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let spool = home.join("spool");
-        if let Err(e) = fs::set_permissions(&spool, fs::Permissions::from_mode(0o700)) {
-            tracing::warn!("스풀 폴더 {} 권한을 좁히지 못했어요: {e}", spool.display());
+        use std::os::unix::fs::DirBuilderExt;
+        if !dir.is_dir() {
+            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent).with_context(ctx)?;
+            }
+            match fs::DirBuilder::new().mode(0o700).create(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+                Err(e) => return Err(e).with_context(ctx),
+            }
         }
+        set_mode(dir, 0o700);
     }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir).with_context(ctx)?;
     Ok(())
+}
+
+/// Unix: `path`가 링크가 아닌 진짜 폴더·파일이면 권한을 `mode`로 맞춘다(링크는 따라가지 않는다).
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    let ft = meta.file_type();
+    if !(ft.is_dir() || ft.is_file()) || meta.permissions().mode() & 0o7777 == mode {
+        return;
+    }
+    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+        tracing::warn!("{} 권한을 좁히지 못했어요: {e}", path.display());
+    }
+}
+
+/// 데이터 폴더에 이미 있는 것을 사용자 전용으로 맞춘다(Unix, 시작할 때). 폴더: 데이터 폴더와
+/// [`PRIVATE_SUBDIRS`]. 파일: [`PRIVATE_FILES`], `events/*.jsonl`, `spool/*`. 링크는 건너뛴다.
+/// 곁이 만들지 않는 다른 하위 폴더·파일은 건드리지 않는다.
+pub fn secure_home(home: &Path) {
+    #[cfg(unix)]
+    {
+        set_mode(home, 0o700);
+        for d in PRIVATE_SUBDIRS {
+            set_mode(&home.join(d), 0o700);
+        }
+        for f in PRIVATE_FILES {
+            set_mode(&home.join(f), 0o600);
+        }
+        let in_dir = |dir: &Path, pick: &dyn Fn(&str) -> bool| {
+            if let Ok(rd) = fs::read_dir(dir) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    if pick(&e.file_name().to_string_lossy()) {
+                        set_mode(&e.path(), 0o600);
+                    }
+                }
+            }
+        };
+        in_dir(&home.join("events"), &|n| n.ends_with(".jsonl"));
+        in_dir(&home.join("spool"), &|_| true);
+    }
+    #[cfg(not(unix))]
+    let _ = home;
 }
 
 fn is_valid_token(s: &str) -> bool {
@@ -166,9 +238,9 @@ impl LogSink {
     }
 }
 
-/// 쓰기 스레드를 띄운다. 모든 `LogSink`가 사라지면 남은 것을 쓰고 끝난다.
+/// 쓰기 스레드를 띄운다(로그 파일은 Unix 0600으로 만든다). 모든 `LogSink`가 사라지면 남은 것을 쓰고 끝난다.
 pub fn spawn_log_writer(dir: PathBuf) -> Result<(LogSink, std::thread::JoinHandle<()>)> {
-    fs::create_dir_all(&dir)?;
+    create_private_dir(&dir)?;
     let (tx, rx) = mpsc::channel::<LogCmd>();
     let handle = std::thread::Builder::new()
         .name("gyeot-log".into())
@@ -188,9 +260,14 @@ fn writer_loop(dir: &Path, rx: &mpsc::Receiver<LogCmd>) {
                         if let Some((_, f)) = current.as_mut() {
                             let _ = f.flush();
                         }
-                        current = OpenOptions::new()
-                            .create(true)
-                            .append(true)
+                        let mut opts = OpenOptions::new();
+                        opts.create(true).append(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            opts.mode(0o600);
+                        }
+                        current = opts
                             .open(dir.join(&file))
                             .map_err(|e| tracing::error!("로그 파일 {file}을 열지 못했어요: {e}"))
                             .ok()
@@ -441,22 +518,88 @@ mod tests {
     }
 
     #[test]
-    fn spool_dir_is_private() {
+    fn home_and_spool_dirs_are_private() {
         let d = tempfile::tempdir().unwrap();
-        let home = d.path().join("home");
+        let home = d.path().join("a").join("home");
         ensure_dirs(&home).unwrap();
         assert!(home.join("events").is_dir());
+        assert!(home.join("spool").is_dir());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let spool = home.join("spool");
             let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode(&spool), 0o700);
-            // 이미 있던 느슨한 폴더도 좁힌다
-            fs::set_permissions(&spool, fs::Permissions::from_mode(0o755)).unwrap();
+            for dir in [home.clone(), home.join("events"), home.join("spool")] {
+                assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+                // 이미 있던 느슨한 폴더도 좁힌다
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+                ensure_dirs(&home).unwrap();
+                assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+            }
+            // 위 폴더(사용자의 것)는 건드리지 않는다
+            fs::set_permissions(d.path().join("a"), fs::Permissions::from_mode(0o755)).unwrap();
             ensure_dirs(&home).unwrap();
-            assert_eq!(mode(&spool), 0o700);
+            assert_eq!(mode(&d.path().join("a")), 0o755);
         }
+    }
+
+    /// R3 L3·L4(계약 §13.4): 이미 있던 파일을 시작할 때 0600으로 맞춘다. 링크·모르는 파일은 건드리지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn existing_files_are_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        ensure_dirs(&home).unwrap();
+        fs::create_dir_all(home.join("open")).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let loose =
+            |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        let mut private = vec![
+            home.join("events/2026-11-25.jsonl"),
+            home.join("spool/1-2-3.json"),
+            home.join("spool/1-2-4.json.tmp"),
+        ];
+        private.extend(PRIVATE_FILES.iter().map(|f| home.join(f)));
+        for p in &private {
+            fs::write(p, "x").unwrap();
+            loose(p, 0o644);
+        }
+        let config = home.join("config.toml");
+        let other = home.join("events/readme.txt");
+        let outside = d.path().join("outside.jsonl");
+        for p in [&config, &other, &outside] {
+            fs::write(p, "x").unwrap();
+            loose(p, 0o644);
+        }
+        std::os::unix::fs::symlink(&outside, home.join("events/2026-11-24.jsonl")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("learn.json.link")).unwrap();
+        loose(&home.join("open"), 0o755);
+        ensure_dirs(&home).unwrap();
+        for p in &private {
+            assert_eq!(mode(p), 0o600, "{}", p.display());
+        }
+        assert_eq!(mode(&home.join("open")), 0o700);
+        assert_eq!(mode(&config), 0o644, "곁의 비밀이 아닌 사용자 파일");
+        assert_eq!(mode(&other), 0o644);
+        assert_eq!(mode(&outside), 0o644, "링크를 따라가지 않는다");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_logs_are_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let (sink, h) = spawn_log_writer(d.path().to_path_buf()).unwrap();
+        let day = 1_764_115_200_000;
+        sink.append(&ev(day), day);
+        sink.flush_blocking();
+        drop(sink);
+        h.join().unwrap();
+        let p = d.path().join("2025-11-26.jsonl");
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

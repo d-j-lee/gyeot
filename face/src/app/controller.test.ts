@@ -217,7 +217,7 @@ describe('낙관적 동작', () => {
     const { ctl: c2 } = setup({ focus: vi.fn(async () => Promise.reject(new ApiError(401, 'x'))) });
     await c2.setFocus(60);
     expect(c2.state.get().presence.focus_mode_until_ms).toBeNull();
-    expect(c2.toasts.get()[0]!.text).toContain('열쇠가 만료됐어요');
+    expect(c2.toasts.get()[0]!.text).toContain('열쇠가 없거나 만료됐어요');
   });
 });
 

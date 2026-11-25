@@ -143,7 +143,7 @@ impl TestServer {
         r.json()
     }
 
-    /// 쿠키만 붙인 요청(토큰 없음).
+    /// 쿠키만 붙인 요청(인증 머리 없음). 쿠키는 어떤 `/v1`도 열지 않아야 한다(G-030).
     pub async fn with_cookie(&self, method: &str, path: &str, cookie: &str) -> Resp {
         let c = format!("gyeot_session={cookie}");
         self.raw(
@@ -155,20 +155,66 @@ impl TestServer {
         .await
     }
 
-    /// 부트 코드로 세션을 열고 쿠키 값을 돌려준다.
+    /// `Authorization: Bearer <key>`(세션 열쇠 등)를 붙인 요청.
+    pub async fn with_key(&self, method: &str, path: &str, key: &str, body: Option<Value>) -> Resp {
+        let auth = format!("Bearer {key}");
+        let body = body.map(|b| b.to_string());
+        self.raw(
+            method,
+            path,
+            &[("Host", &self.host()), ("Authorization", &auth)],
+            body.as_deref().map(str::as_bytes),
+        )
+        .await
+    }
+
+    /// 인증 머리 없이 `POST /v1/session`.
+    pub async fn session_raw(&self, body: &[u8]) -> Resp {
+        self.raw("POST", "/v1/session", &[("Host", &self.host())], Some(body))
+            .await
+    }
+
+    /// 부트 코드를 `POST /v1/session`으로 바꿔 세션 열쇠를 돌려준다.
     pub async fn open_session(&self) -> String {
         let code = self.boot().await["code"].as_str().unwrap().to_owned();
         let r = self
-            .raw(
-                "GET",
-                &format!("/?boot={code}"),
-                &[("Host", &self.host())],
-                None,
-            )
+            .session_raw(serde_json::json!({ "code": code }).to_string().as_bytes())
             .await;
-        assert_eq!(r.status, 303, "{}", r.text());
-        cookie_of(&r).expect("Set-Cookie")
+        assert_eq!(r.status, 200, "{}", r.text());
+        r.json()["session"].as_str().expect("session").to_owned()
     }
+
+    /// 인증 머리 없이 `GET /v1/hello?n=<n>`.
+    pub async fn hello(&self, n: &str) -> Resp {
+        self.raw(
+            "GET",
+            &format!("/v1/hello?n={n}"),
+            &[("Host", &self.host())],
+            None,
+        )
+        .await
+    }
+}
+
+/// 응답에 `Set-Cookie`가 없다(R3 H1, G-030).
+pub fn assert_no_set_cookie(r: &Resp, what: &str) {
+    assert!(
+        r.headers.iter().all(|(k, _)| k != "set-cookie"),
+        "{what}: Set-Cookie가 있으면 안 됨 {:?}",
+        r.headers
+    );
+}
+
+/// 계약 §13.1의 hello 증명을 시험 쪽에서 따로 계산한다(서버 코드를 쓰지 않는다).
+pub fn expected_proof(token: &str, port: u16, n: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes()).unwrap();
+    mac.update(format!("gyeot-hello/v1|{port}|{n}").as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -398,13 +444,6 @@ impl Sse {
             }
         }
     }
-}
-
-/// `Set-Cookie: gyeot_session=<값>; …`의 값.
-pub fn cookie_of(r: &Resp) -> Option<String> {
-    let v = r.header("set-cookie")?;
-    let first = v.split(';').next()?.trim();
-    first.strip_prefix("gyeot_session=").map(str::to_owned)
 }
 
 pub fn hook(name: &str, session: &str, extra: Value) -> Value {

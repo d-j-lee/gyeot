@@ -24,6 +24,10 @@ tauri-plugin-global-shortcut = "2.4"
 tauri-plugin-autostart = "2.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 데몬 확인(docs/contracts.md §13.1): HMAC-SHA256 증명과 32바이트 난수. sha2·getrandom은 이미 Tauri가 쓰는 판.
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
 
 [dev-dependencies]
 # 시험에서 가짜 런타임으로 실제 capabilities(ACL)를 확인한다(src/acl_tests.rs).

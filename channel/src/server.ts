@@ -165,6 +165,8 @@ function daemonToolError(err: unknown, client: DaemonClient): CallToolResult {
   if (err instanceof DaemonError) {
     switch (err.kind) {
       case 'unreachable':
+      case 'not_daemon':
+        // 확인에 실패한 서버는 데몬이 없는 것과 같이 다룬다(§13.1). 토큰도 페이로드도 보내지 않았다.
         return toolError(`곁 데몬에 닿지 않음: ${err.message}`);
       case 'unauthorized':
         return toolError(`곁 데몬이 토큰을 받지 않음: 토큰 파일(${client.tokenFile})이 데몬의 것과 같은지 확인하세요`);

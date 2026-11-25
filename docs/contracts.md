@@ -269,7 +269,7 @@ cwd = "C:/work/proj"
 | `proposal` | `Proposal` |
 | `sessions` | `[Session]` |
 
-15초마다 주석 줄(`: ping`)을 보낸다.
+15초마다 주석 줄(`: ping`)을 보낸다. 응답 머리는 `Content-Type: text/event-stream`이다. 얼굴은 `fetch` 스트림으로 읽고(`Authorization` 머리), 45초 동안 아무것도 받지 못하면 끊긴 것으로 보고 다시 잇는다.
 
 ## 9. 훅 심 (`gyeot-hook`)
 
