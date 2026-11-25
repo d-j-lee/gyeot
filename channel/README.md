@@ -88,12 +88,12 @@ stdout에는 MCP 프로토콜만 쓴다. 기록은 모두 stderr로 간다(Claud
 
 ```
 npm ci
-npm run typecheck   # tsc --noEmit (Node 20 타입으로 검사)
+npm run typecheck   # tsc --noEmit (Node 22 타입으로 검사)
 npm test            # 빌드 → vitest(단위 + 묶은 파일을 띄우는 통합 시험)
 npm run build       # dist/gyeot-channel.mjs (라이선스 고지는 파일 끝 주석)
 ```
 
-- 개발·시험에는 Node.js 22.12 이상이 필요하다(vitest). 묶은 파일은 Node 20 이상에서 돈다.
+- 개발·시험과 실행 모두 Node.js 22 이상(LTS)을 쓴다. Node 20은 2026-04에 지원이 끝났다.
   다른 node로 channel을 띄워 시험하려면 `GYEOT_TEST_NODE=<node 경로> npx vitest run`.
 - `zod`는 MCP SDK의 peer 의존성이라 함께 둔다.
 - 구조: `src/main.ts`(연결·종료), `src/server.ts`(capability·도구), `src/link.ts`(등록·스트림·재연결), `src/sse.ts`(SSE 해석기), `src/daemon.ts`(데몬 HTTP), `src/config.ts`(경로·주소), `src/validate.ts`(입력 검사), `src/instructions.ts`(Claude에게 주는 안내문).

@@ -27,7 +27,10 @@ pub fn resolve_home(env: &HomeEnv) -> Option<PathBuf> {
     if env.windows {
         return nonempty(&env.local_app_data).map(|p| p.join("gyeot"));
     }
-    if let Some(x) = nonempty(&env.xdg_state_home).filter(|p| p.is_absolute()) {
+    // 판단은 실행 중인 OS가 아니라 넘겨받은 플랫폼(`windows=false` = Unix)을 따른다.
+    // 그래야 같은 입력이 어느 호스트(Windows·wasm)에서든 같은 결과를 낸다.
+    let unix_absolute = |p: &PathBuf| p.to_string_lossy().starts_with('/');
+    if let Some(x) = nonempty(&env.xdg_state_home).filter(unix_absolute) {
         return Some(x.join("gyeot"));
     }
     nonempty(&env.home_dir).map(|h| h.join(".local").join("state").join("gyeot"))

@@ -50,7 +50,7 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
 |---|---|---|
 | 코어·서버·데몬·훅 심 | Linux, `cargo test --workspace` | 173 통과. clippy `-D warnings` 0건, wasm32 빌드 확인 |
 | 얼굴 | Linux, vitest | 192 통과. 색 대비 WCAG AA 시험 포함 |
-| channel | Linux, vitest(묶은 파일을 실제로 띄움) | 44 통과. Node 20·22 |
+| channel | Linux, vitest(묶은 파일을 실제로 띄움) | 44 통과. Node 22 |
 | 셸 | Linux(WebKitGTK), cargo test | 41 통과. IPC 권한(ACL) 시험 포함. Windows 대상 clippy 0건 |
 | 설치 스크립트 | pwsh 7.4 | 87 통과 |
 | **끝-끝(가짜 없음)** | Linux, `tests/e2e/e2e.mjs` | 39/39. 실제 데몬·훅 심·channel·얼굴(Chrome)을 이음 |

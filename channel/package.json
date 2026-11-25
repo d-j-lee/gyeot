@@ -5,7 +5,7 @@
   "description": "곁(gyeot) Claude Code channel — MCP stdio 서버",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "build": "node build.mjs",
@@ -17,7 +17,7 @@
     "zod": "4.6.7"
   },
   "devDependencies": {
-    "@types/node": "20.19.43",
+    "@types/node": "22.20.7",
     "esbuild": "0.28.2",
     "typescript": "5.9.3",
     "vitest": "5.1.2"

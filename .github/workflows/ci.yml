@@ -43,7 +43,7 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
       - name: gyeot-core wasm 빌드 확인
         if: runner.os == 'Linux'
         run: |
