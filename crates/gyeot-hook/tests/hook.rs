@@ -1,11 +1,165 @@
-//! 만든 `gyeot-hook` 실행 파일을 띄워 본다: 데몬 없음(스풀), 진짜 데몬(전달·스풀 비우기).
+//! 만든 `gyeot-hook` 실행 파일을 띄워 본다: 데몬 없음(스풀), 가짜 데몬(데몬 확인 §13.1), 진짜 데몬(전달·스풀 비우기).
 
+use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
+use sha2::Sha256;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+// ───────────────────── 가짜 데몬(계약 §13.1) ─────────────────────
+
+/// 가짜 데몬이 `GET /v1/hello`에 어떻게 답하나.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hello {
+    /// 같은 토큰·자기 포트로 계산한 proof(곁 데몬).
+    Good,
+    /// 다른 토큰으로 계산한 proof(다른 사용자의 데몬).
+    WrongToken,
+    /// 다른 포트로 계산한 proof(다른 포트의 진짜 데몬으로 중계하는 서버).
+    OtherPort,
+    /// `404`(곁이 아닌 프로그램, 또는 확인을 모르는 옛 서버).
+    NotFound,
+    /// `200`이지만 JSON이 아님.
+    Garbage,
+    /// 연결만 받고 답하지 않음.
+    Stall,
+}
+
+/// 가짜 데몬이 받은 요청 하나.
+#[derive(Debug, Clone)]
+struct Seen {
+    /// 요청줄(`GET /v1/hello?n=… HTTP/1.1`).
+    line: String,
+    /// `Authorization` 머리가 있었나.
+    auth: bool,
+    body: String,
+}
+
+struct FakeDaemon {
+    port: u16,
+    seen: Arc<Mutex<Vec<Seen>>>,
+}
+
+impl FakeDaemon {
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+/// 계약 §13.1의 proof(시험 쪽에서 따로 계산한다).
+fn hello_proof(token: &str, port: u16, n: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).unwrap();
+    mac.update(format!("gyeot-hello/v1|{port}|{n}").as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 요청 하나를 읽는다: (요청줄, 머리 줄들, 본문).
+fn read_request(s: &mut TcpStream) -> Option<(String, Vec<String>, Vec<u8>)> {
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 65536];
+    loop {
+        let n = s.read(&mut tmp).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&buf[..at]).into_owned();
+        let mut lines = head.split("\r\n").map(str::to_owned);
+        let line = lines.next().unwrap_or_default();
+        let headers: Vec<String> = lines.collect();
+        let len = headers
+            .iter()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        while buf.len() < at + 4 + len {
+            let n = s.read(&mut tmp).ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        return Some((line, headers, buf[at + 4..at + 4 + len].to_vec()));
+    }
+}
+
+fn respond(s: &mut TcpStream, status: &str, body: &str) {
+    let _ = write!(
+        s,
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+}
+
+/// 진짜 `TcpListener`로 만든 작은 가짜 데몬. 연결마다 실을 하나 띄운다(시험이 끝나면 프로세스와 함께 사라진다).
+fn fake_daemon(token: &str, mode: Hello) -> FakeDaemon {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (token, log) = (token.to_owned(), seen.clone());
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            let (token, log) = (token.clone(), log.clone());
+            std::thread::spawn(move || {
+                let Some((line, headers, body)) = read_request(&mut s) else {
+                    return;
+                };
+                let auth = headers.iter().any(|h| {
+                    h.split_once(':')
+                        .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
+                });
+                log.lock().unwrap().push(Seen {
+                    line: line.clone(),
+                    auth,
+                    body: String::from_utf8_lossy(&body).into_owned(),
+                });
+                if let Some(rest) = line.strip_prefix("GET /v1/hello?n=") {
+                    let n = rest.split(' ').next().unwrap_or("");
+                    let ok = |p: String| json!({"v": 1, "proof": p}).to_string();
+                    match mode {
+                        Hello::Good => respond(&mut s, "200 OK", &ok(hello_proof(&token, port, n))),
+                        Hello::WrongToken => {
+                            respond(&mut s, "200 OK", &ok(hello_proof(&"f".repeat(64), port, n)))
+                        }
+                        Hello::OtherPort => respond(
+                            &mut s,
+                            "200 OK",
+                            &ok(hello_proof(&token, port.wrapping_add(1), n)),
+                        ),
+                        Hello::NotFound => respond(&mut s, "404 Not Found", "{}"),
+                        Hello::Garbage => respond(&mut s, "200 OK", "hello"),
+                        Hello::Stall => std::thread::sleep(Duration::from_secs(3)),
+                    }
+                } else if line.starts_with("POST /v1/ingest/") {
+                    respond(&mut s, "202 Accepted", r#"{"accepted":1}"#);
+                } else {
+                    respond(&mut s, "404 Not Found", "{}");
+                }
+            });
+        }
+    });
+    FakeDaemon { port, seen }
+}
 
 fn hook_cmd(home: &Path, url: &str) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_gyeot-hook"));
@@ -212,40 +366,9 @@ fn spooled_payload_is_sanitized_and_private() {
 #[test]
 fn sent_payload_is_sanitized() {
     let d = tempfile::tempdir().unwrap();
-    std::fs::write(d.path().join("token"), "a".repeat(64)).unwrap();
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = l.local_addr().unwrap().port();
-    let server = std::thread::spawn(move || {
-        let (mut s, _) = l.accept().unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 65536];
-        loop {
-            let n = s.read(&mut tmp).unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            let text = String::from_utf8_lossy(&buf).into_owned();
-            if let Some(at) = text.find("\r\n\r\n") {
-                let len = text[..at]
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    })
-                    .unwrap_or(0);
-                if buf.len() >= at + 4 + len {
-                    let _ = s.write_all(
-                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                    );
-                    return String::from_utf8_lossy(&buf[at + 4..at + 4 + len]).into_owned();
-                }
-            }
-        }
-        String::new()
-    });
+    let token = "a".repeat(64);
+    std::fs::write(d.path().join("token"), &token).unwrap();
+    let fake = fake_daemon(&token, Hello::Good);
     let input = json!({
         "session_id": "s1",
         "transcript_path": "/t.jsonl",
@@ -254,16 +377,21 @@ fn sent_payload_is_sanitized() {
         "last_assistant_message": format!("끝났어요. 키는 {SECRET} 입니다."),
         "stop_hook_active": false,
     });
-    let url = format!("http://127.0.0.1:{port}");
     let (out, _) = run_hook(
         d.path(),
-        &url,
+        &fake.url(),
         &["claude-code"],
         input.to_string().as_bytes(),
     );
     assert_eq!(out.status.code(), Some(0));
-    let body = server.join().unwrap();
-    let v: Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    let seen = fake.seen();
+    let ingest: Vec<&Seen> = seen
+        .iter()
+        .filter(|r| r.line.starts_with("POST /v1/ingest/claude-code "))
+        .collect();
+    assert_eq!(ingest.len(), 1, "{seen:?}");
+    let body = &ingest[0].body;
+    let v: Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"));
     assert_eq!(
         v["payload"],
         json!({
@@ -274,6 +402,120 @@ fn sent_payload_is_sanitized() {
         })
     );
     assert!(spool_files(d.path()).is_empty());
+}
+
+/// R3 M2(계약 §13.1, G-032): 그 포트의 서버가 같은 토큰을 안다고 증명하지 못하면 토큰도 페이로드도
+/// 보내지 않고 스풀에 남긴다(다른 사용자의 서버·다른 포트로 중계하는 서버·곁이 아닌 프로그램).
+#[test]
+fn unproven_server_gets_no_token_and_payload_is_spooled() {
+    let token = "a".repeat(64);
+    for mode in [
+        Hello::WrongToken,
+        Hello::OtherPort,
+        Hello::NotFound,
+        Hello::Garbage,
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("token"), &token).unwrap();
+        let fake = fake_daemon(&token, mode);
+        let (out, took) = run_hook(d.path(), &fake.url(), &["claude-code"], &notification("s1"));
+        assert_eq!(out.status.code(), Some(0), "{mode:?}");
+        assert!(out.stdout.is_empty(), "{mode:?}");
+        assert!(took < Duration::from_secs(3), "{mode:?} took {took:?}");
+        let seen = fake.seen();
+        assert!(
+            seen.iter().any(|r| r.line.starts_with("GET /v1/hello?n=")),
+            "{mode:?}: 확인 요청이 없다 {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|r| !r.auth),
+            "{mode:?}: Authorization 머리가 나갔다 {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|r| !r.line.starts_with("POST")),
+            "{mode:?}: ingest가 나갔다 {seen:?}"
+        );
+        let files = spool_files(d.path());
+        assert_eq!(files.len(), 1, "{mode:?}: {files:?}");
+        let v: Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(v["payload"]["session_id"], "s1", "{mode:?}");
+        assert_eq!(v["source"], "claude-code", "{mode:?}");
+    }
+}
+
+/// 맞는 proof를 주면 보낸다. 확인 요청에는 인증 머리가 없고, n은 32바이트 난수(hex 64자)다.
+/// 성공한 뒤에는 남은 스풀도 이어서 보낸다.
+#[test]
+fn proven_server_gets_payload_and_spool_is_drained() {
+    let d = tempfile::tempdir().unwrap();
+    let token = "a".repeat(64);
+    std::fs::write(d.path().join("token"), &token).unwrap();
+    std::fs::create_dir_all(d.path().join("spool")).unwrap();
+    let old = json!({"source": "codex-notify", "payload": {"type": "agent-turn-complete", "thread-id": "old"}, "pid_hint": 1, "received_ms": 1});
+    std::fs::write(d.path().join("spool").join("1-1-0.json"), old.to_string()).unwrap();
+    let fake = fake_daemon(&token, Hello::Good);
+    let (out, took) = run_hook(d.path(), &fake.url(), &["claude-code"], &notification("s1"));
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+    let seen = fake.seen();
+    let hellos: Vec<&Seen> = seen
+        .iter()
+        .filter(|r| r.line.starts_with("GET /v1/hello?n="))
+        .collect();
+    assert_eq!(hellos.len(), 1, "프로세스마다 한 번 {seen:?}");
+    assert!(!hellos[0].auth, "확인 요청에는 토큰을 싣지 않는다");
+    let n = hellos[0].line["GET /v1/hello?n=".len()..]
+        .split(' ')
+        .next()
+        .unwrap();
+    assert_eq!(n.len(), 64, "{n}");
+    assert!(
+        n.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{n}"
+    );
+    let posts: Vec<&Seen> = seen.iter().filter(|r| r.line.starts_with("POST")).collect();
+    assert_eq!(posts.len(), 2, "{seen:?}");
+    assert!(posts.iter().all(|r| r.auth));
+    assert!(posts[0].line.starts_with("POST /v1/ingest/claude-code "));
+    assert!(posts[1].line.starts_with("POST /v1/ingest/codex-notify "));
+    assert!(
+        spool_files(d.path()).is_empty(),
+        "{:?}",
+        spool_files(d.path())
+    );
+    // 다음 프로세스는 다시 확인한다(n도 새로)
+    run_hook(d.path(), &fake.url(), &["claude-code"], &notification("s2"));
+    let hellos: Vec<String> = fake
+        .seen()
+        .iter()
+        .filter(|r| r.line.starts_with("GET /v1/hello?n="))
+        .map(|r| r.line.clone())
+        .collect();
+    assert_eq!(hellos.len(), 2);
+    assert_ne!(hellos[0], hellos[1]);
+}
+
+/// 확인에 답하지 않는 서버: 기존 400ms 통신 한도 안에서 끝내고 스풀에 남긴다(토큰은 나가지 않는다).
+#[test]
+fn stalled_hello_keeps_the_net_budget() {
+    let d = tempfile::tempdir().unwrap();
+    let token = "a".repeat(64);
+    std::fs::write(d.path().join("token"), &token).unwrap();
+    let fake = fake_daemon(&token, Hello::Stall);
+    let (out, took) = run_hook(d.path(), &fake.url(), &["claude-code"], &notification("s1"));
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    // 400ms 통신 한도 + 프로세스 띄우기·stdin·스풀 쓰기
+    assert!(took < Duration::from_millis(1200), "took {took:?}");
+    assert!(
+        took >= Duration::from_millis(350),
+        "확인을 기다리긴 했다: {took:?}"
+    );
+    let seen = fake.seen();
+    assert!(seen.iter().all(|r| !r.auth), "{seen:?}");
+    assert_eq!(spool_files(d.path()).len(), 1);
 }
 
 /// 1 MiB가 넘는 stdin도 끝까지 읽어 버린다(호스트가 EPIPE를 받지 않는다).

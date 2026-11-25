@@ -4,7 +4,7 @@
 //! 정규화 결과는 원본과 같아야 한다(시험이 지킨다).
 
 use crate::event::Source;
-use crate::normalize::PREVIEW_MAX;
+use crate::normalize::{PREVIEW_MAX, agent_id_of, batch_tool_names};
 use crate::text::{collapse_ws, mask, truncate_chars};
 use serde_json::{Map, Value};
 
@@ -27,6 +27,8 @@ const TOOL_PREVIEW_KEYS: [&str; 9] = [
 /// `source`의 원본 페이로드를 정규화에 필요한 만큼만 남긴다.
 ///
 /// - 식별자(`session_id`·`cwd`·`hook_event_name`·`type`·`thread-id` 등)는 그대로 둔다.
+///   하위 에이전트 `agent_id`는 모든 훅 이벤트에서 128자까지 남긴다(§13.2).
+/// - `PostToolBatch`의 `tool_calls`는 도구 이름이 있는 앞 64개만 `[{"tool_name"}]`으로 남긴다(§13.2).
 /// - `prompt`는 글자 수가 같은 `x` 문자열로 바꾼다(정규화는 길이만 쓴다).
 /// - 미리보기로만 쓰는 글은 마스킹 → 공백 접기 → 4,000자 자르기. 미리보기(≤300자)는 원본과 같다.
 /// - 마지막 응답(`last_assistant_message`)은 줄 구조가 질문 판단에 쓰이므로 접지 않고 마스킹만 한다.
@@ -152,6 +154,9 @@ fn hook(o: &Map<String, Value>) -> Value {
     for k in ["session_id", "cwd", "hook_event_name"] {
         copy_str(o, &mut out, k);
     }
+    if let Some(a) = agent_id_of(o) {
+        out.insert("agent_id".into(), Value::String(a));
+    }
     let name = o
         .get("hook_event_name")
         .and_then(Value::as_str)
@@ -208,8 +213,26 @@ fn hook(o: &Map<String, Value>) -> Value {
             copy_clean(o, out_ref, "tool_name");
             copy_text_of(o, out_ref, "error");
         }
-        "PreToolUse" | "PostToolUse" | "PostToolBatch" | "UserPromptExpansion" => {
+        "PreToolUse" | "PostToolUse" | "UserPromptExpansion" => {
             copy_clean(o, out_ref, "tool_name");
+        }
+        "PostToolBatch" => {
+            copy_clean(o, out_ref, "tool_name");
+            let names = batch_tool_names(o);
+            if !names.is_empty() {
+                let calls = names
+                    .into_iter()
+                    .map(|n| {
+                        let mut c = Map::new();
+                        c.insert(
+                            "tool_name".into(),
+                            Value::String(clean(n, SANITIZED_STR_MAX)),
+                        );
+                        Value::Object(c)
+                    })
+                    .collect();
+                out_ref.insert("tool_calls".into(), Value::Array(calls));
+            }
         }
         "TaskCompleted" => {
             copy_clean(o, out_ref, "task_subject");
@@ -301,6 +324,9 @@ fn custom(o: &Map<String, Value>) -> Value {
     {
         out.insert("agent".into(), a.clone());
     }
+    if let Some(a) = agent_id_of(o) {
+        out.insert("agent_id".into(), Value::String(a));
+    }
     if let Some(d) = o.get("detail") {
         out.insert("detail".into(), clean_deep(d));
     }
@@ -384,6 +410,35 @@ mod tests {
                 ),
             ),
             (cc, hook("UserPromptSubmit", json!({"prompt": 5}))),
+            // R3 L3(§13.4): 일반 키=값 비밀
+            (
+                cc,
+                hook(
+                    "PermissionRequest",
+                    json!({"tool_name": "Bash", "tool_input": {"command": "DB_PASSWORD=hunter2kv npm start && psql \"password=hunter2kv host=db\""}}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "Notification",
+                    json!({"notification_type": "permission_prompt", "message": "Claude needs your permission: password=hunter2kv"}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "Stop",
+                    json!({"last_assistant_message": "설정했어요.\ntoken: tok_live_hunter2kv\n\n이대로 둘까요?"}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PermissionRequest",
+                    json!({"tool_name": "mcp__db__connect", "tool_input": {"user": "me", "api_key": "hunter2kv"}}),
+                ),
+            ),
             (
                 cc,
                 hook(
@@ -613,6 +668,72 @@ mod tests {
                 ),
             ),
             (cc, hook("PostToolBatch", json!({}))),
+            // 계약 §13.2: 하위 에이전트(agent_id)와 PostToolBatch의 도구 이름 목록
+            (
+                cc,
+                hook(
+                    "PostToolBatch",
+                    json!({"agent_id": "agent-a2", "agent_type": "Explore", "tool_calls": [
+                        {"tool_name": "Read", "tool_use_id": "toolu_1",
+                         "tool_input": {"file_path": "/w/.env"},
+                         "tool_response": "비밀 파일 내용"},
+                        {"tool_use_id": "toolu_x", "tool_input": {"command": "비밀"}},
+                        {"tool_name": 5},
+                        {"tool_name": "  "},
+                        "비밀",
+                        {"tool_name": "Bash", "tool_response": {"stdout": "비밀"}},
+                        {"tool_name": "Read"}
+                    ]}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolBatch",
+                    json!({"tool_calls": (0..100).map(|i| json!({"tool_name": format!("T{}", i % 70), "tool_input": {"x": "비밀"}})).collect::<Vec<_>>()}),
+                ),
+            ),
+            (cc, hook("PostToolBatch", json!({"tool_calls": "비밀"}))),
+            (cc, hook("PostToolBatch", json!({"tool_calls": []}))),
+            (
+                cc,
+                hook(
+                    "PermissionRequest",
+                    json!({"agent_id": "agent-a1", "tool_name": "Bash", "tool_input": {"command": "git push origin +main"}}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "Notification",
+                    json!({"agent_id": "agent-a1", "notification_type": "permission_prompt", "message": "m"}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolUseFailure",
+                    json!({"agent_id": format!("{}  {}", "a".repeat(127), "b".repeat(300)), "tool_name": "Bash", "error": "x"}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolUse",
+                    json!({"agent_id": "  ", "tool_name": "Read"}),
+                ),
+            ),
+            (
+                cc,
+                hook("PostToolUse", json!({"agent_id": 12, "tool_name": "Read"})),
+            ),
+            (
+                cc,
+                hook(
+                    "SubagentStop",
+                    json!({"agent_id": "agent-a1", "agent_type": "Explore", "agent_transcript_path": "/t/비밀.jsonl"}),
+                ),
+            ),
             (
                 cc,
                 hook(
@@ -667,6 +788,7 @@ mod tests {
             (Source::Custom, json!({"kind": "turn_failed", "session": "c1", "cwd": "/w", "agent": "codex", "detail": {"error_type": format!("boom {SECRET}")}})),
             (Source::Custom, json!({"kind": "turn_done", "session": "c1", "detail": {"last_message": "a\n\nb?", "asks_question": true, "human_followup": false}})),
             (Source::Custom, json!({"kind": "user_action", "detail": {"item": "x", "action": "done"}})),
+            (Source::Custom, json!({"kind": "activity", "session": "c1", "agent_id": " a9 ", "detail": {"tools": ["Read", "  ", "Read", format!("Bash {SECRET}")]}})),
             (Source::Custom, json!({"kind": "nope"})),
             (Source::AokHarness, json!({"t": 1764126700.5, "event": "stop", "result": "fail", "cwd": "C:/work/proj"})),
             (Source::FsmapHarness, json!({"t": 1764126700, "event": "gate", "session": "abc123", "result": "block", "ms": 812})),
@@ -701,8 +823,16 @@ mod tests {
                 "transcript_path",
                 "permission_mode",
                 "user:pw@",
+                "hunter2kv",
             ] {
                 assert!(!text.contains(bad), "{bad} 남음: {src:?} {text}");
+            }
+            // 이벤트 로그에 쓰는 정규화 결과에도 남지 않는다
+            for ev in normalize(src, &raw, T, None) {
+                let line = serde_json::to_string(&ev).unwrap();
+                for bad in [SECRET, "hunter2kv"] {
+                    assert!(!line.contains(bad), "{bad} 이벤트에 남음: {line}");
+                }
             }
             let mut strs = Vec::new();
             walk_strings(&clean, &mut strs);
@@ -714,6 +844,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 계약 §13.2: `agent_id`(128자)는 모든 이벤트에서, `tool_calls`는 PostToolBatch에서 `[{"tool_name"}]`(64개)만.
+    #[test]
+    fn keeps_agent_id_and_batch_tool_names_only() {
+        let raw = hook(
+            "PostToolBatch",
+            json!({"agent_id": "agent-a2", "agent_type": "Explore", "tool_calls": [
+                {"tool_name": "Read", "tool_use_id": "toolu_1", "tool_input": {"file_path": "/w/.env"}, "tool_response": "비밀"},
+                {"tool_use_id": "toolu_2"},
+                {"tool_name": "Bash", "tool_response": {"stdout": "비밀"}}
+            ]}),
+        );
+        assert_eq!(
+            sanitize_payload(Source::ClaudeCode, &raw),
+            json!({
+                "session_id": "abc123",
+                "cwd": "C:\\work\\proj",
+                "hook_event_name": "PostToolBatch",
+                "agent_id": "agent-a2",
+                "tool_calls": [{"tool_name": "Read"}, {"tool_name": "Bash"}],
+            })
+        );
+        let calls: Vec<Value> = (0..100)
+            .map(|i| json!({"tool_name": format!("T{i}"), "tool_input": {"x": i}}))
+            .collect();
+        let clean = sanitize_payload(
+            Source::ClaudeCode,
+            &hook("PostToolBatch", json!({ "tool_calls": calls })),
+        );
+        let kept = clean["tool_calls"].as_array().unwrap();
+        assert_eq!(kept.len(), 64);
+        assert_eq!(kept[63], json!({"tool_name": "T63"}));
+        // 다른 이벤트에서는 tool_calls를 남기지 않는다. agent_id는 남긴다(128자까지)
+        let raw = hook(
+            "PostToolUse",
+            json!({"agent_id": "x".repeat(300), "tool_name": "Read", "tool_calls": [{"tool_name": "Bash"}]}),
+        );
+        let clean = sanitize_payload(Source::ClaudeCode, &raw);
+        assert!(clean.get("tool_calls").is_none(), "{clean}");
+        assert_eq!(clean["agent_id"], "x".repeat(128));
+        let raw = hook(
+            "Notification",
+            json!({"agent_id": "a1", "notification_type": "permission_prompt", "message": "m"}),
+        );
+        assert_eq!(sanitize_payload(Source::ClaudeCode, &raw)["agent_id"], "a1");
     }
 
     #[test]

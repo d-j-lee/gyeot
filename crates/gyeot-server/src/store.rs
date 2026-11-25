@@ -490,11 +490,15 @@ mod tests {
             ts_ms: ts,
             source: Source::ClaudeCode,
             agent: None,
+            agent_id: None,
             session: Some("s".into()),
             cwd: None,
             pid_hint: None,
             raw_event: None,
-            body: EventBody::Activity { tool: None },
+            body: EventBody::Activity {
+                tool: None,
+                tools: Vec::new(),
+            },
         }
     }
 

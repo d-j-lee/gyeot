@@ -309,6 +309,21 @@ impl Sessions {
 mod tests {
     use super::*;
 
+    /// 셸·channel 시험과 같은 공유 값(계약 §13.1). 부품끼리 식이 어긋나면 여기서 깨진다.
+    #[test]
+    fn hello_proof_matches_shared_vectors() {
+        let token = "0123456789abcdef".repeat(4);
+        let n = "ab".repeat(32);
+        assert_eq!(
+            hello_proof(&token, 47321, &n),
+            "cb2a3490aa613ccf14c93af5162080aff69a29f105ef62e3ef4777d7f85bd4c5"
+        );
+        assert_eq!(
+            hello_proof(&token, 47322, &n),
+            "c909b0dde49a2587904b41e63cd46b3faa9674ea124aa03d002b4b1235a683a1"
+        );
+    }
+
     const T: i64 = 1_764_126_720_000;
 
     fn hex(c: char) -> String {

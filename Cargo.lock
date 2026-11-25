@@ -303,9 +303,12 @@ name = "gyeot-hook"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "getrandom",
  "gyeot-core",
  "gyeot-server",
+ "hmac",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "ureq",

@@ -11,6 +11,9 @@ struct Masker {
     url_cred: Regex,
     bearer: Regex,
     tokens: Regex,
+    secret_kv: Regex,
+    secret_word: Regex,
+    not_secret: Regex,
 }
 
 fn masker() -> &'static Masker {
@@ -34,17 +37,74 @@ fn masker() -> &'static Masker {
             r"|\bAIza[0-9A-Za-z_\-]{20,}",
         ))
         .expect("token regex"),
+        // 계약 §13.4: 키 이름에 비밀 낱말이 든 `키=값`·`키: 값`. 공백은 모두 `\s`로 본다(공백 접기 전후가 같게).
+        // 값은 따옴표 묶음(닫는 따옴표가 잘려 없으면 끝까지) 또는 공백 전까지.
+        secret_kv: Regex::new(concat!(
+            r"(?i)(?P<k>[A-Za-z0-9_\-]*(?:pass|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key)[A-Za-z0-9_\-]*)",
+            r#"(?P<sep>["']?\s*[:=]\s*)"#,
+            r#"(?P<v>"(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|\S+)"#,
+        ))
+        .expect("secret key-value regex"),
+        secret_word: Regex::new(
+            r"(?i)pass|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key",
+        )
+        .expect("secret word regex"),
+        // 비밀 낱말을 품었지만 비밀이 아닌 흔한 이름(셈·한도·우회 등).
+        not_secret: Regex::new(concat!(
+            r"(?i)(?:by|com|sur|tres|over|under)pass",
+            r"|pass(?:ed|es|ing|age|through|thru)",
+            r"|tokens|tokeni[sz]",
+            r"|token[_\-]?(?:count|limit|budget|usage|type)",
+        ))
+        .expect("not-secret regex"),
     })
 }
 
-/// 비밀처럼 보이는 것을 [`MASK`]로 바꾼다(계약 §2.4).
+/// 비밀처럼 보이는 것을 [`MASK`]로 바꾼다(계약 §2.4, §13.4). 두 번 가려도 같다.
 pub fn mask(s: &str) -> String {
     let m = masker();
     let s = m.private_key.replace_all(s, MASK);
     let s = m.url_cred.replace_all(&s, "${scheme}[가림]@");
     let s = m.bearer.replace_all(&s, "${b}[가림]");
     let s = m.tokens.replace_all(&s, MASK);
-    s.into_owned()
+    mask_secret_kv(m, &s)
+}
+
+/// 키 이름이 비밀 낱말을 품었는가(흔한 거짓 양성 이름을 지운 뒤에도 남는가).
+fn is_secret_key(m: &Masker, key: &str) -> bool {
+    m.secret_word
+        .is_match(&m.not_secret.replace_all(key, "\u{1f}"))
+}
+
+/// `키=값`·`키: 값`의 값을 가린다. 비밀 키가 아니면(거짓 양성) 값 자리부터 다시 찾는다.
+fn mask_secret_kv(m: &Masker, s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at <= s.len() {
+        let Some(c) = m.secret_kv.captures_at(s, at) else {
+            break;
+        };
+        let (Some(k), Some(sep), Some(v)) = (c.name("k"), c.name("sep"), c.name("v")) else {
+            break;
+        };
+        // `Token::new` 같은 경로 표기는 키=값이 아니다.
+        let path_sep = sep.as_str().trim_end().ends_with(':') && v.as_str().starts_with(':');
+        if path_sep || !is_secret_key(m, k.as_str()) {
+            at = v.start();
+            continue;
+        }
+        out.push_str(&s[copied..v.start()]);
+        out.push_str(match v.as_str().chars().next() {
+            Some('"') => "\"[가림]\"",
+            Some('\'') => "'[가림]'",
+            _ => MASK,
+        });
+        copied = v.end();
+        at = v.end();
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 /// 연속한 공백(줄바꿈 포함)을 한 칸으로 접고 앞뒤 공백을 지운다.
@@ -166,8 +226,9 @@ fn merge_re() -> &'static Regex {
             concat!(
                 r"(?i)\bgh\s+pr\s+merge\b",
                 r"|\bgit{opts}\s+merge(?:\s|$)",
-                // 브랜치 자리는 정확히 main·master: 앞은 공백·`:`, 뒤는 공백·`:`·끝.
-                r"|\bgit{opts}\s+push\b[^;&|\n]*?[\s:](?:main|master)(?:[\s:]|$)",
+                // 브랜치 자리는 정확히 main·master(§12.6·§13.6): 앞은 공백·`:`·`+`·따옴표(그 뒤 `refs/heads/` 허용),
+                // 뒤는 공백·끝·`:`·`;`·`&`·`|`·따옴표·`)`.
+                r#"|\bgit{opts}\s+push\b[^;&|\n]*?[\s:+"'](?:refs/heads/)?(?:main|master)(?:[\s:;&|"')]|$)"#,
             ),
             opts = opts
         ))
@@ -259,6 +320,116 @@ mod tests {
         ] {
             assert_eq!(mask(s), s);
         }
+    }
+
+    /// R3 L3(계약 §13.4): 키 이름에 비밀 낱말이 든 `키=값`·`키: 값`의 값을 가린다.
+    #[test]
+    fn masks_secret_key_values() {
+        let cases = [
+            ("password=hunter2", "password=[가림]"),
+            (
+                "DB_PASSWORD=abc123 npm start",
+                "DB_PASSWORD=[가림] npm start",
+            ),
+            ("token: tok_live_abcdef", "token: [가림]"),
+            ("PGPASSWORD=x psql -h db", "PGPASSWORD=[가림] psql -h db"),
+            ("passwd: s3cr3t", "passwd: [가림]"),
+            ("export API_KEY=abc", "export API_KEY=[가림]"),
+            ("apikey=abc&x=1", "apikey=[가림]"),
+            ("X-Api-Key: abc", "X-Api-Key: [가림]"),
+            ("aws_access_key_id = AKIAxx", "aws_access_key_id = [가림]"),
+            ("private_key: /k/id_rsa", "private_key: [가림]"),
+            ("client_secret=xyz end", "client_secret=[가림] end"),
+            ("--password=p4ss", "--password=[가림]"),
+            // 따옴표 값은 따옴표째로(공백이 있어도 묶음 전체)
+            (r#"password="two words" next"#, r#"password="[가림]" next"#),
+            ("secret='a b c' x", "secret='[가림]' x"),
+            (
+                r#"{"api_key":"abc","n":1}"#,
+                r#"{"api_key":"[가림]","n":1}"#,
+            ),
+            (r#"{"password": "a\"b"}"#, r#"{"password": "[가림]"}"#),
+            // 잘려서 닫는 따옴표가 없어도 끝까지 가린다
+            (r#"token="abcdef"#, r#"token="[가림]""#),
+            // 대소문자, 줄이 바뀐 값
+            ("Password:\nhunter2", "Password:\n[가림]"),
+            // 앞 글자가 한글이어도
+            ("비밀password=abc", "비밀password=[가림]"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(mask(input), want, "input: {input}");
+            // 두 번 가려도 같다
+            assert_eq!(mask(want), want, "idempotent: {want}");
+        }
+    }
+
+    /// 거짓 양성: 값이 없는 플래그 이름, 셈 결과, 경로 표기 같은 것은 그대로 둔다.
+    #[test]
+    fn secret_key_rule_keeps_ordinary_text() {
+        for s in [
+            "npm test --token-limit",
+            "npm test --token-limit 5",
+            "tests passed: 12, failed: 0",
+            "max_tokens=4096",
+            "input tokens: 5000",
+            "token_count: 12",
+            "bypass: true",
+            "let t = AccessToken::new(x);",
+            "PasswordHasher::hash(&p)",
+            "the password is set",
+            "password",
+            "token:",
+            "result: pass",
+        ] {
+            assert_eq!(mask(s), s, "should stay: {s}");
+        }
+        // 거짓 양성으로 넘긴 값 안의 진짜 키=값은 다시 본다
+        assert_eq!(mask("bypass: token=abc"), "bypass: token=[가림]");
+        assert_eq!(mask("passed_token=abc"), "passed_token=[가림]");
+    }
+
+    /// 조각을 이어 붙인 글 모두에서: 두 번 가려도 같고, 공백 접기 전후에 가린 결과가 같다
+    /// (심이 줄인 글을 정규화가 다시 가려도 원본과 같아야 한다, §12.5).
+    #[test]
+    fn masking_is_idempotent_and_whitespace_stable() {
+        let parts = [
+            "password",
+            "=",
+            ": ",
+            "\n",
+            " ",
+            "\"",
+            "'",
+            "x y",
+            "token",
+            "::",
+            "passed",
+            "sk-abcdefghijklmnopqrstu",
+            "Bearer abcdefghijklmnopqrstuvwxyz",
+            "https://u:p@h/",
+            "가",
+            "\\",
+            "api-key",
+        ];
+        let mut n = 0;
+        for a in parts {
+            for b in parts {
+                for c in parts {
+                    for d in parts {
+                        let s = format!("{a}{b}{c}{d}");
+                        let once = mask(&s);
+                        assert_eq!(mask(&once), once, "idempotent: {s:?}");
+                        assert_eq!(
+                            collapse_ws(&mask(&collapse_ws(&s))),
+                            collapse_ws(&once),
+                            "collapse-stable: {s:?}"
+                        );
+                        n += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(n, parts.len().pow(4));
     }
 
     #[test]
@@ -396,6 +567,39 @@ mod tests {
             "git -C main status",
             "git log main",
             "git push origin dev; echo main",
+        ] {
+            assert!(!is_merge_command(s), "병합이 아니어야 함: {s}");
+        }
+    }
+
+    /// R2 N3(계약 §13.6): 브랜치 자리 앞 `+`·따옴표·`refs/heads/`, 뒤 `;`·`&`·`|`·따옴표·`)`.
+    #[test]
+    fn merge_detection_n3() {
+        for s in [
+            "git push origin +main",
+            "git push origin refs/heads/main",
+            "git push origin HEAD:refs/heads/main",
+            "git push origin main;",
+            "git push origin main&& echo done",
+            "git push origin main|cat",
+            "git push origin \"main\"",
+            "git push origin 'main'",
+            "(git push origin main)",
+            "git push origin +refs/heads/master",
+            "git push origin HEAD:'master'",
+        ] {
+            assert!(is_merge_command(s), "병합이어야 함: {s}");
+        }
+        for s in [
+            "git push origin feature/main-fix",
+            "git push origin main-fix",
+            "git push origin mainline",
+            "git merge-base main topic",
+            "git push origin refs/heads/main-fix",
+            "git push origin +mainline",
+            "git push origin \"main-fix\"",
+            "git push origin refs/tags/main2",
+            "git push origin dev; git log main",
         ] {
             assert!(!is_merge_command(s), "병합이 아니어야 함: {s}");
         }
