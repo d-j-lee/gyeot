@@ -189,6 +189,7 @@ port = 47321
 stale_minutes = 30
 nudge_min = 80
 interrupt_min = 95
+approval_interrupt = false      # 승인·병합 대기를 소리(interrupt)까지 올릴지(§13.3)
 quiet_hours = ["22:00-08:00"]   # 현지 시각, 빈 배열이면 없음
 utc_offset_minutes = 540        # 조용한 시간 계산용(Windows 현지 오프셋을 데몬이 채움)
 retention_days = 14
@@ -202,34 +203,37 @@ cwd = "C:/work/proj"
 
 - 바인드는 `127.0.0.1`만. 요청 `Host`가 `127.0.0.1:<port>`·`localhost:<port>`가 아니면 `421`(DNS 리바인딩 방어). `Host` 머리가 있는데 읽을 수 없으면(비UTF-8 등) 요청줄의 주소로 넘어가지 않고 `421`.
 - `Origin` 헤더가 있으면 `http://127.0.0.1:<port>`·`http://localhost:<port>`만 허용, 그 밖(`null`·Tauri 출처 포함)은 `403`. CORS 헤더는 내지 않는다(같은 출처만).
-- 인증은 둘 중 하나다. 쿼리 토큰(`?t=`)은 받지 않는다(URL에 비밀을 싣지 않는다).
-  - **토큰**: `Authorization: Bearer <토큰>`. 상수 시간 비교. 훅 심·channel·셸·`gyeotd --open`이 토큰 파일을 읽어 쓴다.
-  - **세션 쿠키**: 브라우저·셸 창의 얼굴용. `gyeot_session=<32바이트 hex>; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`. 일회용 부트 코드로만 발급한다(§12).
-  - 실패 `401`.
+- 인증은 `Authorization: Bearer <값>` 하나다. 값은 둘 중 하나다. 쿼리(`?t=`)·쿠키는 받지 않는다(URL과 브라우저가 저절로 싣는 곳에 비밀을 두지 않는다).
+  - **토큰**: 토큰 파일의 값. 상수 시간 비교. 훅 심·channel·셸·`gyeotd --open`이 쓴다. 모든 `/v1/*`를 쓸 수 있다.
+  - **세션 열쇠**: 얼굴용. 일회용 부트 코드를 `POST /v1/session`으로 바꿔 받는다(§12.1). 얼굴에 필요한 경로만 쓸 수 있다(아래 표의 "세션" 열). 그 밖은 `403 {"ok":false,"error":"이 열쇠로는 쓸 수 없어요"}`.
+  - 없거나 틀리면 `401`.
+- 토큰을 보내는 쪽은 보내기 전에 `GET /v1/hello`로 그 포트의 서버가 같은 토큰을 아는지 확인한다(§13.1). 확인이 안 되면 토큰도 페이로드도 보내지 않는다.
 - 본문 최대 1 MiB.
-- 얼굴 응답(`/`·`/assets/*`·안내 쪽)에는 `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`(index·안내 쪽)를 붙인다.
+- 얼굴 응답(`/`·`/assets/*`)에는 `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`(index)를 붙인다.
 
-| 메서드·경로 | 인증 | 본문 → 응답 |
-|---|---|---|
-| `GET /health` | 아니오 | `{"ok":true,"version":"0.1.0"}` |
-| `GET /` | 쿠키 | 유효한 세션 쿠키가 있으면 얼굴 `index.html`(토큰을 싣지 않는다). 없으면 한국어 안내 쪽(`401`): "트레이의 곁 열기 또는 `gyeotd --open`". `?boot=<코드>`가 붙으면 §12 |
-| `GET /assets/*` | 아니오 | 얼굴 정적 파일(비밀 없음) |
-| `POST /v1/boot` | 토큰만 | → `{"code":str,"url":"http://127.0.0.1:<port>/?boot=<code>","expires_ms":n}`. 쿠키로는 부를 수 없다 |
-| `POST /v1/ingest/{source}` | 예 | 원본 페이로드 JSON. 심은 `{"payload":…, "pid_hint":n, "received_ms":n}` 봉투로 보낸다 → `202 {"accepted":k}` |
-| `GET /v1/state` | 예 | `Snapshot` |
-| `GET /v1/stream` | 예 | SSE(§8). 얼굴은 쿠키로, 그 밖은 Bearer로 |
-| `POST /v1/items/{id}/action` | 예 | `{"action":"open"\|"done"\|"dismiss"\|"snooze","reason"?:str,"minutes"?:n}` → `{"ok":true}` |
-| `POST /v1/focus` | 예 | `{"on":bool,"minutes"?:n}` → `{"ok":true,"until_ms":n\|null}` |
-| `POST /v1/presence/listening` | 예 | `{"on":bool}` → `{"ok":true}` |
-| `POST /v1/say` | 예 | `{"text":str,"session"?:str}` → `{"chat_id":str\|null,"delivered_to":str\|null,"reason":str}` |
-| `POST /v1/decisions/{decision_id}` | 예 | `{"choice":str}` → `{"delivered_to":str\|null}`. 선택지에 없는 답 `400`, 이미 답함 `409` |
-| `POST /v1/proposals/{id}` | 예 | `{"accept":bool}` → `{"ok":true}` |
-| `POST /v1/adjustments/{kind}` | 예 | `{"quiet":false}` → `{"ok":true}`. 받아들인 조정을 되돌린다. 켜기(`true`)는 제안으로만 하므로 `400` |
-| `POST /v1/channel/register` | 예 | `{"pid":n,"ppid":n,"cwd":str}` → `{"cid":str,"session":str\|null}` |
-| `GET /v1/channel/stream?cid=` | 예 | SSE: `message` 이벤트 `{"chat_id":str,"text":str,"kind":"say"\|"choice"}` |
-| `POST /v1/channel/reply` | 예 | `{"cid":str,"chat_id":str,"text":str}` → `{"ok":true}` |
-| `POST /v1/channel/decision` | 예 | `{"cid":str,"question":str,"options":[str]}`(2–4개) → `{"decision_id":str}` |
-| `POST /v1/channel/unregister` | 예 | `{"cid":str}` → `{"ok":true}` |
+| 메서드·경로 | 토큰 | 세션 | 본문 → 응답 |
+|---|---|---|---|
+| `GET /health` | 없어도 됨 | 없어도 됨 | `{"ok":true,"version":"0.1.0"}`. 곁 데몬인지는 이것으로 판단하지 않는다(§13.1) |
+| `GET /v1/hello?n=<hex>` | 없어도 됨 | 없어도 됨 | → `{"v":1,"proof":"<64 hex>"}`(§13.1). `n`이 16–128자 hex가 아니면 `400` |
+| `GET /`·`/index.html` | 없어도 됨 | 없어도 됨 | 얼굴 `index.html`. 비밀이 없다. 서버는 `?boot=`를 읽지 않는다(얼굴 스크립트가 쓴다) |
+| `GET /assets/*` | 없어도 됨 | 없어도 됨 | 얼굴 정적 파일 |
+| `POST /v1/boot` | 예 | 아니오 | `{}` → `{"code":str,"url":"http://127.0.0.1:<port>/?boot=<code>","expires_ms":n}`. 본문을 끝까지 읽은 뒤 답한다 |
+| `POST /v1/session` | 없어도 됨 | 없어도 됨 | `{"code":str}` → `{"session":"<64 hex>","expires_ms":n}`. 코드가 틀렸거나 지났거나 이미 썼으면 `401` |
+| `POST /v1/ingest/{source}` | 예 | 아니오 | 원본 페이로드 JSON. 심은 `{"payload":…, "pid_hint":n, "received_ms":n}` 봉투로 보낸다 → `202 {"accepted":k}` |
+| `GET /v1/state` | 예 | 예 | `Snapshot` |
+| `GET /v1/stream` | 예 | 예 | SSE(§8) |
+| `POST /v1/items/{id}/action` | 예 | 예 | `{"action":"open"\|"done"\|"dismiss"\|"snooze","reason"?:str,"minutes"?:n}` → `{"ok":true}` |
+| `POST /v1/focus` | 예 | 예 | `{"on":bool,"minutes"?:n}` → `{"ok":true,"until_ms":n\|null}` |
+| `POST /v1/presence/listening` | 예 | 예 | `{"on":bool}` → `{"ok":true}` |
+| `POST /v1/say` | 예 | 예 | `{"text":str,"session"?:str}` → `{"chat_id":str\|null,"delivered_to":str\|null,"reason":str}` |
+| `POST /v1/decisions/{decision_id}` | 예 | 예 | `{"choice":str}` → `{"delivered_to":str\|null}`. 선택지에 없는 답 `400`, 이미 답함 `409` |
+| `POST /v1/proposals/{id}` | 예 | 예 | `{"accept":bool}` → `{"ok":true}` |
+| `POST /v1/adjustments/{kind}` | 예 | 예 | `{"quiet":false}` → `{"ok":true}`. 받아들인 조정을 되돌린다. 켜기(`true`)는 제안으로만 하므로 `400` |
+| `POST /v1/channel/register` | 예 | 아니오 | `{"pid":n,"ppid":n,"cwd":str}` → `{"cid":str,"session":str\|null}` |
+| `GET /v1/channel/stream?cid=` | 예 | 아니오 | SSE: `message` 이벤트 `{"chat_id":str,"text":str,"kind":"say"\|"choice"}` |
+| `POST /v1/channel/reply` | 예 | 아니오 | `{"cid":str,"chat_id":str,"text":str}` → `{"ok":true}` |
+| `POST /v1/channel/decision` | 예 | 아니오 | `{"cid":str,"question":str,"options":[str]}`(2–4개) → `{"decision_id":str}` |
+| `POST /v1/channel/unregister` | 예 | 아니오 | `{"cid":str}` → `{"ok":true}` |
 
 `Snapshot`:
 
@@ -242,7 +246,7 @@ cwd = "C:/work/proj"
   "sessions": [ { "id": "abc123", "agent": "claude-code", "project": "proj", "cwd": "…", "state": "working", "last_ms": 0, "channel": "ch_1" } ],
   "proposals": [ "Proposal…" ],
   "budget": { "nudge": 4, "interrupt": 1 },
-  "settings": { "nudge_min": 80, "interrupt_min": 95, "stale_minutes": 30, "quiet_hours": [], "quiet_kinds": [] }
+  "settings": { "nudge_min": 80, "interrupt_min": 95, "stale_minutes": 30, "quiet_hours": [], "quiet_kinds": [], "approval_interrupt": false }
 }
 ```
 
@@ -336,19 +340,19 @@ cwd = "C:/work/proj"
 
 ## 12. 보안·정확성 개정 (2026-11-26, 독립 검증 R1 반영)
 
-### 12.1 얼굴 열기 — 일회용 부트 코드와 세션 쿠키 (R1 H1·M1·L3)
+### 12.1 얼굴 열기 — 일회용 부트 코드와 세션 열쇠 (R1 H1·M1·L3, R3 H1로 개정)
 
-얼굴 페이지에 토큰을 싣지 않는다. 같은 PC의 다른 사용자·프로세스나 다른 출처 페이지가 `GET /`로 토큰을 얻을 수 없게 하기 위해서다.
+얼굴 페이지에는 비밀을 싣지 않고, 브라우저가 저절로 싣는 곳(쿠키)에도 두지 않는다. 쿠키는 포트를 가리지 않아 같은 호스트의 다른 포트 서버로 샌다(R3에서 실측, G-030).
 
-1. 토큰을 가진 쪽(셸·`gyeotd --open`)이 `POST /v1/boot`(Bearer)로 코드를 받는다. 코드는 32바이트 난수 hex, **120초 동안 한 번만** 쓸 수 있다. 동시에 열린 코드는 최대 8개(넘으면 가장 오래된 것부터 버린다).
-2. 브라우저·셸 창이 `GET /<경로>?boot=<code>&…`를 연다. 코드가 맞으면 서버는 세션을 만들고 `303`으로 같은 경로·같은 쿼리에서 `boot`만 뺀 주소로 보낸다(`?mode=overlay`는 남는다). 이때 `Set-Cookie: gyeot_session=<64 hex>; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`를 단다. 코드가 틀리거나 지났거나 이미 썼으면 안내 쪽(`401`)을 보이고 쿠키를 달지 않는다(이미 유효한 쿠키가 있어도 같다). `/v1/*`·`/health`가 아닌 모든 경로(정적 파일 포함)에서 `boot`를 코드로 쓴다.
-   - `Location` 경로는 `/`로 시작하고 빈 조각(`//`)·점 조각(`.`·`..`)·`%`가 없을 때만 그대로 쓰고, 아니면 `/`로 보낸다. 점 조각을 정리하면 `//host`로 접혀 다른 호스트로 해석될 수 있어서다.
-3. 세션은 만든 때부터 30일 동안 쓸 수 있다(쿠키 `Max-Age`와 같다). 쓸 때마다 마지막 사용 시각을 갱신하되, 이 시각은 개수 상한에서 버릴 순서에만 쓴다(디스크에는 10분마다와 끌 때 쓴다). 세션은 최대 20개(넘으면 가장 오래 안 쓴 것부터 버린다). `<데이터>/sessions.json`에 **세션 값의 SHA-256만** 저장한다(파일이 새도 그대로 쓸 수 없다). Unix 권한 0600.
-4. 얼굴은 같은 출처 `fetch`·`EventSource`로 쿠키 인증을 쓴다. `401`을 받으면, 셸 안이면 IPC `renew_session`을 부르고, 브라우저면 "열쇠가 만료됐어요 — 트레이의 곁 열기 또는 `gyeotd --open`" 안내를 보인다.
-5. `?api=`(다른 API 주소)는 개발 빌드(`import.meta.env.DEV`)에서 루프백 주소일 때만 받는다. 배포 빌드는 늘 같은 출처다.
+1. 토큰을 가진 쪽(셸·`gyeotd --open`)이 `POST /v1/boot`(토큰)로 코드를 받는다. 코드는 32바이트 난수 hex, **120초 동안 한 번만** 쓸 수 있다. 동시에 열린 코드는 최대 8개(넘으면 가장 오래된 것부터 버린다).
+2. 창이 `http://127.0.0.1:<port>/?boot=<code>&…`를 연다(`?mode=overlay` 등은 그대로 둔다). 서버는 `index.html`을 그대로 준다.
+3. 얼굴 스크립트는 시작하자마자 `history.replaceState`로 주소에서 `boot`만 지우고, `POST /v1/session {"code"}`로 세션 열쇠를 받는다. 열쇠는 `sessionStorage`(출처 = 스킴·호스트·**포트**마다 갈리고 탭이 닫히면 사라진다)의 `gyeot.session`에 `{"session","expires_ms"}`로 둔다. 그 뒤 모든 요청은 `Authorization: Bearer <세션 열쇠>`로 한다. SSE는 `EventSource`가 머리를 실을 수 없으므로 `fetch` 스트림으로 읽는다(형식은 §8 그대로).
+4. 세션은 만든 때부터 **7일** 쓸 수 있다. 마지막 사용 시각은 개수 상한에서 버릴 순서에만 쓴다(디스크에는 10분마다와 끌 때 쓴다). 세션은 최대 20개. `<데이터>/sessions.json`에 **세션 값의 SHA-256만** 저장한다. Unix 권한 0600.
+5. 얼굴이 `401`을 받으면 열쇠를 지우고, 셸 안이면 IPC `renew_session`을 부르고(셸이 새 코드로 같은 창을 다시 연다, 30초에 한 번까지), 브라우저면 "열쇠가 없거나 만료됐어요 — 트레이의 곁 열기 또는 `gyeotd --open`" 안내를 보인다. 열쇠도 `boot`도 없이 열면 같은 안내를 보인다.
+6. `?api=`(다른 API 주소)는 개발 빌드(`import.meta.env.DEV`)에서 루프백 주소일 때만 받는다. 배포 빌드는 늘 같은 출처다.
 
-`gyeotd --open [--print]`: 실행 중인 데몬에 `POST /v1/boot` 하고 기본 브라우저로 연다(`--print`면 주소만 출력). Windows는 `rundll32 url.dll,FileProtocolHandler <url>`, Linux는 `xdg-open`, macOS는 `open`.
-셸: 데몬이 건강해지면 `POST /v1/boot`로 코드를 받아 `http://127.0.0.1:<port>/?mode=overlay&boot=<code>`를 연다. 원격 IPC 허용 명령은 `set_hit_rect`·`set_expanded`·`renew_session` 셋이다. `renew_session`은 새 코드를 받아 같은 창을 다시 연다(30초에 한 번까지).
+`gyeotd --open [--print]`: 실행 중인 데몬을 §13.1로 확인하고 `POST /v1/boot` 한다. 코드가 든 주소를 프로그램 인자에 싣지 않는다(Linux·macOS에서는 다른 사용자가 `ps`·`/proc`로 읽어 먼저 쓸 수 있다, R2 N1). 대신 `<데이터>/open/open-<난수>.html`(폴더 0700, 파일 0600)에 그 주소로 넘어가는 쪽을 쓰고, 그 **파일 경로**로 기본 브라우저를 연다. Windows는 `rundll32 url.dll,FileProtocolHandler <경로>`, Linux는 `xdg-open`, macOS는 `open`. 5분 넘은 `open-*.html`은 실행할 때마다 지운다. `--print`면 주소를 표준 출력에만 쓴다.
+셸: §13.1로 확인한 뒤 `POST /v1/boot`로 코드를 받아 `http://127.0.0.1:<port>/?mode=overlay&boot=<code>`를 연다. 원격 IPC 허용 명령은 `set_hit_rect`·`set_expanded`·`renew_session` 셋이다.
 
 ### 12.2 Tauri 출처 허용 삭제 (R1 M2)
 셸은 데몬 주소를 직접 열므로 페이지 출처가 같은 출처다. 셸에 묶인 대체 화면은 데몬 API를 부르지 않는다. 그래서 Tauri 출처(`tauri://localhost`·`http(s)://tauri.localhost`)를 허용하지 않고, CORS 반사도 하지 않는다.
@@ -377,5 +381,44 @@ cwd = "C:/work/proj"
 `permission_request` 미리보기가 다음 가운데 하나면 병합이다: `gh pr merge`, `git merge`(옵션 사이에 `-C <경로>` 같은 앞 옵션 허용), `git … push` 뒤 브랜치 자리가 정확히 `main`·`master`(앞은 공백·`:`, 뒤는 공백·끝·`:`). `feature/main-fix`처럼 단어 일부는 병합이 아니다.
 
 ### 12.7 남은 위험 (알고 받아들인 것)
-- **쿠키는 포트를 가리지 않는다.** 브라우저는 `127.0.0.1`의 다른 포트에서 도는 서버에도 `gyeot_session`을 보낸다(같은 사이트로 본다). `SameSite=Strict`라 다른 사이트에서 건너온 요청에는 붙지 않지만, 사용자가 주소창이나 같은 사이트 링크로 `127.0.0.1:<다른 포트>`를 열면 붙는다. 그 서버를 다른 사용자가 띄웠다면 쿠키를 얻어 30일 동안 곁 API를 쓸 수 있다. 토큰을 아무나 받던 v0.1보다 좁지만 남는다. 줄이는 방법: 세션 기한을 줄이거나, 얼굴 주소를 `gyeot.localhost` 같은 전용 이름으로 옮긴다(WebView2·브라우저의 `*.localhost` 해석은 실측 전). 지금은 기록만 한다(G-028).
 - **1 MiB가 넘는 훅 입력**은 앞부분에서 최상위 문자열 필드만 건진다. 필드 순서가 `tool_calls` 뒤라면 건지지 못하고 그 신호를 잃는다(Claude Code의 필드 순서는 실측 전). 잃으면 승인 대기가 다음 `PostToolBatch`·`Stop`까지 남는다.
+- **늦게 도착한 옛 대기 신호**(시각이 이른 `Notification`이 닫힌 뒤에 도착)는 승인 대기를 다시 열 수 있다(R3 L2). 데몬 재시작 경로에서는 스풀을 먼저 재생해 재현되지 않았다. 심의 시간 초과처럼 좁은 경우만 남는다.
+- **세션 열쇠를 가진 쪽은 얼굴이 할 수 있는 일(말 걸기 포함)을 할 수 있다.** 열쇠는 그 출처의 `sessionStorage`에만 있고 CSP가 외부 스크립트를 막지만, 얼굴에 스크립트 주입이 생기면 그만큼 쓸 수 있다.
+
+## 13. 보안·정확성 개정 2 (2026-11-26, 독립 검증 R2·R3 반영)
+
+### 13.1 데몬 확인 — 토큰을 보내기 전에 (R3 M2)
+`47321`은 모든 OS 사용자가 같이 쓰는 포트다. 내 데몬이 없을 때 다른 사용자가 그 포트를 먼저 잡으면, 심·`--open`·셸·channel이 그쪽에 토큰과 페이로드를 보낸다. 그래서 토큰을 쓰는 쪽은 먼저 서버가 같은 토큰을 아는지 확인한다.
+
+- 클라이언트: 32바이트 난수 `n`(hex 64자)을 만들어 `GET /v1/hello?n=<n>`을 보낸다(인증 머리 없음).
+- 서버: `proof = hex(HMAC-SHA256(key = 토큰 문자열의 UTF-8 바이트, msg = "gyeot-hello/v1|" + <서버가 실제로 묶인 포트의 10진수> + "|" + n))`을 `{"v":1,"proof":…}`로 준다.
+- 클라이언트: 자기 토큰과 **자기가 연결한 포트**로 같은 값을 계산해 상수 시간으로 비교한다. 다르거나 오류면 그 서버를 곁 데몬으로 보지 않는다(포트를 넣어 다른 포트로 중계하는 서버도 걸러낸다).
+  - 훅 심: 보내지 않고 스풀에 남긴다(400ms 통신 한도 안에서 확인과 전송을 함께 한다).
+  - `gyeotd --open`: "이 포트의 서버는 내 곁 데몬이 아니에요(다른 사용자나 프로그램일 수 있어요)"와 exit 1.
+  - 셸: 데몬이 없는 것과 같이 다루되, 대체 화면과 `shell.log`에 같은 이유를 적는다. 그 포트의 페이지를 창에 열지 않는다.
+  - channel: 연결하지 않고 stderr에 이유를 적은 뒤 다시 시도 간격을 따른다.
+- 확인은 프로세스(또는 연결)마다 한 번이면 된다. 셸·channel은 다시 연결할 때마다 다시 한다.
+
+### 13.2 승인 대기를 닫는 신호 — 에이전트를 가린다 (R3 M3, L1)
+- 심은 모든 Claude Code 이벤트에서 `agent_id`(128자까지)를 남긴다. `PostToolBatch`에서는 `tool_calls`를 `[{"tool_name":…}]`(64개까지)로 줄여 남긴다(`tool_input`·`tool_response`는 버린다).
+- 정규화: 이벤트에 `agent`(없으면 null)를 싣는다. `PostToolBatch`의 activity는 `tools`(도구 이름 목록)를 싣는다.
+- 코어: `approval`·`merge` 항목은 연 이벤트의 `agent`를 기억한다. 작업 신호(activity)는 **같은 세션·같은 `agent`**(둘 다 null이면 같다)이고, 도구가 맞거나(G-016) 모를 때만 닫는다. `tools`가 있으면 그 가운데 하나가 맞아야 한다. `agent`가 없는 `Notification(permission_prompt)`은 그 세션의 열린 승인에 붙고 그 승인의 `agent`를 바꾸지 않는다.
+- 같은 세션·같은 `agent`·같은 도구의 `PostToolUseFailure`도 승인 대기를 닫는다.
+
+### 13.3 승인·병합 대기의 소리 알림은 켜야 난다 (R2 N2)
+승인 순간을 알리는 훅이 없다. `PostToolBatch`는 묶음이 다 끝난 뒤에야 온다. 그래서 사람이 승인한 도구가 2분 넘게 돌면(빌드·시험) 곁은 아직 기다린다고 잘못 안다.
+- 설정 `approval_interrupt`(최상위 키, 기본 `false`). 끄면 `approval`·`merge`는 대기 시간으로 `nudge`(말풍선)까지만 올라간다. 이유 줄: "승인했는지 곁이 알 수 없어 말풍선까지만 알려요".
+- 켜면 지금까지의 규칙(2분 → `interrupt`, 작업 신호가 없는 세션은 `nudge`까지)을 따른다.
+- `Snapshot.settings.approval_interrupt`로 얼굴에 보인다.
+
+### 13.4 디스크에 남는 것 (R3 L3·L4, R2 N5)
+- 마스킹에 일반 `키=값` 규칙을 더한다. 키 이름에 `pass`·`passwd`·`password`·`secret`·`token`·`api_key`·`apikey`·`access_key`·`private_key`가 들어 있고(대소문자 무시, `_`·`-` 허용) 뒤에 `=` 또는 `:`가 오면 값(따옴표 묶음 또는 공백 전까지)을 `[가림]`으로 바꾼다. 두 번 가려도 같다.
+- Unix: 데이터 폴더와 그 아래 폴더는 0700, 파일(`events/*.jsonl`·`gyeotd.log`·`token`·`sessions.json`·`learn.json`·스풀)은 0600으로 만든다. 이미 있는 것도 시작할 때 맞춘다.
+- Windows: 설치 폴더나 데이터 폴더가 `%LOCALAPPDATA%` 밖이면 설치 스크립트가 상속을 끊고 그 사용자와 SYSTEM만 남긴다(`icacls … /inheritance:r /grant:r <사용자>:(OI)(CI)F /grant:r *S-1-5-18:(OI)(CI)F`). 결과를 출력한다(R3 M4).
+
+### 13.5 결정 카드는 권한 승인이 아니다 (R3 L5)
+channel이 만든 결정 카드(`decision`이고 선택지가 있는 것)에는 질문 위에 "Claude가 묻는 거예요 — 권한 승인이 아니에요"를 늘 보인다. 승인 단추처럼 보이는 색을 쓰지 않는다.
+
+### 13.6 병합 감지 보강 (R2 N3)
+§12.6에 더해: 브랜치 자리 앞은 공백·`:`·`+`·따옴표, `refs/heads/`를 허용한다. 뒤는 공백·끝·`:`·`;`·`&`·`|`·따옴표·`)`. 예: `git push origin +main`, `HEAD:refs/heads/main`, `git push origin main;`, `"main"`은 병합이다. `feature/main-fix`·`main-fix`·`mainline`·`git merge-base`는 아니다.
+
