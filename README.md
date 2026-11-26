@@ -67,7 +67,7 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
 | 얼굴 | Linux, vitest | 351 통과. 세션 열쇠·보내기 전 상대 확인·fetch SSE 해석기·401 처리, 결정 카드 안내, 색 대비 WCAG AA, 가짜 데몬(mock)의 보안 규칙 포함 |
 | channel | Linux, vitest(묶은 파일을 실제로 띄움) | 53 통과. 데몬 확인(hello) 포함. Node 22 |
 | 셸 | Linux(WebKitGTK), cargo test | 82 통과. IPC 권한(ACL)·데몬 확인·부트 흐름·데몬이 멈추면 바로 닫기 시험 포함. Windows 대상 clippy 0건 |
-| 설치 스크립트 | pwsh 7.4 | `test-install` 134 통과(Windows 전용 폴더 권한 시험은 CI Windows에서), `test-bootstrap` 83 통과(실제 데몬·훅 심으로 설치·업데이트·점검·지우기, 가짜 릴리스 서버로 HTTPS 받기, 가짜 gh로 출처 증명 실패·고정 옵션, 새 판 bootstrap으로 넘기기, 포트를 잡은 다른 서버·증명이 틀린 서버·옛 경로 훅·훅 없는 설치 포함) |
+| 설치 스크립트 | pwsh 7.4 | `test-install` 134 통과(Windows 전용 폴더 권한 시험은 CI Windows에서), `test-bootstrap` 85 통과(실제 데몬·훅 심으로 설치·업데이트·점검·지우기, 가짜 릴리스 서버로 HTTPS 받기, 가짜 gh로 출처 증명 실패·고정 옵션, 새 판 bootstrap으로 넘기기, 포트를 잡은 다른 서버·증명이 틀린 서버·옛 경로 훅·훅 없는 설치 포함) |
 | **끝-끝(가짜 없음)** | Linux, `tests/e2e/e2e.mjs` | 64/64. 실제 데몬·훅 심·channel·얼굴(Chrome)을 이음. 세션 열쇠·데몬 확인·포트를 가로챈 가짜 서버(훅·`--open`·열린 얼굴 모두 열쇠 0건)·스풀 줄이기 포함 |
 | Windows 빌드·시험·끝-끝·설치본 | GitHub Actions(windows-latest) | 이 판의 결과는 `docs/field-notes.md` |
 | 올린 릴리스로 설치 | GitHub Actions(windows-latest), `release-check` | 릴리스를 HTTPS로 받아 5.1로 설치, gh 로그인·출처 증명으로 7에서 업데이트, 점검·지우기. 결과는 `docs/field-notes.md` |

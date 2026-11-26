@@ -28,6 +28,7 @@ $ErrorActionPreference = 'Stop'
 $TestZip = $ZipPath; $TestDaemon = $GyeotdPath; $TestHook = $HookPath; $TestChannel = $ChannelPath; $TestFace = $FaceDir; $TestKeep = [bool]$KeepTemp
 . (Join-Path $PSScriptRoot 'gyeot-common.ps1')
 . (Join-Path $PSScriptRoot 'bootstrap.ps1')
+. (Join-Path $PSScriptRoot 'test-release.ps1')
 
 if ([Console]::IsOutputRedirected) { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) }
 
@@ -235,6 +236,12 @@ try {
     Assert-Boot ((Get-BootReleaseUrl 'd-j-lee/gyeot' '' 'a.zip') -eq 'https://github.com/d-j-lee/gyeot/releases/latest/download/a.zip') '받기 주소: 가장 최근'
     Assert-Boot ((Get-BootReleaseUrl 'd-j-lee/gyeot' 'v0.2.0' 'a.zip') -eq 'https://github.com/d-j-lee/gyeot/releases/download/v0.2.0/a.zip') '받기 주소: 태그'
     Assert-Boot ((Get-BootBuildVersion "곁(gyeot)`r`nversion: 0.2.0`r`nref: x") -eq '0.2.0' -and $null -eq (Get-BootBuildVersion 'commit: x')) 'BUILD.txt 판 읽기'
+    # release-check 가 bootstrap 을 부르는 길: 매개변수가 이름으로 묶이고, 정보 스트림(Write-Host)과 종료 코드를 받는다.
+    $fb = Join-Path $tmpRoot 'fake-boot.ps1'
+    Set-Content -LiteralPath $fb -Encoding UTF8 -Value @('param([string]$Repo = "d", [string]$Tag, [switch]$ApplyClaudeHooks, [switch]$Install)', 'Write-Host "Repo=[$Repo] Tag=[$Tag] Hooks=[$ApplyClaudeHooks] Install=[$Install]"', 'exit 3')
+    $rb = Invoke-ReleaseBoot $fb @{ Tag = 'v1.2.3'; ApplyClaudeHooks = $true; Install = $true }
+    Assert-Boot ($rb.Text -match [regex]::Escape('Repo=[d] Tag=[v1.2.3] Hooks=[True] Install=[True]') -and $rb.Code -eq 3) "release-check 의 bootstrap 호출: 이름으로 묶고 출력·종료 코드를 받는다($($rb.Text.Trim()) / $($rb.Code))"
+
     $sa = Join-Path $tmpRoot 'same-a.ps1'; $sb = Join-Path $tmpRoot 'same-b.ps1'; $sc = Join-Path $tmpRoot 'same-c.ps1'
     [System.IO.File]::WriteAllText($sa, "a`nb`n"); [System.IO.File]::WriteAllText($sb, "a`r`nb`r`n"); [System.IO.File]::WriteAllText($sc, "a`nB`n")
     Assert-Boot ((Test-BootSameScript $sa $sb) -and -not (Test-BootSameScript $sa $sc)) '같은 판 bootstrap 비교: 줄 끝만 다르면 같다, 글자가 다르면 다르다'
@@ -395,7 +402,7 @@ try {
         $env:PATH = $savedPath
 
         Write-Host '== 3c. 받은 zip 의 bootstrap 이 다르면 그쪽으로 넘긴다(업데이트 때 옛 코드와 섞이지 않게)' -ForegroundColor White
-        $hoRel = Join-Path $tmpRoot 'handoff-rel'
+        $hoRel = Join-Path $tmpRoot 'handoff rel'
         $hoStage = Join-Path $tmpRoot 'handoff-stage'
         New-Item -ItemType Directory -Path $hoRel -Force | Out-Null
         Expand-Archive -LiteralPath $zip -DestinationPath $hoStage -Force
@@ -405,7 +412,7 @@ try {
         "$(Get-BootSha256 $hoZip)  gyeot-windows-x64.zip" | Set-Content -LiteralPath (Join-Path $hoRel 'SHA256SUMS.txt') -Encoding ASCII
         $hoArgs = @($common); $hoArgs[1] = $hoZip
         $r = Invoke-BootTest ($hoArgs + @('-ApplyClaudeHooks'))
-        Assert-Boot ($r.Code -eq 0 -and $r.Text -match '받은 판의 bootstrap 으로 넘겨요' -and $r.Text -match '앞선 bootstrap 이 마쳤어요\(local\)' -and $r.Text -match '미리보기만 했어요') "다른 bootstrap 으로 넘겨 이어서 한다(받은 값 $($r.Code))"
+        Assert-Boot ($r.Code -eq 0 -and $r.Text -match '받은 판의 bootstrap 으로 넘겨요' -and $r.Text -match '받기는 앞선 bootstrap 이 했어요\(local\)' -and $r.Text -match '앞선 bootstrap 도 하지 않았어요' -and $r.Text -match '미리보기만 했어요') "다른 bootstrap 으로 넘겨 이어서 한다(공백 경로, 받은 값 $($r.Code))"
         Assert-Boot (([regex]::Matches($r.Text, '받은 판의 bootstrap 으로 넘겨요')).Count -eq 1) '넘긴 쪽은 다시 넘기지 않는다(한 번만)'
         Assert-Boot (-not (Test-Path -LiteralPath (Join-Path $root 'bin'))) '넘긴 미리보기도 설치하지 않는다'
         # 줄 끝만 CRLF 로 바뀐 같은 판(Windows checkout)이면 넘기지 않는다.
@@ -422,6 +429,21 @@ try {
         $crArgs = @($common); $crArgs[1] = $crZip
         $r = Invoke-BootTest ($crArgs + @('-ApplyClaudeHooks'))
         Assert-Boot ($r.Code -eq 0 -and $r.Text -notmatch '받은 판의 bootstrap 으로 넘겨요' -and $r.Text -match '미리보기만 했어요') "줄 끝만 다른 같은 판이면 넘기지 않는다(받은 값 $($r.Code))"
+        # gh 로 출처 증명을 마치고 넘기면, 넘겨받은 쪽이 그렇다고 알린다(하지 않았으면 했다고 하지 않는다).
+        $savedPath = $env:PATH
+        New-BootFakeGh $fakeGhDir -LoggedIn
+        $env:PATH = $fakeGhDir + [System.IO.Path]::PathSeparator + $env:PATH
+        $env:FAKE_GH_ATTEST = '0'
+        $fsPort = Get-BootFreePort
+        $job = Start-BootFileServer $fsPort $hoRel
+        try {
+            $r = Invoke-BootTest ($httpArgs + @('-ReleaseBaseUrl', "http://127.0.0.1:$fsPort/dl"))
+            Assert-Boot ($r.Code -eq 0 -and $r.Text -match '출처 증명 일치' -and $r.Text -match '받은 판의 bootstrap 으로 넘겨요' -and $r.Text -match '받기는 앞선 bootstrap 이 했어요\(https\)' -and $r.Text -match '출처 증명은 앞선 bootstrap 이 확인했어요') "출처 증명을 마치고 넘기면 그렇게 알린다(받은 값 $($r.Code))"
+        } finally {
+            Stop-BootFakeServer $job
+            Remove-Item Env:FAKE_GH_ATTEST -ErrorAction SilentlyContinue
+            $env:PATH = $savedPath
+        }
 
         Write-Host '== 4. 바뀐 zip 은 거절한다' -ForegroundColor White
         $bad = Join-Path $tmpRoot 'bad'

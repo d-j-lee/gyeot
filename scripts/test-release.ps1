@@ -12,24 +12,22 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$Tag,
-    [Parameter(Mandatory = $true)][ValidateSet('fetch', 'preview', 'install', 'update', 'doctor', 'uninstall')][string]$Step,
+    [string]$Tag,
+    [ValidateSet('fetch', 'preview', 'install', 'update', 'doctor', 'uninstall')][string]$Step,
     [string]$Repo = 'd-j-lee/gyeot',
     [switch]$ExpectAttestation
 )
 
 $ErrorActionPreference = 'Stop'
-if (-not $env:CI) { throw '이 시험은 이 PC의 곁 설치를 바꿉니다. CI 러너에서만 돌리세요($env:CI 가 없어요).' }
-$work = Join-Path $(if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }) 'gyeot-boot'
-$boot = Join-Path $work 'bootstrap.ps1'
-$installed = Join-Path $env:LOCALAPPDATA 'gyeot'
 
 function Write-ReleaseFail([string]$Message) { Write-Host "FAIL $Message" -ForegroundColor Red; exit 1 }
 function Write-ReleasePass([string]$Message) { Write-Host "ok   $Message" -ForegroundColor Green }
 
 # bootstrap 은 Write-Host 로 쓴다. 같은 프로세스에서 불러 정보 스트림까지 받는다.
-function Invoke-ReleaseBoot([string]$Path, [string[]]$Arguments) {
-    $out = & $Path @Arguments 6>&1 | ForEach-Object { Write-Host $_; $_ }
+# 매개변수는 해시표로 펼친다. 문자열 배열을 스크립트에 펼치면 '-Tag' 도 위치 인자가 된다.
+function Invoke-ReleaseBoot([string]$Path, [hashtable]$Params) {
+    $global:LASTEXITCODE = 0
+    $out = & $Path @Params 6>&1 | ForEach-Object { Write-Host $_; $_ }
     return [pscustomobject]@{ Code = $LASTEXITCODE; Text = ($out | Out-String) }
 }
 
@@ -39,6 +37,14 @@ function Assert-Text($Result, [string[]]$Want) {
         Write-ReleasePass "출력에 '$w'"
     }
 }
+
+# 점 소싱(시험)일 때는 함수만 읽는다.
+if ($MyInvocation.InvocationName -eq '.') { return }
+if ($env:GITHUB_ACTIONS -ne 'true' -or -not $env:RUNNER_TEMP) { throw '이 시험은 이 PC의 곁 설치를 바꿉니다. GitHub Actions 러너에서만 돌리세요.' }
+if (-not $Tag -or -not $Step) { throw '-Tag 와 -Step 이 필요해요.' }
+$work = Join-Path $env:RUNNER_TEMP 'gyeot-boot'
+$boot = Join-Path $work 'bootstrap.ps1'
+$installed = Join-Path $env:LOCALAPPDATA 'gyeot'
 
 Write-Host "== release-check $Step ($Tag, PowerShell $($PSVersionTable.PSVersion))" -ForegroundColor White
 switch ($Step) {
@@ -66,21 +72,21 @@ switch ($Step) {
         Write-ReleasePass '받은 설치 문서에 한 줄 프롬프트가 있다'
     }
     'preview' {
-        $r = Invoke-ReleaseBoot $boot @('-Tag', $Tag, '-ApplyClaudeHooks', '-RegisterStartup')
+        $r = Invoke-ReleaseBoot $boot @{ Tag = $Tag; ApplyClaudeHooks = $true; RegisterStartup = $true }
         if ($r.Code -ne 0) { Write-ReleaseFail "미리보기 종료 코드 $($r.Code)" }
         Assert-Text $r @('SHA-256 일치', "version: $($Tag.TrimStart('v') -replace '-rc\.\d+$', '')", '미리보기만 했어요')
         if (Test-Path -LiteralPath (Join-Path $installed 'bin')) { Write-ReleaseFail '미리보기가 설치했어요' }
         Write-ReleasePass '미리보기는 설치하지 않았다'
     }
     'install' {
-        $r = Invoke-ReleaseBoot $boot @('-Tag', $Tag, '-ApplyClaudeHooks', '-RegisterStartup', '-Install')
+        $r = Invoke-ReleaseBoot $boot @{ Tag = $Tag; ApplyClaudeHooks = $true; RegisterStartup = $true; Install = $true }
         if ($r.Code -ne 0) { Write-ReleaseFail "설치 종료 코드 $($r.Code)" }
         $want = @('SHA-256 일치', '점검 통과', '내 곁 데몬', '설치·점검을 마쳤어요')
         if ($ExpectAttestation) { $want += '출처 증명 일치' }
         Assert-Text $r $want
     }
     'update' {
-        $r = Invoke-ReleaseBoot (Join-Path $installed 'scripts\bootstrap.ps1') @('-Tag', $Tag, '-ApplyClaudeHooks', '-RegisterStartup', '-Install')
+        $r = Invoke-ReleaseBoot (Join-Path $installed 'scripts\bootstrap.ps1') @{ Tag = $Tag; ApplyClaudeHooks = $true; RegisterStartup = $true; Install = $true }
         if ($r.Code -ne 0) { Write-ReleaseFail "업데이트 종료 코드 $($r.Code)" }
         $want = @('SHA-256 일치', '점검 통과', '내 곁 데몬')
         if ($ExpectAttestation) { $want += '출처 증명 일치' }

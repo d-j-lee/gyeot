@@ -129,3 +129,7 @@ VR7 검증자가 자기 발견의 이벤트 열을 그대로 다시 돌렸다(�
 - 시험: `test-bootstrap` 83(+19: 엄격한 꼴 2, 가짜 릴리스 서버로 HTTPS 받기·404·바뀐 zip, 가짜 gh로 출처 증명 실패·고정 옵션·`-SkipAttestation`·HTTPS 뒤 증명, 새 판 bootstrap으로 넘기기 3과 줄 끝만 다른 같은 판 2, 훅 없이 업데이트, 증명이 틀린 서버 2), `test-install` 134. PSScriptAnalyzer 경고 0, 5.1 문법 0, actionlint 0.
 - 변이 7개(증명 받아들이기, 출처 증명 경고로, 느슨한 태그, 넘기기 끄기, `-NoHooks` 되살리기, signer 고정 빼기, 그리고 앞 라운드의 병합 되돌리기) 모두 잡혔다. `-NoHooks` 변이는 처음에 줄을 반만 바꿔 문법이 깨진 채 "잡혔다"고 나와, 줄 전체를 바꿔 다시 돌렸다(그 시험 하나만 실패).
 - 같이 찾은 것: Windows 러너의 checkout은 `.ps1`을 CRLF로 둘 수 있어, 배포 zip 안의 bootstrap(Windows에서 만듦)과 릴리스 자산 bootstrap(Linux에서 올림)이 바이트로 달라 같은 판인데도 넘기기가 일어날 수 있었다(추론, 러너 git 설정은 재지 않음). `.gitattributes`로 `*.ps1`을 LF로 고정하고, 넘기기 비교는 줄 끝을 빼고 한다. 변이(바이트 비교로 되돌리기)를 새 시험이 잡았다.
+
+## 2026-11-26 · 회귀 재검증(2f34e8d)과 고친 판
+
+같은 에이전트가 자기 발견을 다시 쟀다(약 10분). 중간1·빠진 시험·M3·낮음 1~8 FIXED, 새 시험 변이 5개 모두 잡힘. 남은 높음 1: `test-release.ps1`이 bootstrap 매개변수를 문자열 배열로 펼쳐 `-Tag`까지 위치 인자로 넘겼다(실측: `Repo=[-Tag]`). 이쪽에서도 같은 꼴로 재현했다. 해시표로 펼치고, 그 호출 함수를 가짜 bootstrap으로 시험하는 단위 시험을 넣었다(문자열 배열로 되돌린 변이가 잡힘). 낮음: 넘겨받은 bootstrap이 출처 증명을 하지 않았는데도 "앞선 bootstrap이 마쳤다"고 하던 것(→ `-HandoffAttested`를 실제로 확인했을 때만 넘김, 늘 넘기는 변이가 잡힘), 줄 끝만 다른 같은 판을 넘기던 것(45adcb3에서 이미 고침), install의 작업 시작 대기 6초 → 15초, release 시험 막이를 `GITHUB_ACTIONS`·`RUNNER_TEMP`로. `test-bootstrap` 85, `test-install` 134, PSScriptAnalyzer 0, actionlint 0.

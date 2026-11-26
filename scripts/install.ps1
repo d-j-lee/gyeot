@@ -149,7 +149,8 @@ function Start-GyeotDaemonPreferTask {
         if ($task) {
             try {
                 Start-ScheduledTask -TaskName $script:GyeotTaskName -ErrorAction Stop
-                $deadline = (Get-Date).AddSeconds(6)
+                # 작업은 숨긴 PowerShell 을 거쳐 데몬을 띄우므로 느린 PC를 생각해 넉넉히 기다린다.
+                $deadline = (Get-Date).AddSeconds(15)
                 while ((Get-Date) -lt $deadline) {
                     if (@(Get-GyeotProcessesUnder @('gyeotd') $bin).Count -gt 0) { return '작업 스케줄러' }
                     Start-Sleep -Milliseconds 300

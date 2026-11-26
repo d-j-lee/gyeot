@@ -55,7 +55,8 @@ param(
     [switch]$AllowNonWindows,
     [string]$ReleaseBaseUrl,
     [string]$HandoffVia,
-    [string]$HandoffLabel
+    [string]$HandoffLabel,
+    [switch]$HandoffAttested
 )
 
 $ErrorActionPreference = 'Stop'
@@ -318,8 +319,11 @@ function Invoke-Bootstrap {
     $map = Read-BootSumFile ([System.IO.File]::ReadAllText($sums))
     $hash = Assert-BootHash $zip $map
     Write-BootOk "SHA-256 일치(받다가 깨지지 않았어요): $($hash.Substring(0, 16))…"
+    $attested = $false
     if ($via -eq 'local' -and $HandoffVia) {
-        Write-BootInfo "받기·출처 확인은 앞선 bootstrap 이 마쳤어요($HandoffVia)."
+        Write-BootInfo "받기는 앞선 bootstrap 이 했어요($HandoffVia). SHA-256 은 여기서 다시 봤어요."
+        if ($HandoffAttested) { Write-BootOk '출처 증명은 앞선 bootstrap 이 확인했어요.'; $attested = $true }
+        else { Write-BootInfo '출처 증명은 확인하지 않았어요(앞선 bootstrap 도 하지 않았어요).' }
     } elseif ($via -eq 'local') {
         Write-BootInfo "출처 증명은 확인하지 않았어요(-ZipPath). 필요하면: gh attestation verify `"$zip`" --repo $Repo"
     } elseif ($SkipAttestation) {
@@ -342,6 +346,7 @@ function Invoke-Bootstrap {
                 throw "출처 증명을 확인하지 못했어요: $((($av.Err + ' ' + $av.Out).Trim() -split "`r?`n")[0]). 파일이 바뀌었거나 회사망이 확인 주소(GitHub·sigstore)를 막았을 수 있어요. 이유를 확인한 뒤에만 -SkipAttestation 을 붙이세요."
             }
             Write-BootOk "출처 증명 일치: $Repo 의 GitHub Actions 가 만든 파일이에요."
+            $attested = $true
         }
     }
 
@@ -381,6 +386,7 @@ function Invoke-Bootstrap {
         -not (Test-BootSameScript $newBoot $script:BootSelf)) {
         Write-BootStep '받은 판의 bootstrap 으로 넘겨요(이 파일과 내용이 달라요)'
         $fw = @('-Repo', $Repo, '-ZipPath', $zip, '-SumsPath', $sums, '-WorkDir', (Join-Path $base 'handoff'), '-HandoffVia', $via, '-HandoffLabel', $label)
+        if ($attested) { $fw += '-HandoffAttested' }
         foreach ($sw in @('Install', 'ApplyClaudeHooks', 'NoActivityHook', 'RegisterStartup', 'RegisterChannel', 'StartShell', 'AllowNonWindows')) {
             if ((Get-Variable -Name $sw -ValueOnly)) { $fw += "-$sw" }
         }
@@ -422,7 +428,7 @@ function Invoke-Bootstrap {
     if (-not (Test-BootDaemonUp $cfg.Port)) {
         Write-BootStep "곁 데몬 띄우기(127.0.0.1:$($cfg.Port))"
         $how = Start-BootDaemon $daemonExe $root -PreferTask
-        $up = Wait-BootDaemon $cfg.Port $(if ($how -eq '작업 스케줄러') { 8 } else { 15 })
+        $up = Wait-BootDaemon $cfg.Port 15
         if (-not $up -and $how -eq '작업 스케줄러') {
             # 로그인 세션이 없는 환경 등에서는 작업이 바로 돌지 않는다. 그때는 직접 띄운다.
             Write-BootInfo '작업 스케줄러로 뜨지 않아 직접 띄워요.'
