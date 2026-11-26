@@ -617,6 +617,8 @@ function Get-GyeotDaemonLaunch([string]$DaemonExe, [string]$ProbePath) {
 
 function Get-GyeotProcessesUnder([string[]]$Names, [string]$Root) {
     $found = @()
+    # Windows 밖(시험)에서는 프로세스 이름에 .exe 가 붙어 있다.
+    if (-not (Test-GyeotWindowsHost)) { $Names = @($Names) + @($Names | ForEach-Object { "$_.exe" }) }
     foreach ($n in $Names) {
         foreach ($p in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) {
             $path = $null
@@ -640,4 +642,109 @@ function Get-GyeotRunValue([string]$Name) {
 function ConvertTo-GyeotTomlString([string]$Text) {
     if ($Text -notmatch "['\r\n]") { return "'" + $Text + "'" }
     return '"' + ($Text -replace '\\', '\\' -replace '"', '\"' -replace "`r", '\r' -replace "`n", '\n') + '"'
+}
+
+# ───────────────────────── 점검(doctor.ps1·bootstrap.ps1) ─────────────────────────
+
+# `gyeotd --print-config` 출력에서 경로·포트를 읽는다. 데몬과 같은 해석을 쓰기 위해서다.
+function ConvertFrom-GyeotPrintConfig([string]$Text) {
+    $r = @{ Home = $null; Token = $null; Config = $null; Face = $null; Port = 47321 }
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '^#\s*데이터 폴더:\s*(.+)$') { $r.Home = $Matches[1].Trim() }
+        elseif ($line -match '^#\s*토큰:\s*(.+)$') { $r.Token = $Matches[1].Trim() }
+        elseif ($line -match '^#\s*설정 파일:\s*(.+)$') { $r.Config = $Matches[1].Trim() }
+        elseif ($line -match '^#\s*얼굴 폴더:\s*(.+)$') { $r.Face = $Matches[1].Trim() }
+        elseif ($line -match '^port\s*=\s*(\d+)\s*$') { $r.Port = [int]$Matches[1] }
+    }
+    return $r
+}
+
+# 계약 §13.1: hex(HMAC-SHA256(key = 토큰 UTF-8, msg = "gyeot-hello/v1|<포트>|<n>")).
+function Get-GyeotHelloProof([string]$Token, [int]$Port, [string]$Nonce) {
+    $key = [System.Text.Encoding]::UTF8.GetBytes($Token)
+    $msg = [System.Text.Encoding]::UTF8.GetBytes("gyeot-hello/v1|$Port|$Nonce")
+    $h = New-Object System.Security.Cryptography.HMACSHA256 (, $key)
+    try { $mac = $h.ComputeHash($msg) } finally { $h.Dispose() }
+    return (($mac | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function New-GyeotNonce {
+    $b = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+    return (($b | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+# 길이가 같은 두 hex 글을 상수 시간으로 비교한다(대소문자 무시).
+function Test-GyeotSameHex([string]$A, [string]$B) {
+    if ($null -eq $A -or $null -eq $B) { return $false }
+    $a = $A.ToLowerInvariant(); $b = $B.ToLowerInvariant()
+    if ($a.Length -ne $b.Length -or $a.Length -eq 0) { return $false }
+    $diff = 0
+    for ($i = 0; $i -lt $a.Length; $i++) { $diff = $diff -bor ([int][char]$a[$i] -bxor [int][char]$b[$i]) }
+    return ($diff -eq 0)
+}
+
+# `node --version`(v22.11.0 꼴)의 큰 판. 읽지 못하면 0.
+function Get-GyeotNodeMajor([string]$VersionText) {
+    if ($VersionText -match '^\s*v?(\d+)\.') { return [int]$Matches[1] }
+    return 0
+}
+
+# 점검 결과 한 줄. Status: ok · warn · fail · skip
+function New-GyeotCheck([string]$Name, [string]$Status, [string]$Detail) {
+    return [pscustomobject]@{ Name = $Name; Status = $Status; Detail = $Detail }
+}
+
+function Write-GyeotCheck($Check) {
+    switch ($Check.Status) {
+        'ok'   { Write-Host "  ✓ $($Check.Name) — $($Check.Detail)" -ForegroundColor Green }
+        'warn' { Write-Host "  ! $($Check.Name) — $($Check.Detail)" -ForegroundColor Yellow }
+        'fail' { Write-Host "  ✗ $($Check.Name) — $($Check.Detail)" -ForegroundColor Red }
+        default { Write-Host "  - $($Check.Name) — $($Check.Detail)" -ForegroundColor DarkGray }
+    }
+}
+
+# 127.0.0.1 에 HTTP/1.1 GET 을 직접 보내 본문을 돌려준다. 시스템 프록시 설정을 타지 않게 소켓을 쓴다.
+# 200이 아니면 예외. 응답은 64 KiB까지만 읽는다.
+function Get-GyeotLoopbackText([int]$Port, [string]$PathAndQuery, [int]$TimeoutMs = 3000) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $ar = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { throw "127.0.0.1:$Port 연결 시간 초과" }
+        $client.EndConnect($ar)
+        $client.ReceiveTimeout = $TimeoutMs
+        $client.SendTimeout = $TimeoutMs
+        $stream = $client.GetStream()
+        $req = "GET $PathAndQuery HTTP/1.1`r`nHost: 127.0.0.1:$Port`r`nConnection: close`r`nAccept: application/json`r`n`r`n"
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($req)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $buf = New-Object byte[] 65536
+        $ms = New-Object System.IO.MemoryStream
+        while ($ms.Length -lt 65536) {
+            $n = $stream.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { break }
+            $ms.Write($buf, 0, $n)
+        }
+        $text = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+    } finally { $client.Close() }
+    $sep = $text.IndexOf("`r`n`r`n")
+    if ($sep -lt 0) { throw '응답이 HTTP 꼴이 아니에요' }
+    $head = $text.Substring(0, $sep)
+    $body = $text.Substring($sep + 4)
+    if ($head -notmatch '^HTTP/1\.[01] 200 ') { throw "응답: $(($head -split "`r`n")[0])" }
+    if ($head -match '(?im)^transfer-encoding:\s*chunked') {
+        $out = New-Object System.Text.StringBuilder
+        $rest = $body
+        while ($rest.Length -gt 0) {
+            $nl = $rest.IndexOf("`r`n")
+            if ($nl -lt 0) { break }
+            $size = [Convert]::ToInt32(($rest.Substring(0, $nl).Split(';')[0]).Trim(), 16)
+            if ($size -eq 0) { break }
+            [void]$out.Append($rest.Substring($nl + 2, [Math]::Min($size, $rest.Length - $nl - 2)))
+            $rest = $rest.Substring([Math]::Min($rest.Length, $nl + 2 + $size + 2))
+        }
+        $body = $out.ToString()
+    }
+    return $body
 }

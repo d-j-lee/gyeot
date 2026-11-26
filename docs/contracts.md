@@ -213,7 +213,7 @@ cwd = "C:/work/proj"
 
 | 메서드·경로 | 토큰 | 세션 | 본문 → 응답 |
 |---|---|---|---|
-| `GET /health` | 없어도 됨 | 없어도 됨 | `{"ok":true,"version":"0.1.0"}`. 곁 데몬인지는 이것으로 판단하지 않는다(§13.1) |
+| `GET /health` | 없어도 됨 | 없어도 됨 | `{"ok":true,"version":"0.2.0"}`. 곁 데몬인지는 이것으로 판단하지 않는다(§13.1) |
 | `GET /v1/hello?n=<hex>` | 없어도 됨 | 없어도 됨 | → `{"v":1,"proof":"<64 hex>"}`(§13.1). `n`이 16–128자 hex가 아니면 `400` |
 | `GET /`·`/index.html` | 없어도 됨 | 없어도 됨 | 얼굴 `index.html`. 비밀이 없다. 서버는 `?boot=`를 읽지 않는다(얼굴 스크립트가 쓴다) |
 | `GET /assets/*` | 없어도 됨 | 없어도 됨 | 얼굴 정적 파일 |
@@ -239,7 +239,7 @@ cwd = "C:/work/proj"
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "now_ms": 1764126720123,
   "presence": { "mood": "idle", "level": "ambient", "focus_item": null, "line": "", "since_ms": 0, "focus_mode_until_ms": null },
   "items": [ "Item…" ],

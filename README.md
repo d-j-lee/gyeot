@@ -16,7 +16,19 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
 
 ## 설치 (Windows)
 
-1. **받기**: GitHub Actions의 최근 `CI` 실행에서 `gyeot-windows-x64` 산출물(zip)을 받아 푼다. 셸 설치본(`gyeot-shell-setup-x64.exe`)도 같은 곳에 있다. 직접 빌드하려면 아래 [개발](#개발)을 본다.
+### Claude Code에 맡기기 (권장)
+
+업무 PC의 Claude Code에 이 한 줄을 붙여 넣는다. 처음이면 설치하고, 이미 있으면 최신 릴리스로 바꾼다.
+
+```
+d-j-lee/gyeot 최신 릴리스로 곁을 설치(이미 있으면 업데이트)해 줘. 순서는 `gh api repos/d-j-lee/gyeot/contents/INSTALL-WITH-CLAUDE.md -H "Accept: application/vnd.github.raw"` 로 읽은 문서를 그대로 따르고, 내 설정을 바꾸기 전에는 미리보기를 보여 주고 확인을 받아.
+```
+
+전제는 `gh`가 이 저장소를 볼 수 있는 계정으로 로그인돼 있는 것이다. Claude Code가 따르는 순서와 되돌리는 법은 [INSTALL-WITH-CLAUDE.md](INSTALL-WITH-CLAUDE.md)에 있다. 릴리스의 `bootstrap.ps1`이 zip의 SHA-256을 확인한 뒤 설치하고, `doctor.ps1`로 점검까지 한다.
+
+### 손으로
+
+1. **받기**: [Releases](https://github.com/d-j-lee/gyeot/releases)에서 `gyeot-windows-x64.zip`과 `SHA256SUMS.txt`를 받는다. 셸 설치본(`gyeot-shell-setup-x64.exe`)도 같은 곳에 있지만 zip에 셸이 들어 있어 따로 필요하지 않다. 직접 빌드하려면 아래 [개발](#개발)을 본다.
 2. **설치**: 압축을 푼 폴더에서 아래 명령을 실행한다. 관리자 권한은 필요 없다.
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DryRun   # 무엇을 할지 먼저 본다
@@ -26,7 +38,8 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
    - 기본 훅에는 `PostToolBatch`(도구 묶음이 끝날 때 한 번)가 들어 있다. 사람이 승인한 뒤 곁이 "아직 기다린다"고 오해하지 않게 하는 신호다. 빼려면 `-NoActivityHook`을 준다. 그러면 승인한 뒤에도 승인 카드가 턴이 끝날 때까지 남는다.
    - `-RegisterStartup`: 로그인할 때 데몬을 창 없이 띄운다.
    - 지울 때는 `scripts\uninstall.ps1`을 쓴다. 데이터는 `-PurgeData`를 줄 때만 지운다.
-3. **띄우기**: `gyeot-shell`(투명 오버레이, 트레이, `Ctrl+Alt+Space`)을 실행한다. 셸 없이 쓰려면 `gyeotd --open`으로 브라우저에 연다(트레이 메뉴 "곁 열기"와 같다). 주소만 쳐서 열면 "열쇠가 없다"는 안내가 나온다. 얼굴 페이지는 토큰을 받지 않고, 이 명령이 만든 일회용 코드로 세션을 연다.
+3. **점검**: `powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\gyeot\scripts\doctor.ps1"`. 아무것도 바꾸지 않고, 데몬이 내 곁 데몬인지까지 본다.
+4. **띄우기**: `gyeot-shell`(투명 오버레이, 트레이, `Ctrl+Alt+Space`)을 실행한다. 셸 없이 쓰려면 `gyeotd --open`으로 브라우저에 연다(트레이 메뉴 "곁 열기"와 같다). 주소만 쳐서 열면 "열쇠가 없다"는 안내가 나온다. 얼굴 페이지는 토큰을 받지 않고, 이 명령이 만든 일회용 코드로 세션을 연다.
 
 ### Claude Code와 잇기
 
@@ -96,6 +109,10 @@ cargo test --workspace                       # Rust 전체
 cargo build --workspace && node tests/e2e/e2e.mjs --screenshots /tmp/shots
 cargo run -p gyeotd                          # http://127.0.0.1:47321 (얼굴은 face/dist)
 (cd face && npm run dev)                     # 얼굴만 따로: ?demo=panel, npm run mock
+pwsh scripts/test-install.ps1 -SourceDir <배포 폴더> -SkipInit
+pwsh scripts/test-bootstrap.ps1 -GyeotdPath target/debug/gyeotd -HookPath target/debug/gyeot-hook   # 설치 흐름 끝-끝
 ```
+
+배포는 `Cargo.toml`의 판과 같은 `v*` 태그를 올리면 CI가 Windows에서 빌드·시험(진짜 zip으로 bootstrap 끝-끝 포함)한 뒤 GitHub Release를 만든다. 릴리스 노트는 `CHANGELOG.md`의 그 판 절이다.
 
 작업 규칙은 [CLAUDE.md](CLAUDE.md)에 있다.

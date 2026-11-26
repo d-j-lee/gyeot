@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "gyeot-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "gyeot-hook"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "getrandom",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "gyeot-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "gyeotd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gyeot-server",

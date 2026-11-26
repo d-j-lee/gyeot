@@ -16,7 +16,7 @@ import { describeError, log } from './log.js';
 import { LIMITS, checkDecision, checkReply, sanitizeMeta, type ChannelMessage } from './validate.js';
 
 export const SERVER_NAME = 'gyeot';
-export const SERVER_VERSION = '0.1.0';
+export const SERVER_VERSION = '0.2.0';
 export const CHANNEL_METHOD = 'notifications/claude/channel';
 
 const TOOL_TIMEOUT_MS = 5000;

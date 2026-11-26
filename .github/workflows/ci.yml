@@ -4,6 +4,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -237,6 +238,12 @@ jobs:
       - name: 설치·지우기 자체 시험(PowerShell 7)
         shell: pwsh
         run: ./scripts/test-install.ps1 -SourceDir $env:GYEOT_FAKE -SkipInit
+      - name: 부트스트랩·점검 함수 시험(Windows PowerShell 5.1)
+        shell: powershell
+        run: .\scripts\test-bootstrap.ps1
+      - name: 부트스트랩·점검 함수 시험(PowerShell 7)
+        shell: pwsh
+        run: ./scripts/test-bootstrap.ps1
 
   # ───────────── Windows 배포본: 릴리스 빌드 → 설치 스크립트 검증 → zip·설치본 ─────────────
   windows-dist:
@@ -307,12 +314,15 @@ jobs:
           Copy-Item shell\src-tauri\target\release\gyeot-shell.exe "$stage\bin\"
           Copy-Item channel\dist\gyeot-channel.mjs "$stage\bin\"
           Copy-Item face\dist\* "$stage\face\" -Recurse
-          Copy-Item scripts\install.ps1, scripts\uninstall.ps1, scripts\gyeot-common.ps1 "$stage\scripts\"
+          Copy-Item scripts\install.ps1, scripts\uninstall.ps1, scripts\gyeot-common.ps1, scripts\doctor.ps1, scripts\bootstrap.ps1 "$stage\scripts\"
           Copy-Item examples\* "$stage\examples\" -Recurse
           if (Test-Path README.md) { Copy-Item README.md "$stage\README.md" } else { Copy-Item shell\README.md "$stage\README.md" }
           Copy-Item shell\README.md "$stage\README-shell.md"
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           @(
             "곁(gyeot) Windows x64",
+            "version: $ver",
+            "ref:    $env:GITHUB_REF_NAME",
             "commit: $env:GITHUB_SHA",
             "built:  $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))",
             "run:    $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
@@ -344,6 +354,14 @@ jobs:
           Compress-Archive -Path dist\gyeot-windows-x64\* -DestinationPath dist\gyeot-windows-x64.zip -Force
           Get-FileHash dist\gyeot-windows-x64.zip, dist\gyeot-shell-setup-x64.exe -Algorithm SHA256 | Format-List
 
+      - name: 이 zip 으로 bootstrap 끝-끝(설치·데몬·doctor·업데이트·지우기, Windows PowerShell 5.1)
+        shell: powershell
+        run: .\scripts\test-bootstrap.ps1 -ZipPath .\dist\gyeot-windows-x64.zip
+
+      - name: 이 zip 으로 bootstrap 끝-끝(PowerShell 7)
+        shell: pwsh
+        run: ./scripts/test-bootstrap.ps1 -ZipPath ./dist/gyeot-windows-x64.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: gyeot-windows-x64
@@ -362,3 +380,46 @@ jobs:
           path: shell/src-tauri/target/release/gyeot-shell.exe
           if-no-files-found: error
           retention-days: 14
+
+  # ───────────── 릴리스: v* 태그일 때만, 같은 실행의 windows dist 산출물을 그대로 올린다 ─────────────
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows-dist]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 태그와 판이 같은지
+        run: |
+          v=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then echo "태그 $GITHUB_REF_NAME 와 Cargo.toml 판 $v 가 달라요"; exit 1; fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: gyeot-windows-x64
+          path: rel
+      - uses: actions/download-artifact@v4
+        with:
+          name: gyeot-shell-setup-x64
+          path: rel
+      - name: 자산 모으기·해시
+        run: |
+          cp scripts/bootstrap.ps1 INSTALL-WITH-CLAUDE.md rel/
+          cd rel
+          sha256sum gyeot-windows-x64.zip gyeot-shell-setup-x64.exe bootstrap.ps1 INSTALL-WITH-CLAUDE.md > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -la
+      - name: 릴리스 노트(CHANGELOG 의 이 판)
+        run: |
+          awk -v tag="## $GITHUB_REF_NAME" 'index($0, tag)==1{f=1; next} /^## /{if(f) exit} f' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md 에 '## $GITHUB_REF_NAME' 절이 없어요"; exit 1; }
+          cat notes.md
+      - name: 릴리스 만들기
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" rel/gyeot-windows-x64.zip rel/gyeot-shell-setup-x64.exe rel/bootstrap.ps1 rel/INSTALL-WITH-CLAUDE.md rel/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --title "곁 $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+

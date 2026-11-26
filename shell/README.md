@@ -124,7 +124,7 @@ npx tauri build --bundles nsis
 ```
 
 - 실행 파일: `shell\src-tauri\target\release\gyeot-shell.exe`
-- 설치본: `shell\src-tauri\target\release\bundle\nsis\곁_0.1.0_x64-setup.exe`(현재 사용자 설치, 관리자 권한 불필요)
+- 설치본: `shell\src-tauri\target\release\bundle\nsis\곁_0.2.0_x64-setup.exe`(현재 사용자 설치, 관리자 권한 불필요)
 
 NSIS 설치본에는 **셸만** 들어 있습니다. 데몬·훅 심·얼굴·channel은 배포 zip의 `scripts\install.ps1`로 `%LOCALAPPDATA%\gyeot\bin`에 설치하세요. 셸은 거기 있는 `gyeotd.exe`를 찾아 띄웁니다(zip의 `bin\`에도 `gyeot-shell.exe`가 함께 들어 있어서 설치본 없이 써도 됩니다).
 

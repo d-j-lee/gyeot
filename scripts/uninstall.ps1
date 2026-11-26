@@ -154,6 +154,7 @@ try {
     Write-Host ''
     if ($DryRun) { Write-Host '미리보기를 마쳤어요.' -ForegroundColor White }
     else { Write-Host '곁을 지웠어요.' -ForegroundColor White }
+    Write-GyeotInfo 'channel 을 claude mcp 에 등록했다면 따로 지우세요: claude mcp remove gyeot --scope user'
     $exitCode = 0
 } catch {
     Write-Host ''

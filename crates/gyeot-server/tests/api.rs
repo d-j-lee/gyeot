@@ -22,7 +22,10 @@ async fn health_needs_no_token() {
         .raw("GET", "/health", &[("Host", &srv.host())], None)
         .await;
     assert_eq!(r.status, 200);
-    assert_eq!(r.json(), json!({"ok": true, "version": "0.1.0"}));
+    assert_eq!(
+        r.json(),
+        json!({"ok": true, "version": env!("CARGO_PKG_VERSION")})
+    );
     srv.stop().await;
 }
 
@@ -250,7 +253,7 @@ async fn permission_prompt_becomes_item_in_state_and_sse() {
     let first = sse.next(S).await.unwrap();
     assert_eq!(first.event, "snapshot");
     let snap = first.json();
-    assert_eq!(snap["version"], "0.1.0");
+    assert_eq!(snap["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(snap["presence"]["mood"], "idle");
     assert_eq!(snap["budget"], json!({"nudge": 4, "interrupt": 1}));
     assert_eq!(snap["settings"]["nudge_min"], 80);

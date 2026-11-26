@@ -218,7 +218,7 @@ try {
     } else {
         Write-Host '  skip 이 콘솔에서 자식 출력의 한국어를 읽지 못해 문구 확인을 건너뜀' -ForegroundColor Yellow
     }
-    foreach ($f in @('bin\gyeotd.exe', 'bin\gyeot-hook.exe', 'bin\face\index.html', 'scripts\uninstall.ps1', 'scripts\gyeot-common.ps1',
+    foreach ($f in @('bin\gyeotd.exe', 'bin\gyeot-hook.exe', 'bin\face\index.html', 'scripts\uninstall.ps1', 'scripts\gyeot-common.ps1', 'scripts\doctor.ps1', 'scripts\bootstrap.ps1',
             'snippets\claude-settings.hooks.json', 'snippets\codex-hooks.json', 'snippets\codex-config.notify.toml', 'snippets\mcp.json')) {
         Assert-Gyeot (Test-Path -LiteralPath (Join-GyeotTestPath $root $f)) "설치됨: $f"
     }

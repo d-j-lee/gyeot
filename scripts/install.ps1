@@ -260,7 +260,7 @@ try {
     if ($DryRun) {
         foreach ($pair in $plan) { Write-GyeotPlan "$($pair[0]) → $($pair[1])" }
         Write-GyeotPlan "$($src.Face)\* → $FaceDir\ (기존 face 폴더는 비우고 새로 복사)"
-        Write-GyeotPlan "uninstall.ps1, gyeot-common.ps1 → $ScriptsDir\"
+        Write-GyeotPlan "uninstall.ps1, doctor.ps1, bootstrap.ps1, gyeot-common.ps1 → $ScriptsDir\"
     } else {
         foreach ($d in @($InstallRoot, $BinDir, $ScriptsDir)) {
             if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
@@ -273,11 +273,11 @@ try {
         New-Item -ItemType Directory -Path $FaceDir -Force | Out-Null
         Copy-Item -Path (Join-Path $src.Face '*') -Destination $FaceDir -Recurse -Force
         Write-GyeotOk "face\ ($(@(Get-ChildItem -LiteralPath $FaceDir -Recurse -File).Count)개 파일)"
-        foreach ($f in @('uninstall.ps1', 'gyeot-common.ps1')) {
+        foreach ($f in @('uninstall.ps1', 'doctor.ps1', 'bootstrap.ps1', 'gyeot-common.ps1')) {
             $from = Join-Path $PSScriptRoot $f
             if (Test-Path -LiteralPath $from) { Copy-GyeotFile -From $from -To (Join-Path $ScriptsDir $f) }
         }
-        Write-GyeotOk "scripts\uninstall.ps1 (나중에 지울 때)"
+        Write-GyeotOk "scripts\uninstall.ps1 (지울 때) · doctor.ps1 (점검) · bootstrap.ps1 (업데이트)"
     }
 
     # ── 5. gyeotd --init ──
@@ -470,6 +470,7 @@ try {
             Write-GyeotInfo "곁 셸(설치본 gyeot-shell-setup)을 쓰면 트레이 아이콘의 '곁 열기'로도 열 수 있어요."
         }
         Write-GyeotInfo '얼굴 주소에는 토큰이 없어요. 주소만 복사해 열면 안내 쪽이 보이니 위 방법으로 여세요.'
+        Write-GyeotInfo "점검: powershell -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $ScriptsDir 'doctor.ps1')`""
         Write-GyeotInfo "지우기: powershell -ExecutionPolicy Bypass -File `"$(Join-Path $ScriptsDir 'uninstall.ps1')`""
     }
     $exitCode = 0

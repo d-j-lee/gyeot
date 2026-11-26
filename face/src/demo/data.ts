@@ -238,7 +238,7 @@ export const DEMO_SETTINGS: Settings = {
 export function demoSnapshot(now: number, mood: Mood = 'waiting', offsetMin = 540): Snapshot {
   const items = demoItems(now, offsetMin);
   return {
-    version: '0.1.0',
+    version: '0.2.0',
     now_ms: now,
     presence: demoPresence(now, mood),
     items,
