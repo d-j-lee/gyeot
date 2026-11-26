@@ -12,7 +12,8 @@ import type {
 import { isMood } from '../lib/labels.ts';
 import { sortItems } from '../lib/items.ts';
 
-export type ConnStatus = 'connecting' | 'open' | 'retrying' | 'auth' | 'demo';
+/** host: 배포 얼굴이 127.0.0.1 이 아닌 주소에서 열려 아무 요청도 보내지 않는다(§15.5). */
+export type ConnStatus = 'connecting' | 'open' | 'retrying' | 'auth' | 'host' | 'demo';
 
 export interface ConnState {
   status: ConnStatus;

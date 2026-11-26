@@ -178,6 +178,32 @@ describe('열쇠가 없거나 만료됐을 때(§12.1-5)', () => {
   });
 });
 
+describe('127.0.0.1 이 아닌 주소(§15.5)', () => {
+  const HOST = { status: 'host', attempt: 0, retryAt: null } as const;
+  const HOST_TEXT = '127.0.0.1 주소로 열어 주세요 — 트레이의 ‘곁 열기’나 gyeotd --open은 늘 그 주소로 엽니다';
+
+  it('기본 화면: 안내를 보이고(다시 확인·지금 다시 단추 없음), 열쇠 안내와 섞이지 않는다', () => {
+    const { ctl } = mount('default');
+    act(() => ctl.dispatch({ type: 'conn', conn: HOST }));
+    const notice = document.querySelector('.host-notice') as HTMLElement;
+    expect(notice.getAttribute('role')).toBe('alert');
+    expect(notice.querySelector('.host-notice__text')!.textContent).toBe(HOST_TEXT);
+    expect(notice.querySelector('button')).toBeNull();
+    expect(document.querySelector('.auth-notice')).toBeNull();
+    const conn = document.querySelector('.status__conn')!;
+    expect(conn.textContent).toBe('127.0.0.1 주소로 열어 주세요');
+    expect(conn.querySelector('button, .spinner')).toBeNull();
+  });
+
+  it('오버레이: 아바타가 오프라인으로 보이고 이름에 알린다', () => {
+    const { ctl } = mount('overlay');
+    act(() => ctl.dispatch({ type: 'conn', conn: HOST }));
+    const avatar = document.querySelector('.ov-avatar')!;
+    expect(avatar.classList.contains('ov-avatar--offline')).toBe(true);
+    expect(avatar.getAttribute('aria-label')).toContain('127.0.0.1 주소로 열어 주세요');
+  });
+});
+
 describe('기본 화면', () => {
   it('패널이 늘 보이고 세션 목록이 있다', () => {
     mount('default');

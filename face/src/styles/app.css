@@ -831,7 +831,9 @@ kbd {
 }
 
 /* 열쇠 만료(401) 안내 — 탭 위, 패널 폭 전체 */
-.auth-notice {
+/* 열쇠 안내(AuthNotice)와 주소 안내(HostNotice, §15.5)는 같은 꼴이다 */
+.auth-notice,
+.host-notice {
   display: flex;
   align-items: flex-start;
   flex-wrap: wrap;
@@ -845,16 +847,19 @@ kbd {
   font-size: 13px;
   line-height: 1.5;
 }
-.auth-notice > .icon {
+.auth-notice > .icon,
+.host-notice > .icon {
   flex: none;
   margin-top: 2px;
   color: var(--warn);
 }
-.auth-notice__text {
+.auth-notice__text,
+.host-notice__text {
   flex: 1 1 14em;
   margin: 0;
 }
-.auth-notice__text code {
+.auth-notice__text code,
+.host-notice__text code {
   font-family: var(--mono);
   font-size: 12px;
   padding: 0 4px;

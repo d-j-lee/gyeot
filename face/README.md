@@ -1,7 +1,7 @@
 # 곁의 얼굴 (`face/`)
 
 곁 데몬이 `/`에서 내보내는 웹 화면과 아바타다. TypeScript + Vite + Preact, UI 키트 없이 만든다.
-규격은 `../docs/contracts.md`(Snapshot·Item·Presence·Delivery·Proposal·Session, REST §7, SSE §8, 보완 §10.1, 열쇠·답 §12, 데몬 확인·소리 설정·결정 카드 §13, 얼굴 확인·메모리 세션 §14.1),
+규격은 `../docs/contracts.md`(Snapshot·Item·Presence·Delivery·Proposal·Session, REST §7, SSE §8, 보완 §10.1, 열쇠·답 §12, 데몬 확인·소리 설정·결정 카드 §13, 얼굴 확인·메모리 세션 §14.1, 127.0.0.1에서만 §15.5),
 아바타는 `../docs/avatar-spec.md`를 따른다.
 
 ## 명령
@@ -65,6 +65,7 @@ curl -H "Authorization: Bearer <토큰>" "http://127.0.0.1:47321/mock/trigger?wh
 
 패널 머리에는 기분(한국어), 데몬이 준 `presence.line`, 집중 모드 남은 시간, 연결 상태("곁 데몬에 연결 중… N초 뒤 다시 시도" + 지금 다시)를 보인다.
 세션 열쇠가 없거나 만료되면(401, 열쇠도 `boot`도 없이 열었을 때 포함) 탭 위에 "열쇠가 없거나 만료됐어요 — 트레이의 ‘곁 열기’를 누르거나 터미널에서 `gyeotd --open`을 실행하세요." 안내와 다시 확인 단추를 띄우고, 아바타는 오프라인으로 보인다.
+배포 빌드를 `127.0.0.1`이 아닌 주소(`localhost`·`[::1]` 등)로 열면 아무 요청도 보내지 않고 탭 위에 "127.0.0.1 주소로 열어 주세요 — 트레이의 ‘곁 열기’나 `gyeotd --open`은 늘 그 주소로 엽니다" 안내를 띄운다(단추 없음, 아바타는 오프라인, §15.5).
 
 | 탭 | 내용 |
 |---|---|
@@ -106,6 +107,9 @@ curl -H "Authorization: Bearer <토큰>" "http://127.0.0.1:47321/mock/trigger?wh
 
 ## 데이터 흐름
 
+- 주소(§15.5, G-042): 배포 빌드의 얼굴은 `location.hostname`이 정확히 `127.0.0.1`일 때만 데몬에 요청한다. 얼굴 확인(§14.1)은 포트만 묶으므로, `localhost`가 `::1`로 풀리면 그 주소의 같은 포트를 잡은 서버가 hello를 진짜 데몬에 중계해 확인을 통과할 수 있어서다.
+  그 밖의 주소면 부트 코드 교환·hello·스트림·REST 어느 것도 보내지 않고, 셸 IPC(`renew_session`)도 부르지 않는다(셸 안이어도 같다. 셸은 늘 127.0.0.1로 연다). 주소의 `boot`는 지금처럼 지우되 바꾸지 않는다.
+  개발 빌드(`import.meta.env.DEV`, `npm run dev`)와 데모(`?demo=`)는 예외다. 배포 빌드에서는 이 예외 분기가 빌드에서 빠진다.
 - 열쇠(§12.1, G-030): 얼굴은 토큰을 받지 않는다(meta·`?t=` 없음).
   1. 시작하자마자 주소에 `boot`가 있으면 `history.replaceState`로 `boot`만 지운다(`mode=overlay` 등은 그대로).
   2. 처음 요청이 필요할 때 `POST /v1/session {"code"}`로 세션 열쇠를 받아 `sessionStorage['gyeot.session'] = {"session","expires_ms"}`에 둔다. 동시에 여러 요청이 기다려도 코드는 한 번만 보낸다.
@@ -145,9 +149,9 @@ curl -H "Authorization: Bearer <토큰>" "http://127.0.0.1:47321/mock/trigger?wh
 src/
   types.ts            계약 타입
   state/reducer.ts    applyEvent·낙관적 숨김·고르개
-  app/                Controller(상태·말풍선·소리·낙관적 동작), Backend(HTTP·401 처리), createBackend(주소→백엔드), Observable
-  lib/                api(Authorization 머리)·session(부트 코드·세션 열쇠)·peer(얼굴 확인 hello)·stream(fetch 스트림)·sse(해석기)·bubble(차례)·time(한국어 시각)·items(정렬·점수식·FNV id)·labels·audio·voice·prefs·tauri·shape
-  components/         Avatar·Bubble·Panel·TurnTab·ItemCard·ChatTab·SettingsTab·StatusLine·SessionList·MoodSheet·AuthNotice
+  app/                Controller(상태·말풍선·소리·낙관적 동작), Backend(HTTP·401 처리), HostBlockedBackend(127.0.0.1이 아닐 때), createBackend(주소→백엔드), Observable
+  lib/                api(Authorization 머리)·session(부트 코드·세션 열쇠)·peer(얼굴 확인 hello)·origin(127.0.0.1에서만)·stream(fetch 스트림)·sse(해석기)·bubble(차례)·time(한국어 시각)·items(정렬·점수식·FNV id)·labels·audio·voice·prefs·tauri·shape
+  components/         Avatar·Bubble·Panel·TurnTab·ItemCard·ChatTab·SettingsTab·StatusLine·SessionList·MoodSheet·AuthNotice·HostNotice
   demo/               표본 데이터(mock 서버와 같이 씀)·DemoBackend
   styles/             theme(색 토큰, WCAG AA 시험)·avatar(움직임)·app
 mock/server.ts        가짜 데몬(npm run mock). server.test.ts 가 실제로 띄워 HTTP 로 시험한다
@@ -164,6 +168,7 @@ screenshots/          찍은 화면
 §12: 토큰 없음(meta·`?t=`), 주소에서 `boot`만 지우기(`replaceState`, 다른 쿼리 글자 그대로), `/v1/session` 교환(한 번만·401·닿지 않음), `sessionStorage['gyeot.session']`, 모든 요청의 `Authorization: Bearer`, 쿠키·`EventSource` 안 씀(코드 전체 검사), 배포 빌드의 `?api=` 무시,
 401이면 열쇠 지움·스트림 멈춤·`renew_session` 30초 제한·안내, 열쇠도 `boot`도 없으면 요청 0개, 집중·sleep 때 답은 배지로만, 데모는 네트워크·IPC를 안 씀(`main.tsx`를 실제로 띄워서도 본다),
 §13: 결정 카드 안내(§13.5), 설정 탭의 `approval_interrupt`(§13.3),
+§15.5: 배포 빌드는 127.0.0.1에서만(localhost·[::1]이면 요청·IPC 0건, boot는 지우되 바꾸지 않음, 안내), 개발 빌드·데모 예외(`main.tsx`를 localhost 출처로 띄워서도 본다),
 §14.1: 얼굴 확인 값(서버 담당과 같은 공유 시험 값), hello를 먼저·인증 머리 없이·스트림마다 새 n, 모르는 서버면 열쇠 0건·지움·renew/안내, hello 실패는 끊김, 데몬 재시작 흐름, REST는 확인된 연결에서만,
 가짜 데몬(`mock/`)의 부트 코드·`/v1/session`·세션 열쇠 범위(ingest·channel·boot는 403)·쿠키 거절·`/v1/hello` HMAC과 `face` 목록(섞임·최대 20·끝난 세션 없음)·보안 머리글·Host·Origin(실제로 띄워 HTTP로), vite 프록시가 `/v1`·`/health`만 넘기고 `/v1`에 `xfwd`를 싣는지.
 
@@ -175,7 +180,7 @@ screenshots/          찍은 화면
 - mock은 Host·Origin·Bearer(토큰·세션 열쇠와 그 범위)를 계약대로 검사한다. 다만 개발 서버(`127.0.0.1:5173`·`localhost:5173`) 출처는 받는다(vite 프록시가 Origin을 그대로 넘긴다). 진짜 데몬은 받지 않는다.
   그래서 개발 서버(`npm run dev`)는 mock에만 붙인다. 진짜 데몬에 붙이면 브라우저가 POST에 싣는 `Origin: http://127.0.0.1:5173` 때문에 `POST /v1/session`이 403이라 열쇠를 받지 못한다(프록시에서 Origin을 지우는 것은 검사를 느슨하게 하므로 하지 않았다).
   mock은 세션을 메모리에만 두고 `sessions.json`에 쓰지 않는다. 훅 수집·channel은 흉내 내지 않는다(토큰이면 404, 세션 열쇠면 403 — 경계만 계약대로).
-- 열쇠는 출처(스킴·호스트·**포트**)마다 갈리는 `sessionStorage`에 있으므로 `127.0.0.1`과 `localhost`, 개발 서버(5173)와 데몬(47321)은 서로 다른 열쇠를 쓴다. 각자 부트 주소로 연다.
+- 배포 빌드는 `127.0.0.1`에서만 돈다(§15.5). 개발 서버는 예외라 `localhost:5173`으로도 열리지만, 열쇠는 출처(스킴·호스트·**포트**)마다 갈리는 `sessionStorage`에 있으므로 `127.0.0.1`과 `localhost`, 개발 서버(5173)와 데몬(47321)은 서로 다른 열쇠를 쓴다. 각자 부트 주소로 연다.
 - 부트 코드는 `/v1/session`에 확인 없이 보낸다(아직 열쇠가 없어 확인할 값이 없다). 코드는 120초·한 번만이고 데몬 메모리에만 있어, 데몬이 멈춘 사이 포트를 잡은 서버가 받아도 다시 뜬 데몬에서는 쓸 수 없다.
 - 확인된 스트림이 열려 있는 동안 데몬이 죽고 다른 서버가 포트를 잡으면, 얼굴이 끊김을 알아채기 전(보통 곧바로, 늦어도 45초 감시)에 보낸 REST 요청 하나는 그 서버로 갈 수 있다. 스트림은 다시 이을 때 늘 다시 확인한다.
 - 세션 열쇠를 가진 페이지 스크립트는 얼굴이 할 수 있는 일을 다 할 수 있다(계약 §12.7). CSP가 외부 스크립트를 막지만, 얼굴에 스크립트 주입이 생기면 열쇠를 읽을 수 있다.

@@ -15,6 +15,7 @@ import { ChatTab } from './components/ChatTab.tsx';
 import { SettingsTab } from './components/SettingsTab.tsx';
 import { SessionList } from './components/SessionList.tsx';
 import { AuthNotice } from './components/AuthNotice.tsx';
+import { HostNotice } from './components/HostNotice.tsx';
 
 export interface AppConfig {
   mode: 'default' | 'overlay';
@@ -58,7 +59,9 @@ export function App({ ctl, config }: { ctl: Controller; config: AppConfig }) {
   const overlay = config.mode === 'overlay';
   // 열쇠를 잃으면 받은 상태가 더는 살아 있지 않다 — 연결 전과 같이 오프라인으로 보인다.
   const authLost = state.conn.status === 'auth';
-  const offline = (!state.synced || authLost) && state.conn.status !== 'demo';
+  // §15.5: 배포 얼굴이 127.0.0.1 이 아닌 주소에서 열렸다(아무 요청도 보내지 않는다).
+  const wrongHost = state.conn.status === 'host';
+  const offline = (!state.synced || authLost || wrongHost) && state.conn.status !== 'demo';
   const mood: Mood = state.presence.mood;
   // 오버레이에서 패널이 열려 있으면 말풍선은 패널 뒤에 숨긴다(차례는 그대로).
   const showBubble = !(overlay && open);
@@ -259,7 +262,7 @@ export function App({ ctl, config }: { ctl: Controller; config: AppConfig }) {
       onDropToast={(id) => ctl.dropToast(id)}
       onClose={overlay ? closePanel : undefined}
       demo={state.conn.status === 'demo'}
-      notice={authLost ? <AuthNotice onRetry={() => ctl.retryNow()} /> : null}
+      notice={wrongHost ? <HostNotice /> : authLost ? <AuthNotice onRetry={() => ctl.retryNow()} /> : null}
     >
       {body}
     </Panel>
@@ -280,7 +283,7 @@ export function App({ ctl, config }: { ctl: Controller; config: AppConfig }) {
   const avatarMood: Mood = offline ? 'idle' : mood;
 
   if (overlay) {
-    const label = `곁 — ${authLost ? '열쇠가 없거나 만료됐어요' : moodLabel(avatarMood)}${blockingCount ? `, 막힌 일 ${blockingCount}건` : ''}${unread ? `, 안 읽은 답 ${unread}개` : ''}. 패널 ${open ? '접기' : '열기'}`;
+    const label = `곁 — ${wrongHost ? '127.0.0.1 주소로 열어 주세요' : authLost ? '열쇠가 없거나 만료됐어요' : moodLabel(avatarMood)}${blockingCount ? `, 막힌 일 ${blockingCount}건` : ''}${unread ? `, 안 읽은 답 ${unread}개` : ''}. 패널 ${open ? '접기' : '열기'}`;
     return (
       <div class="ov">
         <LiveAnnouncer bubble={bubble} />

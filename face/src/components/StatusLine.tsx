@@ -14,6 +14,8 @@ export function connText(conn: ConnState, localNow: number): string {
       return '데모 모드 — 데몬 없이 표본 데이터로 보여요';
     case 'auth':
       return '열쇠가 없거나 만료됐어요';
+    case 'host':
+      return '127.0.0.1 주소로 열어 주세요';
     case 'retrying': {
       if (conn.retryAt === null) return '곁 데몬에 연결 중…';
       const s = Math.max(0, Math.ceil((conn.retryAt - localNow) / 1000));
@@ -45,6 +47,8 @@ export function StatusLine({ mood, line, focusUntil, now, conn, onRetry }: Statu
 
   const focusOn = focusUntil !== null && focusUntil > now;
   const offline = conn.status !== 'open' && conn.status !== 'demo';
+  // 열쇠·주소 문제는 기다려도 풀리지 않는다 — 돌아가는 표시와 지금 다시 단추를 두지 않는다(패널 위 안내가 할 일을 알린다).
+  const stuck = conn.status === 'auth' || conn.status === 'host';
 
   return (
     <div class="status">
@@ -60,10 +64,10 @@ export function StatusLine({ mood, line, focusUntil, now, conn, onRetry }: Statu
       {line && !offline && <p class="status__line">{line}</p>}
       {offline && (
         <p class={`status__conn status__conn--${conn.status}`} role="status">
-          {offline && conn.status !== 'auth' && <span class="spinner" aria-hidden="true" />}
+          {offline && !stuck && <span class="spinner" aria-hidden="true" />}
           <span>{connText(conn, tick)}</span>
-          {/* 열쇠 만료면 패널 위 안내(AuthNotice)가 다시 확인 단추를 단다 */}
-          {offline && conn.status !== 'auth' && (
+          {/* 열쇠 만료면 패널 위 안내(AuthNotice)가 다시 확인 단추를 단다. 주소 문제(HostNotice)는 단추가 없다 */}
+          {offline && !stuck && (
             <button type="button" class="btn btn--xs btn--ghost" onClick={onRetry}>
               <IconRefresh size={12} /> 지금 다시
             </button>

@@ -12,6 +12,7 @@ const loc = (href: string) => new URL(href) as unknown as Location;
 
 afterEach(() => {
   sessionStorage.clear();
+  vi.unstubAllEnvs();
   vi.useRealTimers();
   delete (window as Window & { __TAURI__?: unknown }).__TAURI__;
   vi.unstubAllGlobals();
@@ -81,6 +82,50 @@ describe('백엔드 고르기(main.tsx)', () => {
     expect(JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string)).toEqual({ code: CODE });
     expect(fetchSpy.mock.calls[3]![1]!.headers).toMatchObject({ Authorization: `Bearer ${KEY}` });
     sessionStorage.clear();
+  });
+});
+
+describe('배포 얼굴은 127.0.0.1 에서만(§15.5, G-042)', () => {
+  it('localhost(배포 빌드)면 어떤 요청도 IPC 도 보내지 않고 host 상태 — 저장된 열쇠·부트 코드가 있어도', async () => {
+    vi.stubEnv('DEV', false);
+    sessionStorage.setItem('gyeot.session', JSON.stringify({ session: 'ab'.repeat(32), expires_ms: Date.now() + 60_000 }));
+    const fetchSpy = vi.fn();
+    const esSpy = vi.fn();
+    const invoke = vi.fn(async () => undefined);
+    vi.stubGlobal('fetch', fetchSpy);
+    vi.stubGlobal('EventSource', esSpy);
+    (window as Window & { __TAURI__?: unknown }).__TAURI__ = { core: { invoke } }; // 셸 안이어도 같다
+    for (const href of ['http://localhost:47321/?mode=overlay', 'http://[::1]:47321/']) {
+      const b = createBackend(parseBoot(new URL(href).search), loc(href), 'ef'.repeat(32));
+      expect(b).not.toBeInstanceOf(HttpBackend);
+      const statuses: ConnState[] = [];
+      b.start({ status: (c) => statuses.push(c), event: () => {} });
+      expect(statuses).toEqual([{ status: 'host', attempt: 0, retryAt: null }]);
+      for (const p of [b.focus(true, 30), b.say('안녕', null), b.itemAction('it_1', 'done'), b.decide('dc_1', 'A'), b.proposal('pr_1', true), b.listening(true)]) {
+        await expect(p).rejects.toBeInstanceOf(Error);
+      }
+      b.retryNow();
+      b.stop();
+      expect(statuses).toHaveLength(1);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(esSpy).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('127.0.0.1(배포 빌드)은 그대로 실제 데몬', () => {
+    vi.stubEnv('DEV', false);
+    const href = 'http://127.0.0.1:47321/?mode=overlay';
+    expect(createBackend(parseBoot(new URL(href).search), loc(href))).toBeInstanceOf(HttpBackend);
+  });
+
+  it('개발 빌드는 localhost 도 실제 데몬(예외), 데모는 어디서든 데모', () => {
+    vi.stubEnv('DEV', true);
+    expect(createBackend(parseBoot(''), loc('http://localhost:5173/'))).toBeInstanceOf(HttpBackend);
+    vi.stubEnv('DEV', false);
+    const href = 'http://localhost:47321/?demo=panel';
+    expect(createBackend(parseBoot(new URL(href).search), loc(href))).toBeInstanceOf(DemoBackend);
   });
 });
 

@@ -8,6 +8,7 @@ import type {
 } from '../types.ts';
 import type { FaceAuth } from './session.ts';
 import { checkPeer } from './peer.ts';
+import { WrongHost } from './origin.ts';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
@@ -65,6 +66,7 @@ export function describeError(e: unknown): string {
     return `요청이 거절됐어요(${e.status})`;
   }
   if (e instanceof NotConnected) return '곁 데몬과 연결되어 있지 않아요';
+  if (e instanceof WrongHost) return '127.0.0.1 주소로 열어 주세요';
   if (e instanceof DOMException && e.name === 'AbortError') return '응답이 너무 늦어요';
   return '곁 데몬에 닿지 않아요';
 }
