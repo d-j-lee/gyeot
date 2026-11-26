@@ -95,6 +95,89 @@ function Start-BootFakeServer([int]$Port, [string]$Response, [int]$Seconds = 30)
     return $job
 }
 
+# 폴더의 파일을 이름(주소의 마지막 조각)으로 내주는 가짜 릴리스 서버. 없는 이름은 404.
+function Start-BootFileServer([int]$Port, [string]$Root, [int]$Seconds = 120) {
+    $server = {
+        param($ListenPort, $ServeRoot, $Lifetime)
+        $l = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback, $ListenPort)
+        $l.Start()
+        $deadline = (Get-Date).AddSeconds($Lifetime)
+        try {
+            while ((Get-Date) -lt $deadline) {
+                if (-not $l.Pending()) { Start-Sleep -Milliseconds 50; continue }
+                $c = $l.AcceptTcpClient()
+                try {
+                    $c.ReceiveTimeout = 5000
+                    $st = $c.GetStream()
+                    $buf = New-Object byte[] 8192
+                    $n = $st.Read($buf, 0, $buf.Length)
+                    if ($n -le 0) { continue }
+                    $req = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+                    $name = ''
+                    if ($req -match '^GET\s+\S*/([^/\s?]+)') { $name = $Matches[1] }
+                    $file = Join-Path $ServeRoot $name
+                    if ($name -and (Test-Path -LiteralPath $file -PathType Leaf)) {
+                        $body = [System.IO.File]::ReadAllBytes($file)
+                        $head = "HTTP/1.1 200 OK`r`nContent-Type: application/octet-stream`r`nContent-Length: $($body.Length)`r`nConnection: close`r`n`r`n"
+                    } else {
+                        $body = [System.Text.Encoding]::ASCII.GetBytes('not found')
+                        $head = "HTTP/1.1 404 Not Found`r`nContent-Length: $($body.Length)`r`nConnection: close`r`n`r`n"
+                    }
+                    $hb = [System.Text.Encoding]::ASCII.GetBytes($head)
+                    $st.Write($hb, 0, $hb.Length)
+                    $st.Write($body, 0, $body.Length)
+                    $st.Flush()
+                } catch {
+                    Write-Verbose $_.Exception.Message
+                } finally { $c.Close() }
+            }
+        } finally { $l.Stop() }
+    }
+    $job = Start-Job -ScriptBlock $server -ArgumentList @($Port, $Root, $Seconds)
+    $until = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $until) {
+        $probe = New-Object System.Net.Sockets.TcpClient
+        try { $probe.Connect('127.0.0.1', $Port); break } catch { Start-Sleep -Milliseconds 200 } finally { $probe.Close() }
+    }
+    return $job
+}
+
+# 가짜 gh. -LoggedIn 이 아니면 auth status 가 실패한다. 로그인이면 release 는 실패(HTTPS 로 넘어가게),
+# attestation verify --help 는 고정 옵션을 보이고, verify 는 $env:FAKE_GH_ATTEST(0/1)로 답한다. 받은 인자는 $env:FAKE_GH_LOG 에 적는다.
+function New-BootFakeGh([string]$Dir, [switch]$LoggedIn) {
+    if (Test-Path -LiteralPath $Dir) { Remove-Item -LiteralPath $Dir -Recurse -Force }
+    New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+    $authCode = if ($LoggedIn) { 0 } else { 1 }
+    if (Test-BootWindows) {
+        $cmd = @(
+            '@echo off',
+            'if defined FAKE_GH_LOG echo %* >> "%FAKE_GH_LOG%"',
+            "if `"%1`"==`"auth`" exit /b $authCode",
+            'if "%1"=="release" exit /b 1',
+            'if not "%1"=="attestation" exit /b 1',
+            'if "%3"=="--help" (echo --signer-workflow --source-ref --deny-self-hosted-runners& exit /b 0)',
+            'if "%FAKE_GH_ATTEST%"=="0" exit /b 0',
+            'echo verification failed 1>&2',
+            'exit /b 1'
+        ) -join "`r`n"
+        Set-Content -LiteralPath (Join-Path $Dir 'gh.cmd') -Value $cmd -Encoding ASCII
+    } else {
+        $sh = @(
+            '#!/bin/sh',
+            '[ -n "$FAKE_GH_LOG" ] && echo "$*" >> "$FAKE_GH_LOG"',
+            "[ `"`$1`" = auth ] && exit $authCode",
+            '[ "$1" = release ] && exit 1',
+            '[ "$1" = attestation ] || exit 1',
+            'if [ "$3" = --help ]; then echo "--signer-workflow --source-ref --deny-self-hosted-runners"; exit 0; fi',
+            '[ "$FAKE_GH_ATTEST" = 0 ] && exit 0',
+            'echo "verification failed" >&2',
+            'exit 1'
+        ) -join "`n"
+        Set-Content -LiteralPath (Join-Path $Dir 'gh') -Value $sh -Encoding ASCII
+        & chmod +x (Join-Path $Dir 'gh')
+    }
+}
+
 function Stop-BootFakeServer($Job) {
     if ($Job) { Stop-Job $Job -ErrorAction SilentlyContinue; Remove-Job $Job -Force -ErrorAction SilentlyContinue }
 }
@@ -147,6 +230,8 @@ try {
 
     Assert-Boot ((Test-BootRepoName 'd-j-lee/gyeot') -and -not (Test-BootRepoName 'a/b;c') -and -not (Test-BootRepoName '../x') -and -not (Test-BootRepoName 'x')) '저장소 이름 꼴'
     Assert-Boot ((Test-BootTagName 'v0.2.0') -and (Test-BootTagName 'v0.2.0-rc.1') -and -not (Test-BootTagName '0.2.0') -and -not (Test-BootTagName 'v0.2.0/../x') -and -not (Test-BootTagName 'v1.2.3 x')) '태그 꼴'
+    Assert-Boot (-not (Test-BootTagName "v0.2.0`n") -and -not (Test-BootTagName 'V0.2.0') -and -not (Test-BootTagName 'v0.2.0-rc.1-evil') -and -not (Test-BootTagName 'v0.2.0-beta')) '태그 꼴: 끝 줄바꿈·대문자 V·rc 뒤 덧붙임·rc 아닌 꼬리는 거절'
+    Assert-Boot (-not (Test-BootRepoName 'a/..') -and -not (Test-BootRepoName "d-j-lee/gyeot`n") -and -not (Test-BootRepoName 'a/.hidden') -and (Test-BootRepoName 'a/b.c')) '저장소 이름: ..·끝 줄바꿈·점으로 시작 거절'
     Assert-Boot ((Get-BootReleaseUrl 'd-j-lee/gyeot' '' 'a.zip') -eq 'https://github.com/d-j-lee/gyeot/releases/latest/download/a.zip') '받기 주소: 가장 최근'
     Assert-Boot ((Get-BootReleaseUrl 'd-j-lee/gyeot' 'v0.2.0' 'a.zip') -eq 'https://github.com/d-j-lee/gyeot/releases/download/v0.2.0/a.zip') '받기 주소: 태그'
     Assert-Boot ((Get-BootBuildVersion "곁(gyeot)`r`nversion: 0.2.0`r`nref: x") -eq '0.2.0' -and $null -eq (Get-BootBuildVersion 'commit: x')) 'BUILD.txt 판 읽기'
@@ -243,6 +328,84 @@ try {
         Assert-Boot (-not (Test-Path -LiteralPath (Join-Path $root 'bin'))) '미리보기 뒤 bin\ 이 없다'
         Assert-Boot ((Get-Content -LiteralPath $settings -Raw) -notmatch 'gyeot-hook') '미리보기 뒤 Claude 설정이 그대로'
 
+        Write-Host '== 3b. gh 없이 HTTPS 로 받기(가짜 릴리스 서버), 받기 실패·바뀐 zip 거절' -ForegroundColor White
+        # gh 는 가짜를 PATH 맨 앞에 둔다(이 PC의 gh·토큰과 상관없이 같은 결과가 나오게). 처음엔 "로그인 안 됨".
+        $savedPath = $env:PATH
+        $fakeGhDir = Join-Path $tmpRoot 'fake-gh'
+        New-BootFakeGh $fakeGhDir
+        $env:PATH = $fakeGhDir + [System.IO.Path]::PathSeparator + $env:PATH
+        $httpArgs = @('-InstallRoot', $root, '-ClaudeSettingsPath', $settings, '-WorkDir', (Join-Path $tmpRoot 'work-http'), '-Tag', 'v9.9.9')
+        if (-not (Test-BootWindows)) { $httpArgs += '-AllowNonWindows' }
+        $fsPort = Get-BootFreePort
+        $job = Start-BootFileServer $fsPort $rel
+        try {
+            $r = Invoke-BootTest ($httpArgs + @('-ReleaseBaseUrl', "http://127.0.0.1:$fsPort/dl", '-ApplyClaudeHooks'))
+            if ($r.Code -ne 0) { Write-Host $r.Text }
+            Assert-Boot ($r.Code -eq 0 -and $r.Text -match '\(https\)' -and $r.Text -match 'SHA-256 일치' -and $r.Text -match '미리보기만 했어요') "HTTPS 로 받아 확인·미리보기(받은 값 $($r.Code))"
+            Assert-Boot ($r.Text -match '로그인돼 있을 때만 확인해요') 'gh 로그인이 없으면 출처 증명은 건너뛴다고 알린다'
+            Assert-Boot (-not (Test-Path -LiteralPath (Join-Path $root 'bin'))) 'HTTPS 미리보기도 설치하지 않는다'
+        } finally { Stop-BootFakeServer $job }
+        # 서버에 zip 이 없으면(404) 멈춘다.
+        $emptyRel = Join-Path $tmpRoot 'empty-rel'
+        New-Item -ItemType Directory -Path $emptyRel -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $rel 'SHA256SUMS.txt') -Destination $emptyRel
+        $fsPort = Get-BootFreePort
+        $job = Start-BootFileServer $fsPort $emptyRel
+        try {
+            $r = Invoke-BootTest ($httpArgs + @('-ReleaseBaseUrl', "http://127.0.0.1:$fsPort/dl"))
+            Assert-Boot ($r.Code -eq 1 -and $r.Text -match '릴리스 파일을 받지 못했어요' -and $r.Text -notmatch 'SHA-256 일치') "받지 못하면 멈춘다(받은 값 $($r.Code))"
+        } finally { Stop-BootFakeServer $job }
+        # 서버의 zip 이 SHA256SUMS 와 다르면 멈춘다.
+        $badRel = Join-Path $tmpRoot 'bad-rel'
+        New-Item -ItemType Directory -Path $badRel -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $rel 'SHA256SUMS.txt') -Destination $badRel
+        Copy-Item -LiteralPath $zip -Destination (Join-Path $badRel 'gyeot-windows-x64.zip')
+        $fs = [System.IO.File]::Open((Join-Path $badRel 'gyeot-windows-x64.zip'), 'Append'); $fs.WriteByte(1); $fs.Dispose()
+        $fsPort = Get-BootFreePort
+        $job = Start-BootFileServer $fsPort $badRel
+        try {
+            $r = Invoke-BootTest ($httpArgs + @('-ReleaseBaseUrl', "http://127.0.0.1:$fsPort/dl", '-Install', '-ApplyClaudeHooks'))
+            Assert-Boot ($r.Code -eq 1 -and $r.Text -match '맞지 않아요' -and -not (Test-Path -LiteralPath (Join-Path $root 'bin'))) "HTTPS 로 받은 바뀐 zip 은 설치하지 않는다(받은 값 $($r.Code))"
+        } finally { Stop-BootFakeServer $job }
+
+        Write-Host '== 3b-2. gh 로그인이면 출처 증명을 확인하고, 맞지 않으면 멈춘다' -ForegroundColor White
+        New-BootFakeGh $fakeGhDir -LoggedIn
+        $env:FAKE_GH_LOG = Join-Path $tmpRoot 'fake-gh.log'
+        $fsPort = Get-BootFreePort
+        $job = Start-BootFileServer $fsPort $rel
+        try {
+            $env:FAKE_GH_ATTEST = '1'
+            $r = Invoke-BootTest ($httpArgs + @('-ReleaseBaseUrl', "http://127.0.0.1:$fsPort/dl", '-Install', '-ApplyClaudeHooks'))
+            Assert-Boot ($r.Code -eq 1 -and $r.Text -match '출처 증명을 확인하지 못했어요' -and -not (Test-Path -LiteralPath (Join-Path $root 'bin'))) "출처 증명이 실패하면 설치하지 않는다(받은 값 $($r.Code))"
+            $log = ''
+            if (Test-Path -LiteralPath $env:FAKE_GH_LOG) { $log = [System.IO.File]::ReadAllText($env:FAKE_GH_LOG) }
+            Assert-Boot ($log -match 'attestation verify \S*gyeot-windows-x64\.zip --repo d-j-lee/gyeot' -and $log.Contains('--signer-workflow d-j-lee/gyeot/.github/workflows/ci.yml') -and $log.Contains('--source-ref refs/tags/v9.9.9') -and $log.Contains('--deny-self-hosted-runners')) '출처 증명은 저장소·ci.yml·태그·GitHub 호스트 러너로 고정해 묻는다'
+            $r = Invoke-BootTest ($httpArgs + @('-ReleaseBaseUrl', "http://127.0.0.1:$fsPort/dl", '-SkipAttestation'))
+            Assert-Boot ($r.Code -eq 0 -and $r.Text -match '건너뛰었어요\(-SkipAttestation\)') "-SkipAttestation 이면 건너뛰었다고 알리고 이어 간다(받은 값 $($r.Code))"
+            $env:FAKE_GH_ATTEST = '0'
+            $r = Invoke-BootTest ($httpArgs + @('-ReleaseBaseUrl', "http://127.0.0.1:$fsPort/dl"))
+            Assert-Boot ($r.Code -eq 0 -and $r.Text -match '출처 증명 일치' -and $r.Text -match 'HTTPS 로 다시 해 볼게요') "gh 로 못 받아도 HTTPS 로 받고 출처 증명을 확인한다(받은 값 $($r.Code))"
+        } finally {
+            Stop-BootFakeServer $job
+            Remove-Item Env:FAKE_GH_ATTEST, Env:FAKE_GH_LOG -ErrorAction SilentlyContinue
+        }
+        $env:PATH = $savedPath
+
+        Write-Host '== 3c. 받은 zip 의 bootstrap 이 다르면 그쪽으로 넘긴다(업데이트 때 옛 코드와 섞이지 않게)' -ForegroundColor White
+        $hoRel = Join-Path $tmpRoot 'handoff-rel'
+        $hoStage = Join-Path $tmpRoot 'handoff-stage'
+        New-Item -ItemType Directory -Path $hoRel -Force | Out-Null
+        Expand-Archive -LiteralPath $zip -DestinationPath $hoStage -Force
+        Add-Content -LiteralPath (Join-Path $hoStage 'scripts/bootstrap.ps1') -Value '# 새 판 표시(시험)' -Encoding UTF8
+        $hoZip = Join-Path $hoRel 'gyeot-windows-x64.zip'
+        Compress-Archive -Path (Join-Path $hoStage '*') -DestinationPath $hoZip -Force
+        "$(Get-BootSha256 $hoZip)  gyeot-windows-x64.zip" | Set-Content -LiteralPath (Join-Path $hoRel 'SHA256SUMS.txt') -Encoding ASCII
+        $hoArgs = @($common); $hoArgs[1] = $hoZip
+        $r = Invoke-BootTest ($hoArgs + @('-ApplyClaudeHooks'))
+        Assert-Boot ($r.Code -eq 0 -and $r.Text -match '받은 판의 bootstrap 으로 넘겨요' -and $r.Text -match '앞선 bootstrap 이 마쳤어요\(local\)' -and $r.Text -match '미리보기만 했어요') "다른 bootstrap 으로 넘겨 이어서 한다(받은 값 $($r.Code))"
+        Assert-Boot (([regex]::Matches($r.Text, '받은 판의 bootstrap 으로 넘겨요')).Count -eq 1) '넘긴 쪽은 다시 넘기지 않는다(한 번만)'
+        Assert-Boot (-not (Test-Path -LiteralPath (Join-Path $root 'bin'))) '넘긴 미리보기도 설치하지 않는다'
+
         Write-Host '== 4. 바뀐 zip 은 거절한다' -ForegroundColor White
         $bad = Join-Path $tmpRoot 'bad'
         New-Item -ItemType Directory -Path $bad -Force | Out-Null
@@ -297,6 +460,12 @@ try {
         $t = (& $exe -NoProfile -ExecutionPolicy Bypass -File $doc -InstallRoot $root -ClaudeSettingsPath $staleSet | Out-String)
         Assert-Boot ($LASTEXITCODE -eq 1 -and $t -match '없는 파일을 부르는 곁 훅' -and $t -match '이 설치의 gyeot-hook 를 부르지 않는 이벤트') "옛 경로만 가리키는 곁 훅은 실패(받은 값 $LASTEXITCODE)"
 
+        # 훅을 넣지 않고(-ApplyClaudeHooks 없이) 업데이트해도 점검은 훅을 본다: 옛 경로 훅을 가리지 않는다.
+        $upArgs = @('-ZipPath', $zip, '-InstallRoot', $root, '-ClaudeSettingsPath', $staleSet, '-WorkDir', (Join-Path $tmpRoot 'work-nohook'), '-Install')
+        if (-not (Test-BootWindows)) { $upArgs += '-AllowNonWindows' }
+        $r = Invoke-BootTest $upArgs
+        Assert-Boot ($r.Code -eq 1 -and $r.Text -match '없는 파일을 부르는 곁 훅' -and $r.Text -match '점검에서 실패') "훅 없이 업데이트해도 고장 난 곁 훅을 알린다(받은 값 $($r.Code))"
+
         # 이 설치의 훅은 다 있어도, 없는 파일을 부르는 곁 훅이 하나 더 있으면 실패(그 훅은 매번 실패한다).
         $extraSet = Join-Path $claudeDir 'extra-broken.json'
         $ex = ConvertFrom-GyeotJsonText (Read-GyeotTextFile $settings)
@@ -324,6 +493,15 @@ try {
         try {
             $t = (& $exe -NoProfile -ExecutionPolicy Bypass -File $doc -InstallRoot $root -ClaudeSettingsPath $settings | Out-String)
             Assert-Boot ($LASTEXITCODE -eq 1 -and $t -match '다른 프로그램이 쓰고 있어요' -and $t -notmatch '닿지 않아요') "포트를 다른 프로그램이 잡으면 그렇게 알린다(받은 값 $LASTEXITCODE)"
+        } finally { Stop-BootFakeServer $job }
+
+        # 곁 hello 꼴로 답하지만 내 토큰을 모르는 서버: 내 데몬으로 받으면 안 된다(열기 코드도 받지 않는다).
+        $fakeHello = '{"service":"gyeot","proof":"' + ('0' * 64) + '","face":[]}'
+        $job = Start-BootFakeServer $port ("HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($fakeHello.Length)`r`nConnection: close`r`n`r`n" + $fakeHello)
+        try {
+            $t = (& $exe -NoProfile -ExecutionPolicy Bypass -File $doc -InstallRoot $root -ClaudeSettingsPath $settings | Out-String)
+            Assert-Boot ($LASTEXITCODE -eq 1 -and $t -match '내 토큰을 몰라요' -and $t -notmatch '내 곁 데몬\(hello') "증명이 틀린 곁 hello 는 내 데몬이 아니다(받은 값 $LASTEXITCODE)"
+            Assert-Boot ($t -match '얼굴 열기 — 데몬 확인이 안 돼 건너뛰었어요') '그때 열기 코드를 받지 않는다'
         } finally { Stop-BootFakeServer $job }
 
         Write-Host '== 8. 지우기: 곁 훅만 빠지고 사용자 훅은 남는다' -ForegroundColor White

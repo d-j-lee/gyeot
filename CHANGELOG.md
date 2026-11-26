@@ -2,7 +2,7 @@
 
 ## v0.2.0
 
-첫 배포판이다. v0.1(개발 중 판)에서 독립 검증을 여러 번 돌려 실제로 뚫린 것을 막았다. 자세한 기록은 `docs/field-notes.md`, 결정은 `docs/decisions.md` G-023~G-042.
+첫 배포판이다. v0.1(개발 중 판)에서 독립 검증을 여러 번 돌려 실제로 뚫린 것을 막았다. 자세한 기록은 `docs/field-notes.md`, 결정은 `docs/decisions.md` G-023~G-045.
 
 **설치**
 - 업무 PC에서는 `INSTALL-WITH-CLAUDE.md`의 한 줄을 Claude Code에 주면 된다. 로그인은 필요 없다.

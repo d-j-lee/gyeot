@@ -45,6 +45,7 @@ if (Test-Path $doctor) { & (Join-Path $env:LOCALAPPDATA "gyeot\bin\gyeotd.exe") 
 - `node`가 없거나 22보다 낮으면 "대화 기능만 빠진다"고 알리고 3단계부터 `-RegisterChannel`을 뺀다. `claude`를 찾지 못해도 뺀다.
 - `gh`가 없거나 로그인돼 있지 않으면 "출처 증명은 건너뛰고 SHA-256만 확인한다"고 알린다. 멈추지는 않는다.
 - 이미 설치돼 있으면 마지막 점검 표에서 지금 쓰는 선택을 읽는다. "Claude 훅"이 ok면 `-ApplyClaudeHooks`, "활동 훅이 없어요" 경고가 있으면 `-NoActivityHook`도, "로그인 시 시작"이 ok면 `-RegisterStartup`, "channel"이 ok면 `-RegisterChannel`. 업데이트는 이 선택을 그대로 쓴다.
+- "Claude 훅"이 실패(빠진 이벤트·없는 파일을 부르는 곁 훅)면 `-ApplyClaudeHooks`를 붙이자고 사람에게 제안한다. 다시 넣으면 경로를 고친다. "곁 훅이 없어요" 경고면 사람이 훅을 원하는지 묻는다.
 
 ### 2. bootstrap 받기·무결성 확인
 
@@ -52,6 +53,7 @@ if (Test-Path $doctor) { & (Join-Path $env:LOCALAPPDATA "gyeot\bin\gyeotd.exe") 
 $ErrorActionPreference = "Stop"
 $d = Join-Path $env:TEMP "gyeot-boot"; New-Item -ItemType Directory -Force -Path $d | Out-Null
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; $ProgressPreference = "SilentlyContinue"
+try { [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials } catch { "프록시 자격 증명을 넣지 못함(무시)" }
 $base = "https://github.com/d-j-lee/gyeot/releases/latest/download"
 foreach ($f in @("bootstrap.ps1", "SHA256SUMS.txt")) { Invoke-WebRequest -UseBasicParsing -Uri "$base/$f" -OutFile (Join-Path $d $f) }
 $want = ((Select-String -Path (Join-Path $d "SHA256SUMS.txt") -Pattern "  bootstrap\.ps1$").Line -split "\s+")[0]
@@ -146,6 +148,7 @@ claude mcp remove gyeot --scope user
 
 | 증상 | 할 일 |
 |---|---|
+| 한 줄 프롬프트의 `curl.exe`가 인증서 오류 | Git Bash에서는 Git의 curl이 먼저 잡혀 Windows 인증서 저장소를 쓰지 않을 수 있다. `C:\Windows\System32\curl.exe -fsSL <같은 주소>`로 다시 받는다 |
 | `curl.exe`나 `Invoke-WebRequest`가 인증서·프록시 오류 | 회사망이 github.com을 막거나 검사한다. 사람에게 알린다. `gh auth login`이 되는 PC면 bootstrap이 gh로 받는다. 안 되면 사람이 브라우저로 릴리스 페이지에서 `gyeot-windows-x64.zip`·`SHA256SUMS.txt`·`bootstrap.ps1`을 한 폴더에 받고, 3·4단계를 그 폴더의 `bootstrap.ps1`로 `-ZipPath "<그 폴더>\gyeot-windows-x64.zip"`을 더해 돌린다 |
 | "SHA-256 이 맞지 않아요" | 다시 받는다. 그래도 같으면 멈추고 알린다 |
 | "출처 증명을 확인하지 못했어요" | 멈추고 알린다. 회사망이 확인 주소를 막는 경우가 있다. 사람이 고르면 `-SkipAttestation`(SHA-256만 확인) |

@@ -19,6 +19,9 @@
     출처 증명은 확인하지 않으니, 필요하면 gh attestation verify <zip> --repo d-j-lee/gyeot 로 따로 보세요.
 .PARAMETER SkipAttestation
     출처 증명 확인을 건너뜁니다. 확인이 실패한 이유(회사망 차단 등)를 안 뒤에만 쓰세요.
+.NOTES
+    받은 zip 안의 bootstrap.ps1 이 이 파일과 다르면(설치된 옛 bootstrap 으로 업데이트할 때) 확인을 마친 zip 을
+    넘겨 새 판의 bootstrap 이 이어서 하게 합니다(-HandoffVia). -ReleaseBaseUrl 은 시험용입니다.
 .PARAMETER ApplyClaudeHooks
     ~/.claude/settings.json 을 백업한 뒤 곁의 훅을 더합니다(기존 훅은 그대로).
 .PARAMETER RegisterStartup
@@ -49,13 +52,17 @@ param(
     [switch]$SkipAttestation,
     [string]$InstallRoot,
     [string]$ClaudeSettingsPath,
-    [switch]$AllowNonWindows
+    [switch]$AllowNonWindows,
+    [string]$ReleaseBaseUrl,
+    [string]$HandoffVia,
+    [string]$HandoffLabel
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 $script:ZipName = 'gyeot-windows-x64.zip'
 $script:SumsName = 'SHA256SUMS.txt'
+$script:BootSelf = $PSCommandPath
 
 function Write-BootStep([string]$m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Write-BootInfo([string]$m) { Write-Host "    $m" }
@@ -170,8 +177,9 @@ function Test-BootDaemonUp([int]$Port) {
 }
 
 # 저장소·태그는 URL 과 명령줄에 들어가므로 꼴을 좁힌다.
-function Test-BootRepoName([string]$Name) { return ($Name -match '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$') }
-function Test-BootTagName([string]$Name) { return ($Name -match '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') }
+# \z: 끝 줄바꿈도 받지 않는다. -cmatch: 대소문자를 가린다(태그는 소문자 v). CI 의 태그 검사와 같은 꼴이다.
+function Test-BootRepoName([string]$Name) { return ($Name -cmatch '\A[A-Za-z0-9-]+/[A-Za-z0-9_-][A-Za-z0-9._-]*\z' -and $Name -notmatch '\.\.') }
+function Test-BootTagName([string]$Name) { return ($Name -cmatch '\Av\d+\.\d+\.\d+(-rc\.\d+)?\z') }
 
 function Get-BootReleaseUrl([string]$Repo, [string]$Tag, [string]$Asset) {
     if ($Tag) { return "https://github.com/$Repo/releases/download/$Tag/$Asset" }
@@ -232,7 +240,8 @@ function Invoke-Bootstrap {
     if (-not (Test-BootWindows) -and -not $AllowNonWindows) { throw '곁은 Windows용이에요. 이 PC는 Windows가 아니에요.' }
     if ($PSVersionTable.PSVersion.Major -lt 5) { throw "PowerShell 5.1 이상이 필요해요(지금 $($PSVersionTable.PSVersion))." }
     if (-not (Test-BootRepoName $Repo)) { throw "저장소 이름 꼴이 아니에요: $Repo" }
-    if ($Tag -and -not (Test-BootTagName $Tag)) { throw "태그 꼴이 아니에요(v0.2.0 처럼): $Tag" }
+    if ($Tag -and -not (Test-BootTagName $Tag)) { throw "태그 꼴이 아니에요(v0.2.0, v0.2.0-rc.1 처럼): $Tag" }
+    if ($ReleaseBaseUrl -and $ReleaseBaseUrl -notmatch '\Ahttps?://') { throw "-ReleaseBaseUrl 은 http(s) 주소여야 해요: $ReleaseBaseUrl" }
 
     $base = $WorkDir
     if (-not $base) {
@@ -285,6 +294,7 @@ function Invoke-Bootstrap {
             if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
             foreach ($asset in @($script:SumsName, $script:ZipName)) {
                 $url = Get-BootReleaseUrl $Repo $Tag $asset
+                if ($ReleaseBaseUrl) { $url = "$($ReleaseBaseUrl.TrimEnd('/'))/$asset" }
                 Write-BootInfo "받기: $url"
                 try { Invoke-BootDownload $url (Join-Path $dir $asset) }
                 catch { throw "릴리스 파일을 받지 못했어요($url): $($_.Exception.Message). 회사망이 github.com 을 막으면 gh auth login 뒤 다시 하거나, 릴리스 페이지에서 받아 -ZipPath 로 주세요." }
@@ -301,7 +311,9 @@ function Invoke-Bootstrap {
     $map = Read-BootSumFile ([System.IO.File]::ReadAllText($sums))
     $hash = Assert-BootHash $zip $map
     Write-BootOk "SHA-256 일치(받다가 깨지지 않았어요): $($hash.Substring(0, 16))…"
-    if ($via -eq 'local') {
+    if ($via -eq 'local' -and $HandoffVia) {
+        Write-BootInfo "받기·출처 확인은 앞선 bootstrap 이 마쳤어요($HandoffVia)."
+    } elseif ($via -eq 'local') {
         Write-BootInfo "출처 증명은 확인하지 않았어요(-ZipPath). 필요하면: gh attestation verify `"$zip`" --repo $Repo"
     } elseif ($SkipAttestation) {
         Write-BootWarn '출처 증명 확인을 건너뛰었어요(-SkipAttestation).'
@@ -312,7 +324,13 @@ function Invoke-Bootstrap {
         if ($help.Code -ne 0) {
             Write-BootInfo 'gh 가 오래돼 출처 증명을 확인하지 못했어요(gh 2.49 이상 필요). 이번엔 SHA-256 만 봤어요.'
         } else {
-            $av = Invoke-BootGh $gh.Source @('attestation', 'verify', $zip, '--repo', $Repo) 180000
+            # 이 저장소의 ci.yml 이, 이 태그에서, GitHub 호스트 러너로 만든 것만 받는다(gh 가 그 옵션을 알 때).
+            $avArgs = @('attestation', 'verify', $zip, '--repo', $Repo)
+            $helpText = $help.Out + "`n" + $help.Err
+            if ($helpText -match '--signer-workflow') { $avArgs += @('--signer-workflow', "$Repo/.github/workflows/ci.yml") }
+            if ($label -and (Test-BootTagName $label) -and $helpText -match '--source-ref') { $avArgs += @('--source-ref', "refs/tags/$label") }
+            if ($helpText -match '--deny-self-hosted-runners') { $avArgs += '--deny-self-hosted-runners' }
+            $av = Invoke-BootGh $gh.Source $avArgs 180000
             if ($av.Code -ne 0) {
                 throw "출처 증명을 확인하지 못했어요: $((($av.Err + ' ' + $av.Out).Trim() -split "`r?`n")[0]). 파일이 바뀌었거나 회사망이 확인 주소(GitHub·sigstore)를 막았을 수 있어요. 이유를 확인한 뒤에만 -SkipAttestation 을 붙이세요."
             }
@@ -344,7 +362,24 @@ function Invoke-Bootstrap {
             elseif ($label -eq 'local') { $label = "v$ver(받은 파일)" }
         }
     }
+    if ($HandoffLabel) { $label = $HandoffLabel }
     if (-not $label) { $label = '(판 모름)' }
+
+    # ── 3b. 받은 판의 bootstrap 이 이 파일과 다르면 그쪽으로 넘긴다 ──
+    # 설치된 옛 bootstrap 으로 업데이트할 때, 옛 코드가 새 판의 스크립트와 섞여 돌지 않게 한다.
+    # 넘기는 zip 은 여기서 SHA-256(과 출처 증명)을 마친 것이다.
+    $newBoot = Join-Path (Join-Path $stage 'scripts') 'bootstrap.ps1'
+    if (-not $HandoffVia -and $script:BootSelf -and (Test-Path -LiteralPath $newBoot) -and (Test-Path -LiteralPath $script:BootSelf) -and
+        ((Get-BootSha256 $newBoot) -ne (Get-BootSha256 $script:BootSelf))) {
+        Write-BootStep '받은 판의 bootstrap 으로 넘겨요(이 파일과 내용이 달라요)'
+        $fw = @('-Repo', $Repo, '-ZipPath', $zip, '-SumsPath', $sums, '-WorkDir', (Join-Path $base 'handoff'), '-HandoffVia', $via, '-HandoffLabel', $label)
+        foreach ($sw in @('Install', 'ApplyClaudeHooks', 'NoActivityHook', 'RegisterStartup', 'RegisterChannel', 'StartShell', 'AllowNonWindows')) {
+            if ((Get-Variable -Name $sw -ValueOnly)) { $fw += "-$sw" }
+        }
+        if ($InstallRoot) { $fw += @('-InstallRoot', $InstallRoot) }
+        if ($ClaudeSettingsPath) { $fw += @('-ClaudeSettingsPath', $ClaudeSettingsPath) }
+        return (Invoke-BootScript $newBoot $fw)
+    }
 
     # ── 4. 미리보기(늘) ──
     Write-BootStep '미리보기(install.ps1 -DryRun)'
@@ -436,7 +471,7 @@ function Invoke-Bootstrap {
     $dArgs = @('-InstallRoot', $root)
     if ($ClaudeSettingsPath) { $dArgs += @('-ClaudeSettingsPath', $ClaudeSettingsPath) }
     if ($NoActivityHook) { $dArgs += '-NoActivityHook' }
-    if (-not $ApplyClaudeHooks) { $dArgs += '-NoHooks' }
+    # 훅을 이번에 넣지 않았어도 점검은 한다. 곁 훅이 없으면 doctor 가 경고만 하고, 옛 경로를 부르는 곁 훅은 실패로 알린다.
     $code = Invoke-BootScript $doctor $dArgs
     Write-Host ''
     if ($code -ne 0) { Write-Host '설치는 했지만 점검에서 실패가 있어요. 위 ✗ 줄을 보세요.' -ForegroundColor Red; return 1 }

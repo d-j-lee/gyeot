@@ -117,3 +117,14 @@ VR7 검증자가 자기 발견의 이벤트 열을 그대로 다시 돌렸다(�
 - 시험: `test-bootstrap` 64(+21: 저장소·태그 꼴, 받기 주소, BUILD 판, 경로 비교, 훅 처리기 경로, 셸 형식 병합 3, 127.0.0.1 HTTP 상태·청크·HTTP 아님, 받기 함수, doctor의 훅 없음·옛 경로·없는 파일 하나·활동 훅 없음·다른 서버), `test-install` 134(+4). PSScriptAnalyzer 경고 0, 5.1 문법 호환 0.
 - 변이 4개(병합 되돌리기, 다른 서버를 응답 없음으로, 없는 파일을 경고로, 훅 없음을 실패로)가 모두 잡혔다. 처음에는 "없는 파일" 변이가 살아남아(다른 실패가 함께 나서 가려짐) 그 경우만 따로 보는 시험을 더했다.
 - 추론: Claude Code의 셸 도구가 끝나도 bootstrap이 띄운 데몬은 산다. libuv는 직접 띄운 자식만 kill-on-close 잡에 넣고 손자는 빼기 때문이다(libuv `uv__init_global_job_handle`의 SILENT_BREAKAWAY_OK). 실측 전이라, `-RegisterStartup`이면 작업 스케줄러로 띄우고 안 뜨면 직접 띄운다.
+
+## 2026-11-26 · 배포 흐름 회귀 검증(a38168e)과 고친 판
+
+같은 지적 목록을 받은 새 에이전트가 사본(worktree)에서 실험했다(약 14분). 지난 발견: H1·M1·M2·M4~M7과 낮음 10개 FIXED, M3와 bootstrap 자체 해시 PARTIAL.
+
+- 높음 1: release-check가 같은 프로세스에서 부른 bootstrap의 출력을 받지 못해 늘 실패(Write-Host는 정보 스트림). 중간 1: 설치 문서 2단계가 받기 404에도 "SHA-256 일치"로 끝남. 둘 다 검증 결과가 오기 전에 이쪽에서도 따로 재현해 46bd570에서 고쳤다(6>&1, `$ErrorActionPreference = "Stop"`과 빈 기대값 거절).
+- 빠진 시험(중간): doctor의 증명 불일치 분기. 그 분기를 `$true`로 바꾼 변이가 64/64를 통과했다. 증명이 틀린 곁 hello를 주는 서버 시험을 더했다.
+- 낮음을 고쳤다: 태그·저장소 꼴(`\z`·대소문자·`..`, CI와 같은 `-rc.N`만), CI 태그 검사(`v0.2.0-rc.1-evil`을 받던 case 문 → 정규식, bash로 7가지 꼴 확인), 출처 증명 고정(`--signer-workflow` ci.yml·`--source-ref` 태그·`--deny-self-hosted-runners`, gh가 그 옵션을 알 때), 훅 없이 업데이트할 때 doctor에 `-NoHooks`를 넘겨 고장 난 훅을 가리던 것, 설치된 옛 bootstrap이 새 판 스크립트와 섞여 도는 것(받은 zip의 bootstrap이 다르면 확인을 마친 zip을 넘겨 그쪽이 잇는다), install의 작업 스케줄러 시작이 실제로 떴는지 보지 않던 것, 2단계의 프록시 자격 증명, Git Bash curl 인증서 오류 안내, CHANGELOG의 결정 범위.
+- release-check의 단계 스크립트를 `scripts/test-release.ps1`(UTF-8 BOM)로 옮겼다. 러너가 인라인 스크립트를 BOM 없이 쓰면 5.1이 한글 비교 문자열을 깨뜨릴 수 있어서다(추론, 러너 소스는 확인하지 못했다).
+- 시험: `test-bootstrap` 81(+17: 엄격한 꼴 2, 가짜 릴리스 서버로 HTTPS 받기·404·바뀐 zip, 가짜 gh로 출처 증명 실패·고정 옵션·`-SkipAttestation`·HTTPS 뒤 증명, 새 판 bootstrap으로 넘기기 3, 훅 없이 업데이트, 증명이 틀린 서버 2), `test-install` 134. PSScriptAnalyzer 경고 0, 5.1 문법 0, actionlint 0.
+- 변이 7개(증명 받아들이기, 출처 증명 경고로, 느슨한 태그, 넘기기 끄기, `-NoHooks` 되살리기, signer 고정 빼기, 그리고 앞 라운드의 병합 되돌리기) 모두 잡혔다. `-NoHooks` 변이는 처음에 줄을 반만 바꿔 문법이 깨진 채 "잡혔다"고 나와, 줄 전체를 바꿔 다시 돌렸다(그 시험 하나만 실패).

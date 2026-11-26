@@ -397,13 +397,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: 태그와 판이 같은지(vX.Y.Z, 또는 미리 내는 vX.Y.Z-rc.N)
         id: ver
+        shell: bash
         run: |
           v=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          case "$GITHUB_REF_NAME" in
-            "v$v") echo "pre=false" >> "$GITHUB_OUTPUT" ;;
-            "v$v"-rc.[0-9]*) echo "pre=true" >> "$GITHUB_OUTPUT" ;;
-            *) echo "태그 $GITHUB_REF_NAME 와 Cargo.toml 판 $v 가 맞지 않아요(v$v 또는 v$v-rc.N)"; exit 1 ;;
-          esac
+          rc="^v${v//./\\.}-rc\.[0-9]+$"
+          if [[ "$GITHUB_REF_NAME" == "v$v" ]]; then echo "pre=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF_NAME" =~ $rc ]]; then echo "pre=true" >> "$GITHUB_OUTPUT"
+          else echo "태그 $GITHUB_REF_NAME 와 Cargo.toml 판 $v 가 맞지 않아요(v$v 또는 v$v-rc.N)"; exit 1
+          fi
           echo "base=v$v" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
@@ -433,7 +434,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           for f in gyeot-windows-x64.zip gyeot-shell-setup-x64.exe bootstrap.ps1 INSTALL-WITH-CLAUDE.md; do
-            gh attestation verify "rel/$f" --repo "$GITHUB_REPOSITORY"
+            gh attestation verify "rel/$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" --source-ref "$GITHUB_REF" --deny-self-hosted-runners
           done
       - name: 릴리스 노트(CHANGELOG 의 이 판)
         env:
@@ -452,9 +454,8 @@ jobs:
           gh release create "$GITHUB_REF_NAME" rel/gyeot-windows-x64.zip rel/gyeot-shell-setup-x64.exe rel/bootstrap.ps1 rel/INSTALL-WITH-CLAUDE.md rel/SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" --title "곁 $GITHUB_REF_NAME" --notes-file notes.md --verify-tag "${flags[@]}"
 
-  # 올린 릴리스를 사람이 받는 길 그대로 받아 Windows 에 설치·업데이트·점검·지우기까지 해 본다.
-  # 5.1 은 gh 로그인 없이 HTTPS 로(처음 설치), 7 은 gh 로그인으로(출처 증명 확인, 같은 폴더 위 업데이트).
-  # bootstrap 은 Write-Host 로 쓰므로 같은 프로세스에서 부를 때 6>&1 로 받아야 출력 검사가 된다.
+  # 올린 릴리스를 사람이 받는 길 그대로 받아 Windows 에 설치·업데이트·점검·지우기까지 해 본다(scripts/test-release.ps1).
+  # 5.1 은 gh 로그인 없이 HTTPS 로(처음 설치), 7 은 gh 로그인으로(출처 증명 확인, 설치된 bootstrap 으로 업데이트).
   release-check:
     name: release-check (Windows, 받은 릴리스로)
     if: startsWith(github.ref, 'refs/tags/v')
@@ -462,57 +463,24 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
-      - name: bootstrap.ps1 받기·무결성(HTTPS, 인증 없음)
+      - uses: actions/checkout@v4
+      - name: 받기·무결성(HTTPS, 인증 없음)
         shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $d = Join-Path $env:RUNNER_TEMP 'gyeot-boot'
-          New-Item -ItemType Directory -Force -Path $d | Out-Null
-          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-          $ProgressPreference = 'SilentlyContinue'
-          $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME"
-          foreach ($f in @('bootstrap.ps1', 'SHA256SUMS.txt', 'INSTALL-WITH-CLAUDE.md')) { Invoke-WebRequest -UseBasicParsing -Uri "$base/$f" -OutFile (Join-Path $d $f) }
-          foreach ($f in @('bootstrap.ps1', 'INSTALL-WITH-CLAUDE.md')) {
-            $want = ((Select-String -Path (Join-Path $d 'SHA256SUMS.txt') -Pattern "  $([regex]::Escape($f))$").Line -split '\s+')[0]
-            $got = (Get-FileHash -Algorithm SHA256 (Join-Path $d $f)).Hash.ToLowerInvariant()
-            if ($got -ne $want) { throw "$f 해시가 맞지 않아요($got / $want)" }
-            Write-Host "$f 해시 일치"
-          }
+        run: .\scripts\test-release.ps1 -Tag $env:GITHUB_REF_NAME -Step fetch
       - name: 미리보기(5.1, HTTPS) — 아무것도 바꾸지 않는다
         shell: powershell
-        run: |
-          & "$env:RUNNER_TEMP\gyeot-boot\bootstrap.ps1" -Tag $env:GITHUB_REF_NAME -ApplyClaudeHooks -RegisterStartup 6>&1 | Tee-Object -Variable out | Out-Host
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          if (-not (($out | Out-String) -match '미리보기만 했어요')) { Write-Host '미리보기 끝 줄이 없어요'; exit 1 }
-          if (Test-Path "$env:LOCALAPPDATA\gyeot\bin") { Write-Host '미리보기가 설치했어요'; exit 1 }
+        run: .\scripts\test-release.ps1 -Tag $env:GITHUB_REF_NAME -Step preview
       - name: 설치·점검(5.1, HTTPS, 기본 폴더)
         shell: powershell
-        run: |
-          & "$env:RUNNER_TEMP\gyeot-boot\bootstrap.ps1" -Tag $env:GITHUB_REF_NAME -ApplyClaudeHooks -RegisterStartup -Install 6>&1 | Tee-Object -Variable out | Out-Host
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          $t = $out | Out-String
-          foreach ($want in @('SHA-256 일치', '점검 통과', '내 곁 데몬', '설치·점검을 마쳤어요')) { if ($t -notmatch [regex]::Escape($want)) { Write-Host "출력에 '$want' 가 없어요"; exit 1 } }
+        run: .\scripts\test-release.ps1 -Tag $env:GITHUB_REF_NAME -Step install
       - name: 업데이트·점검(7, gh 로그인 → 출처 증명 확인)
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          & "$env:LOCALAPPDATA\gyeot\scripts\bootstrap.ps1" -Tag $env:GITHUB_REF_NAME -ApplyClaudeHooks -RegisterStartup -Install 6>&1 | Tee-Object -Variable out | Out-Host
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          $t = $out | Out-String
-          foreach ($want in @('출처 증명 일치', '점검 통과', '내 곁 데몬')) { if ($t -notmatch [regex]::Escape($want)) { Write-Host "출력에 '$want' 가 없어요"; exit 1 } }
-          $s = Get-Content -Raw "$env:USERPROFILE\.claude\settings.json" | ConvertFrom-Json
-          $n = @($s.hooks.Stop | ForEach-Object { $_.hooks } | Where-Object { $_.command -match 'gyeot-hook' }).Count
-          if ($n -ne 1) { Write-Host "업데이트 뒤 Stop 의 곁 훅이 $n 개예요(1이어야)"; exit 1 }
-      - name: 점검만(설치 폴더의 doctor)
+        run: ./scripts/test-release.ps1 -Tag $env:GITHUB_REF_NAME -Step update -ExpectAttestation
+      - name: 점검만(설치 폴더의 doctor, 5.1)
         shell: powershell
-        run: |
-          & "$env:LOCALAPPDATA\gyeot\scripts\doctor.ps1"
-          exit $LASTEXITCODE
-      - name: 지우기(훅·시작 등록 포함)
+        run: .\scripts\test-release.ps1 -Tag $env:GITHUB_REF_NAME -Step doctor
+      - name: 지우기(훅·시작 등록 포함, 5.1)
         shell: powershell
-        run: |
-          & "$env:LOCALAPPDATA\gyeot\scripts\uninstall.ps1" -RemoveClaudeHooks
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          if (Get-ScheduledTask -TaskName gyeot-daemon -ErrorAction SilentlyContinue) { Write-Host '작업 스케줄러 등록이 남았어요'; exit 1 }
-          if (Test-Path "$env:LOCALAPPDATA\gyeot\bin") { Write-Host 'bin 이 남았어요'; exit 1 }
+        run: .\scripts\test-release.ps1 -Tag $env:GITHUB_REF_NAME -Step uninstall

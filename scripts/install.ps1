@@ -139,13 +139,23 @@ function Start-GyeotDaemonHidden {
 }
 
 # 로그인 시작 작업이 있으면 작업 스케줄러로 띄운다(이 스크립트를 부른 도구의 프로세스 트리와 떨어져 돈다).
+# 로그인 세션이 없는 환경처럼 작업이 바로 돌지 않으면 몇 초 뒤 직접 띄운다.
 function Start-GyeotDaemonPreferTask {
     param([string]$DaemonExe)
+    $bin = Split-Path -Parent $DaemonExe
     if (Test-GyeotWindowsHost) {
         $task = $null
         try { $task = Get-ScheduledTask -TaskName $script:GyeotTaskName -ErrorAction Stop } catch { $task = $null }
         if ($task) {
-            try { Start-ScheduledTask -TaskName $script:GyeotTaskName -ErrorAction Stop; return '작업 스케줄러' } catch { Write-Verbose $_.Exception.Message }
+            try {
+                Start-ScheduledTask -TaskName $script:GyeotTaskName -ErrorAction Stop
+                $deadline = (Get-Date).AddSeconds(6)
+                while ((Get-Date) -lt $deadline) {
+                    if (@(Get-GyeotProcessesUnder @('gyeotd') $bin).Count -gt 0) { return '작업 스케줄러' }
+                    Start-Sleep -Milliseconds 300
+                }
+                Write-GyeotInfo '작업 스케줄러로 뜨지 않아 직접 띄워요.'
+            } catch { Write-Verbose $_.Exception.Message }
         }
     }
     Start-GyeotDaemonHidden $DaemonExe
@@ -430,7 +440,6 @@ try {
             Write-GyeotPlan "작업 스케줄러: 로그인 시 `"$($launch.Execute)`" $($launch.Arguments)"
         } else {
             $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-            $registered = $false
             try {
                 if ($launch.Arguments) {
                     $action = New-ScheduledTaskAction -Execute $launch.Execute -Argument $launch.Arguments -WorkingDirectory $launch.WorkingDirectory
@@ -443,7 +452,6 @@ try {
                     -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
                 Register-ScheduledTask -TaskName $script:GyeotTaskName -Action $action -Trigger $trigger -Principal $principal `
                     -Settings $settings -Description '곁 데몬(gyeotd)을 로그인할 때 창 없이 띄웁니다.' -Force | Out-Null
-                $registered = $true
                 Write-GyeotOk '작업 스케줄러에 등록했어요.'
             } catch {
                 Write-GyeotWarn "작업 스케줄러가 거절했어요: $($_.Exception.Message)"
@@ -454,10 +462,9 @@ try {
                 Write-GyeotOk "Run 값 '$script:GyeotRunValueDaemon' 을 등록했어요."
             }
             if (-not $NoStart -and -not (Get-GyeotProcessesUnder @('gyeotd') $BinDir).Count) {
-                if ($registered) { Start-ScheduledTask -TaskName $script:GyeotTaskName }
-                else { Start-GyeotDaemonHidden $dst.Daemon }
+                $how = Start-GyeotDaemonPreferTask $dst.Daemon
                 $wasDaemon = $false
-                Write-GyeotOk '곁 데몬을 띄웠어요.'
+                Write-GyeotOk "곁 데몬을 띄웠어요($how)."
             }
         }
     }
