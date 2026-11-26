@@ -12,10 +12,13 @@ struct Masker {
     bearer: Regex,
     tokens: Regex,
     slack_hook: Regex,
+    discord_hook: Regex,
     auth_header: Regex,
     cookie_header: Regex,
     secret_flag: Regex,
     mysql_p: Regex,
+    cmd_flags: Vec<Regex>,
+    aws_set: Regex,
     user_secret: Regex,
     secret_kv: Regex,
     secret_word: Regex,
@@ -54,6 +57,8 @@ fn masker() -> &'static Masker {
         .expect("token regex"),
         slack_hook: Regex::new(r"(?i)(?P<h>\bhooks\.slack\.com/services/)[A-Za-z0-9/_\-]+")
             .expect("slack webhook regex"),
+        discord_hook: Regex::new(r"(?i)(?P<h>\bdiscord(?:app)?\.com/api/webhooks/)[A-Za-z0-9/_\-]+")
+            .expect("discord webhook regex"),
         // `Authorization: [방식] <값>`(Basic·Bearer 등). 닫는 따옴표는 남긴다.
         auth_header: Regex::new(&format!(
             r#"(?i)(?P<h>\b(?:proxy-)?authorization["']?\s*:\s*["']?(?:(?:basic|bearer|digest|token|negotiate|ntlm)\s+)?){VALUE}"#
@@ -62,9 +67,9 @@ fn masker() -> &'static Masker {
         // `Cookie: …`·`Set-Cookie: …`: 값에 공백·`;`가 들어 있으므로 따옴표나 끝까지.
         cookie_header: Regex::new(r#"(?i)(?P<h>\b(?:set-)?cookie["']?\s*:\s*["']?)(?P<v>[^\s"'][^"']*)"#)
             .expect("cookie header regex"),
-        // 값을 공백 뒤에 받는 플래그(`--password SECRET`).
+        // 값을 공백(또는 `=`) 뒤에 받는 긴 플래그(`--password SECRET`, §14.5·§15.4).
         secret_flag: Regex::new(&format!(
-            r"(?i)(?P<h>(?:^|\s)--(?:password|passwd|token|secret|api-key|access-token|auth)\s+){VALUE}"
+            r"(?i)(?P<h>(?:^|\s)--(?:password|passwd|token|secret-access-key|secret-key|secret|api-key|access-token|auth|client-secret|private-key|passphrase)(?:\s+|=)){VALUE}"
         ))
         .expect("secret flag regex"),
         // mysql·mysqldump·mysqladmin의 붙여 쓴 `-p<값>`(`-P`는 포트라 대소문자를 가린다).
@@ -72,6 +77,22 @@ fn masker() -> &'static Masker {
             r"(?P<h>(?i:\bmysql(?:dump|admin)?\b)[^;&|]*?\s-p){VALUE}"
         ))
         .expect("mysql password regex"),
+        // 명령으로 가린 짧은 플래그(§15.4). 다른 명령의 같은 글자(`docker run -p 8080:80`, `ssh -p 22`)는 그대로다.
+        cmd_flags: [
+            r"(?P<h>(?i:\b(?:docker|podman)\s+login\b)[^;&|]*?\s-p\s+)",
+            r"(?P<h>(?i:\baz\s+login\b)[^;&|]*?\s-p\s+)",
+            r"(?P<h>(?i:\bsshpass\b)[^;&|]*?\s-p\s*)",
+            r"(?P<h>(?i:\bredis-cli\b)[^;&|]*?\s-a\s+)",
+            r"(?P<h>(?i:\bopenssl\b)[^;&|]*?\s-(?:k|pass|passin|passout)\s+)",
+        ]
+        .iter()
+        .map(|h| Regex::new(&format!("{h}{VALUE}")).expect("command flag regex"))
+        .collect(),
+        // `aws configure set <키> <값>`: 키가 비밀 꼴이면 값을 가린다(§15.4).
+        aws_set: Regex::new(&format!(
+            r"(?P<h>(?i:\baws\s+configure\s+set)\s+(?P<k>[^\s\x22']+)\s+){VALUE}"
+        ))
+        .expect("aws configure set regex"),
         // `-u`·`--user` 다음 `이름:비밀`.
         user_secret: Regex::new(
             r#"(?P<h>(?:^|\s)(?:-u|--user)(?:\s+|=)["']?(?P<n>[^\s:"']+):)(?P<v>[^\s"']+)"#,
@@ -97,7 +118,7 @@ fn masker() -> &'static Masker {
     })
 }
 
-/// 비밀처럼 보이는 것을 [`MASK`]로 바꾼다(계약 §2.4, §13.4, §14.5). 두 번 가려도 같다.
+/// 비밀처럼 보이는 것을 [`MASK`]로 바꾼다(계약 §2.4, §13.4, §14.5, §15.4). 두 번 가려도 같다.
 pub fn mask(s: &str) -> String {
     let m = masker();
     let s = m.private_key.replace_all(s, MASK);
@@ -105,10 +126,21 @@ pub fn mask(s: &str) -> String {
     let s = m.bearer.replace_all(&s, "${b}[가림]");
     let s = m.tokens.replace_all(&s, MASK);
     let s = m.slack_hook.replace_all(&s, "${h}[가림]");
+    let s = m.discord_hook.replace_all(&s, "${h}[가림]");
     let s = m.auth_header.replace_all(&s, mask_value);
     let s = m.cookie_header.replace_all(&s, "${h}[가림]");
     let s = m.secret_flag.replace_all(&s, mask_value);
-    let s = m.mysql_p.replace_all(&s, mask_value);
+    let mut s = m.mysql_p.replace_all(&s, mask_value).into_owned();
+    for re in &m.cmd_flags {
+        s = re.replace_all(&s, mask_value).into_owned();
+    }
+    let s = m.aws_set.replace_all(&s, |c: &regex::Captures<'_>| {
+        if is_secret_key(m, &c["k"]) {
+            mask_value(c)
+        } else {
+            c[0].to_owned()
+        }
+    });
     let s = m.user_secret.replace_all(&s, |c: &regex::Captures<'_>| {
         let (n, v) = (&c["n"], &c["v"]);
         // `-u 1000:1000`(uid:gid)은 비밀이 아니다.
@@ -560,6 +592,133 @@ mod tests {
             "eyJ only",
         ] {
             assert_eq!(mask(s), s, "should stay: {s}");
+        }
+    }
+
+    /// R5 회귀 R-L1·VR7 M2(계약 §15.4): 명령으로 가린 짧은 플래그, 긴 플래그 더, 공백 구분 키, Discord 웹훅.
+    #[test]
+    fn masks_r8_secret_forms() {
+        let cases = [
+            (
+                "docker login -u me -p hunter2DOCKER",
+                "docker login -u me -p [가림]",
+            ),
+            (
+                "podman login reg.io -p 'pw' -u x",
+                "podman login reg.io -p '[가림]' -u x",
+            ),
+            (
+                "sshpass -p s3cr3t ssh -p 22 host",
+                "sshpass -p [가림] ssh -p 22 host",
+            ),
+            ("sshpass -ps3cr3t ssh host", "sshpass -p[가림] ssh host"),
+            (
+                "az login -u me -p hunter2 --tenant t",
+                "az login -u me -p [가림] --tenant t",
+            ),
+            (
+                "redis-cli -h db -a hunter2 ping",
+                "redis-cli -h db -a [가림] ping",
+            ),
+            (
+                "openssl enc -aes256 -k hunter2 -in f",
+                "openssl enc -aes256 -k [가림] -in f",
+            ),
+            (
+                "openssl rsa -pass pass:hunter2 -in k",
+                "openssl rsa -pass [가림] -in k",
+            ),
+            ("x --client-secret abc --y", "x --client-secret [가림] --y"),
+            ("x --secret-key abc", "x --secret-key [가림]"),
+            ("x --secret-access-key abc", "x --secret-access-key [가림]"),
+            ("x --private-key abc", "x --private-key [가림]"),
+            (
+                "ssh-keygen --passphrase abc",
+                "ssh-keygen --passphrase [가림]",
+            ),
+            ("x --client-secret=abc", "x --client-secret=[가림]"),
+            (
+                "aws configure set aws_secret_access_key wJalrXUtnFEMI",
+                "aws configure set aws_secret_access_key [가림]",
+            ),
+            (
+                "aws configure set default.aws_session_token abc --profile p",
+                "aws configure set default.aws_session_token [가림] --profile p",
+            ),
+            (
+                "curl https://discord.com/api/webhooks/123/abcDEF -d x",
+                "curl https://discord.com/api/webhooks/[가림] -d x",
+            ),
+            (
+                "https://discordapp.com/api/webhooks/1/x_y-z",
+                "https://discordapp.com/api/webhooks/[가림]",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(mask(input), want, "input: {input}");
+            assert_eq!(mask(want), want, "idempotent: {want}");
+        }
+    }
+
+    /// §15.4의 평범한 글은 그대로다. 특히 `docker run -p`는 포트다.
+    #[test]
+    fn r8_rules_keep_ordinary_text() {
+        for s in [
+            "mkdir -p dir",
+            "cp -pr a b",
+            "ssh -p 22 host",
+            "docker run -p 8080:80 nginx",
+            "docker compose up -p proj",
+            "podman run -p 80:80 img",
+            "mysql -P 3306 db",
+            "az group list -o table",
+            "redis-cli -h db ping",
+            "openssl x509 -in c.pem -noout",
+            "aws configure set region ap-northeast-2",
+            "aws configure set output json",
+            "the password hunter2 was wrong",
+            "https://discord.com/channels/1/2",
+        ] {
+            assert_eq!(mask(s), s, "should stay: {s}");
+        }
+    }
+
+    /// §15.4 규칙도 두 번 가려도 같고 공백 접기 전후에 같다.
+    #[test]
+    fn r8_rules_are_idempotent_and_whitespace_stable() {
+        let parts = [
+            "docker login",
+            "sshpass",
+            "redis-cli",
+            "openssl",
+            "aws configure set",
+            " ",
+            "\n",
+            "-p",
+            "-a",
+            "-k",
+            "x",
+            "'",
+            "aws_secret_key",
+            "--client-secret",
+            "discord.com/api/webhooks/1",
+            ";",
+        ];
+        for a in parts {
+            for b in parts {
+                for c in parts {
+                    for d in parts {
+                        let s = format!("{a}{b}{c}{d}");
+                        let once = mask(&s);
+                        assert_eq!(mask(&once), once, "idempotent: {s:?}");
+                        assert_eq!(
+                            collapse_ws(&mask(&collapse_ws(&s))),
+                            collapse_ws(&once),
+                            "collapse-stable: {s:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -29,7 +29,7 @@ const TOOL_PREVIEW_KEYS: [&str; 9] = [
 /// - 식별자(`session_id`·`cwd`·`hook_event_name`·`type`·`thread-id` 등)는 그대로 둔다.
 ///   하위 에이전트 `agent_id`는 모든 훅 이벤트에서 128자까지 남긴다(§13.2).
 /// - `PostToolBatch`의 `tool_calls`는 도구 이름이 있는 앞 64개만 `[{"tool_name"}]`으로 남긴다(§13.2).
-/// - `PostToolUseFailure`도 `tool_input`의 미리보기 필드 하나를 남긴다(승인 요청과 맞춰 본다, §14.2).
+/// - `PostToolUseFailure`·`PostToolUse`도 `tool_input`의 미리보기 필드 하나를 남긴다(승인 요청과 맞춰 본다, §14.2·§15.3).
 /// - 심이 붙인 `"gyeot_partial": true`(잘린 입력에서 건짐)는 그대로 둔다.
 /// - `prompt`는 글자 수가 같은 `x` 문자열로 바꾼다(정규화는 길이만 쓴다).
 /// - 미리보기로만 쓰는 글은 마스킹 → 공백 접기 → 4,000자 자르기. 미리보기(≤300자)는 원본과 같다.
@@ -223,8 +223,15 @@ fn hook(o: &Map<String, Value>) -> Value {
                 out_ref.insert("tool_input".into(), t);
             }
         }
-        "PreToolUse" | "PostToolUse" | "UserPromptExpansion" => {
+        "PreToolUse" | "UserPromptExpansion" => {
             copy_clean(o, out_ref, "tool_name");
+        }
+        // 끝낸 호출을 승인 요청과 맞춰 보는 미리보기 필드 하나(§15.3).
+        "PostToolUse" => {
+            copy_clean(o, out_ref, "tool_name");
+            if let Some(t) = o.get("tool_input").and_then(tool_input) {
+                out_ref.insert("tool_input".into(), t);
+            }
         }
         "PostToolBatch" => {
             copy_clean(o, out_ref, "tool_name");
@@ -705,6 +712,35 @@ mod tests {
             ),
             (cc, hook("PostToolBatch", json!({"tool_calls": "비밀"}))),
             (cc, hook("PostToolBatch", json!({"tool_calls": []}))),
+            // §15.3: PostToolUse도 tool_input의 미리보기 필드 하나만 남긴다
+            (
+                cc,
+                hook(
+                    "PostToolUse",
+                    json!({"tool_name": "WebFetch", "tool_input": {"url": "https://a.example/?token=hunter2kv", "prompt": "비밀 질문"}, "tool_response": "비밀 응답"}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolUse",
+                    json!({"tool_name": "Bash", "tool_input": {"command": format!("echo {SECRET}"), "description": "비밀 설명"}, "tool_response": {"stdout": "비밀"}}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolUse",
+                    json!({"tool_name": "mcp__x__y", "tool_input": {"a": 1, "key": SECRET}}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolUse",
+                    json!({"tool_name": "Write", "tool_input": {"file_path": "/w/a", "content": "비밀 내용"}}),
+                ),
+            ),
             // §14.2: 실패의 미리보기, 잘린 입력 표시, 겹친 묶음 이름
             (
                 cc,

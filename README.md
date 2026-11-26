@@ -6,13 +6,13 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
 
 - **듣는다**: Claude Code·Codex 훅, fsmap·AOK 하네스 로그를 한 흐름으로 모은다. 훅은 작업을 막거나 기다리게 하지 않는다.
 - **판단한다**: AOK 관제실과 같은 이름·점수(승인 95, 결정 85, 실패 80…)로 "당신 차례"를 만든다. 숫자는 결정적인 규칙이 계산한다.
-- **표정으로 먼저 알린다**: 새싹 색과 눈빛이 상태다. 말풍선·소리는 예산 안에서만 쓰고, 집중 모드와 "사람이 이미 그 세션에 있음"을 지킨다. 모든 알림에 "왜?"가 붙는다.
+- **표정으로 먼저 알린다**: 새싹 색과 눈빛이 상태다. 말풍선은 예산 안에서만 쓰고, 기본 설정에서는 소리를 내지 않는다. 집중 모드와 "사람이 이미 그 세션에 있음"을 지키고, 모든 알림에 "왜?"가 붙는다.
 - **대화를 잇는다**: 곁에게 한 말이 실행 중인 Claude Code 세션에 들어가고, Claude의 답은 곁이 읽어 준다. Claude는 곁을 통해 선택지 카드를 내밀 수 있다.
 - **대신하지 않는다**: 권한 승인·병합·삭제는 언제나 터미널에서 사람이 한다. 학습 결과는 제안으로만 나오고, 곁은 스스로 설정을 바꾸지 않는다.
 
-| 말풍선(끼어듦) | 당신 차례 패널 |
+| 말풍선 | 당신 차례 패널 |
 |---|---|
-| ![말풍선](docs/images/overlay-bubble-interrupt.png) | ![패널](docs/images/overlay-panel-light.png) |
+| ![말풍선](docs/images/overlay-bubble-nudge.png) | ![패널](docs/images/overlay-panel-light.png) |
 
 ## 설치 (Windows)
 
@@ -23,7 +23,7 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
    powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1           # %LOCALAPPDATA%\gyeot\bin 에 설치, 설정 조각만 출력
    ```
    - `-ApplyClaudeHooks`: `~/.claude/settings.json`을 백업한 뒤 곁의 훅만 더한다. 기존 훅(fsmap·AOK·work-atlas 등)은 그대로 두고, 여러 번 실행해도 결과가 같다.
-   - 기본 훅에는 `PostToolBatch`(도구 묶음이 끝날 때 한 번)가 들어 있다. 사람이 승인한 뒤 곁이 "아직 기다린다"고 오해하지 않게 하는 신호다. 빼려면 `-NoActivityHook`을 준다. 그러면 승인 대기는 말풍선까지만 올라가고 소리로 끼어들지 않는다.
+   - 기본 훅에는 `PostToolBatch`(도구 묶음이 끝날 때 한 번)가 들어 있다. 사람이 승인한 뒤 곁이 "아직 기다린다"고 오해하지 않게 하는 신호다. 빼려면 `-NoActivityHook`을 준다. 그러면 승인한 뒤에도 승인 카드가 턴이 끝날 때까지 남는다.
    - `-RegisterStartup`: 로그인할 때 데몬을 창 없이 띄운다.
    - 지울 때는 `scripts\uninstall.ps1`을 쓴다. 데이터는 `-PurgeData`를 줄 때만 지운다.
 3. **띄우기**: `gyeot-shell`(투명 오버레이, 트레이, `Ctrl+Alt+Space`)을 실행한다. 셸 없이 쓰려면 `gyeotd --open`으로 브라우저에 연다(트레이 메뉴 "곁 열기"와 같다). 주소만 쳐서 열면 "열쇠가 없다"는 안내가 나온다. 얼굴 페이지는 토큰을 받지 않고, 이 명령이 만든 일회용 코드로 세션을 연다.
@@ -50,8 +50,8 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
 
 | 무엇 | 어디서 | 결과 |
 |---|---|---|
-| 코어·서버·데몬·훅 심 | Linux, `cargo test --workspace` | 256 통과. clippy `-D warnings` 0건(Linux·Windows 대상), wasm32 빌드 확인 |
-| 얼굴 | Linux, vitest | 339 통과. 세션 열쇠·보내기 전 상대 확인·fetch SSE 해석기·401 처리, 결정 카드 안내, 색 대비 WCAG AA, 가짜 데몬(mock)의 보안 규칙 포함 |
+| 코어·서버·데몬·훅 심 | Linux, `cargo test --workspace` | 263 통과. clippy `-D warnings` 0건(Linux·Windows 대상), wasm32 빌드 확인 |
+| 얼굴 | Linux, vitest | 351 통과. 세션 열쇠·보내기 전 상대 확인·fetch SSE 해석기·401 처리, 결정 카드 안내, 색 대비 WCAG AA, 가짜 데몬(mock)의 보안 규칙 포함 |
 | channel | Linux, vitest(묶은 파일을 실제로 띄움) | 53 통과. 데몬 확인(hello) 포함. Node 22 |
 | 셸 | Linux(WebKitGTK), cargo test | 82 통과. IPC 권한(ACL)·데몬 확인·부트 흐름·데몬이 멈추면 바로 닫기 시험 포함. Windows 대상 clippy 0건 |
 | 설치 스크립트 | pwsh 7.4 | 128 통과, Windows 전용 폴더 권한 시험 1개는 CI(Windows)에서 |

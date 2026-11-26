@@ -710,10 +710,12 @@ mod tests {
         let b = serde_json::to_vec(&v).unwrap();
         let raw = payload_from_bytes(&b, false).unwrap();
         let p = sanitize_payload(Source::ClaudeCode, &raw);
+        // §15.3: PostToolUse는 tool_input의 미리보기 필드 하나만 남긴다(본문·응답은 버린다)
         assert_eq!(
             p,
-            json!({"hook_event_name": "PostToolUse", "session_id": "s1", "cwd": "/w", "tool_name": "Read"})
+            json!({"hook_event_name": "PostToolUse", "session_id": "s1", "cwd": "/w", "tool_name": "Read", "tool_input": {"file_path": "/w/a.rs"}})
         );
+        assert!(serde_json::to_vec(&p).unwrap().len() < 1000);
         let v = json!({
             "hook_event_name": "PermissionRequest",
             "session_id": "s1",

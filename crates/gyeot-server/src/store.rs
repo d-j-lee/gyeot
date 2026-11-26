@@ -493,6 +493,7 @@ mod tests {
                 tool: None,
                 tools: Vec::new(),
                 partial: false,
+                preview: String::new(),
             },
         }
     }

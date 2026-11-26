@@ -189,6 +189,10 @@ pub enum EventBody {
         /// 작업 신호로만 센다. 거짓이면 JSON에 쓰지 않는다.
         #[serde(default, skip_serializing_if = "is_false")]
         partial: bool,
+        /// `PostToolUse`가 끝낸 호출의 미리보기(`tool_input`, 승인 요청과 같은 식, §15.3). 요청을 지울 때 둘 다
+        /// 있으면 같아야 한다. 비었으면 JSON에 쓰지 않는다(옛 로그와 같은 모양).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        preview: String,
     },
     /// 하위 에이전트 시작.
     SubagentStart {
@@ -392,8 +396,14 @@ impl EventBody {
                 p(error, 120);
                 p(pv, 300);
             }
-            EventBody::Activity { tool, tools, .. } => {
+            EventBody::Activity {
+                tool,
+                tools,
+                preview: pv,
+                ..
+            } => {
                 po(tool, 80);
+                p(pv, 300);
                 *tools = crate::normalize::tool_list(tools.iter().map(String::as_str));
             }
             EventBody::SubagentStart { agent_type } | EventBody::SubagentStop { agent_type } => {
@@ -591,6 +601,7 @@ mod tests {
                 tool: None,
                 tools: vec![],
                 partial: false,
+                preview: String::new(),
             }
         );
         let v = serde_json::to_value(&ev).unwrap();
@@ -611,6 +622,7 @@ mod tests {
                 tool: None,
                 tools: vec![],
                 partial: false,
+                preview: String::new(),
             }
         );
         // 옛 줄은 다시 써도 같은 모양(새 필드는 값이 있을 때만 쓴다)
@@ -627,6 +639,7 @@ mod tests {
                 tool: None,
                 tools: vec!["Read".into(), "Bash".into()],
                 partial: false,
+                preview: String::new(),
             }
         );
         assert_eq!(
@@ -700,11 +713,19 @@ mod tests {
                 tool: Some("Read".into()),
                 tools: vec![],
                 partial: false,
+                preview: String::new(),
             },
             EventBody::Activity {
                 tool: None,
                 tools: vec!["Read".into(), "Bash".into(), "Read".into()],
                 partial: true,
+                preview: String::new(),
+            },
+            EventBody::Activity {
+                tool: Some("Bash".into()),
+                tools: vec![],
+                partial: false,
+                preview: "npm test".into(),
             },
             EventBody::SubagentStart { agent_type: None },
             EventBody::SubagentStop {

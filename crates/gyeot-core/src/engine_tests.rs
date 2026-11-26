@@ -332,17 +332,23 @@ fn decision_class_precedence() {
         h.get(ItemKind::Decision, T0).unwrap().title,
         "질문에 답을 기다려요"
     );
-    // 승인이 오면 결정은 닫히고 승인만 남는다
+    // 승인이 와도 결정은 따로 남는다(§15.2: 판정 순서는 결정끼리만)
     let fx = h.apply(perm_prompt(T0 + SEC));
-    assert!(removed(&fx).contains(&item_id(S, ItemKind::Decision)));
-    assert_eq!(h.kinds(T0 + SEC), vec![ItemKind::Approval]);
-    // 승인이 열려 있는 동안 결정 신호는 열리지 않는다
-    h.apply(hook(
+    assert!(removed(&fx).is_empty(), "{fx:?}");
+    let mut k = h.kinds(T0 + SEC);
+    k.sort();
+    assert_eq!(k, vec![ItemKind::Approval, ItemKind::Decision]);
+    // 승인이 열려 있는 동안에도 새 결정 신호는 결정을 갱신한다
+    let fx = h.apply(hook(
         T0 + 2 * SEC,
         "Notification",
         json!({"notification_type": "agent_needs_input", "message": "?"}),
     ));
-    assert_eq!(h.kinds(T0 + 2 * SEC), vec![ItemKind::Approval]);
+    assert_eq!(deliveries(&fx).len(), 1);
+    assert_eq!(h.get(ItemKind::Decision, T0).unwrap().body, "?");
+    let mut k = h.kinds(T0 + 2 * SEC);
+    k.sort();
+    assert_eq!(k, vec![ItemKind::Approval, ItemKind::Decision]);
 }
 
 #[test]
@@ -1396,17 +1402,15 @@ fn subagent_batch_keeps_main_agent_wait() {
     assert!(h.open(T0 + 40 * SEC).is_empty());
 }
 
-/// R5 L1·R3 회귀 N3(계약 §14.2): 턴 끝(`stop`)·`prompt`는 주 에이전트 요청만 지운다.
+/// R5 L1·R3 회귀 N3(계약 §14.2·§15.1): 턴 끝(`stop`)은 주 에이전트 요청만 지운다.
 /// 하위 에이전트의 요청은 그 에이전트의 `SubagentStop`이 지운다.
 #[test]
 fn turn_end_and_subagent_stop_remove_their_own_requests() {
-    // 백그라운드 하위 에이전트의 승인은 주 에이전트의 턴 끝·입력으로 닫히지 않는다
+    // 백그라운드 하위 에이전트의 승인은 주 에이전트의 턴 끝으로 닫히지 않는다(입력은 §15.1에서 모두 지운다)
     let mut h = H::new();
     h.apply(sub_perm_request(Some("bg1"), T0, "Bash", "sleep 100"));
     h.apply(perm_prompt(T0 + SEC));
     h.apply(stop(T0 + 2 * SEC, "백그라운드로 돌려 두었어요."));
-    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Open));
-    h.apply(prompt(T0 + 3 * SEC));
     assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Open));
     // 다른 에이전트의 SubagentStop은 지우지 않는다
     h.apply(by(Some("bg2"), T0 + 4 * SEC, "SubagentStop", json!({})));
@@ -1434,6 +1438,197 @@ fn turn_end_and_subagent_stop_remove_their_own_requests() {
     assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Open));
     h.apply(by(Some("a1"), T0 + 5 * SEC, "SubagentStop", json!({})));
     assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Closed));
+}
+
+/// VR7 H1·R5 회귀 R-M1·VR7 L1(계약 §15.1, G-040): 사람이 새로 말하면(`prompt`) 에이전트 상관없이
+/// 그 시각까지의 모든 요청(보류 중인 병합 포함)을 지운다. `stop`은 지금처럼 주 에이전트 것만.
+#[test]
+fn prompt_removes_every_request() {
+    // VR7 H1의 실측 순서: ag1 요청 → 6초 뒤 agent 없는 알림 → (SubagentStop 없음) → 입력 → Read → 묶음 → Stop
+    let mut h = H::new();
+    h.apply(sub_perm_request(Some("ag1"), T0, "Bash", "rm -rf build"));
+    h.apply(perm_prompt(T0 + 6 * SEC));
+    assert_eq!(h.kinds(T0 + 6 * SEC), vec![ItemKind::Approval]);
+    let fx = h.apply(prompt(T0 + 20 * SEC));
+    assert_eq!(removed(&fx), vec![item_id(S, ItemKind::Approval)]);
+    h.apply(tool(T0 + 21 * SEC, "Read"));
+    h.apply(batch(None, T0 + 22 * SEC, &["Read"]));
+    h.apply(stop(T0 + 23 * SEC, "다 했어요."));
+    let later = T0 + 50 * 3_600_000;
+    h.tick(later);
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Closed));
+    // 그 뒤의 다른 승인(주 에이전트 Edit)이 끝나면 묵은 Bash 승인이 다시 남지 않는다
+    h.apply(perm_request(later, "Edit", "src/a.rs"));
+    h.apply(perm_prompt(later + 6 * SEC));
+    assert_eq!(
+        h.get(ItemKind::Approval, later).unwrap().title,
+        "권한 승인 대기 · Edit"
+    );
+    h.apply(batch(None, later + 10 * SEC, &["Edit"]));
+    h.apply(stop(later + 11 * SEC, "고쳤어요."));
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Closed));
+
+    // R5 회귀 R-M1: q1 요청 → 알림 → 입력·Stop ×3 → 계속 기다림이 아니다
+    let mut h = H::new();
+    h.apply(sub_perm_request(Some("q1"), T0, "Bash", "make"));
+    h.apply(perm_prompt(T0 + 6 * SEC));
+    for i in 0..3 {
+        h.apply(prompt(T0 + (10 + 10 * i) * SEC));
+        h.apply(stop(T0 + (15 + 10 * i) * SEC, "끝"));
+    }
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Closed));
+    assert_ne!(h.e.presence().mood, Mood::Waiting);
+
+    // VR7 L1: bg1의 병합 요청 → 주 Stop(지우지 않는다) → 보류가 끝나 merge(ambient) → 입력이 지운다
+    let mut h = H::new();
+    h.apply(sub_perm_request(
+        Some("bg1"),
+        T0,
+        "Bash",
+        "git push origin main",
+    ));
+    h.apply(stop(T0 + 2 * SEC, "백그라운드로 올리는 중이에요."));
+    h.tick(T0 + 30 * MIN);
+    assert_eq!(h.state(ItemKind::Merge), Some(ItemState::Open));
+    h.apply(prompt(T0 + 31 * MIN));
+    assert_eq!(h.state(ItemKind::Merge), Some(ItemState::Closed));
+    // 보류 중(10초 안)인 병합 요청도 입력이 지운다: 창이 지나도 열리지 않는다
+    let mut h = H::new();
+    h.apply(sub_perm_request(
+        Some("bg1"),
+        T0,
+        "Bash",
+        "git push origin main",
+    ));
+    h.apply(prompt(T0 + 3 * SEC));
+    h.tick(T0 + 20 * SEC);
+    assert!(h.get(ItemKind::Merge, T0).is_none());
+    // 입력보다 늦은 시각의 요청은 남는다
+    let mut h = H::new();
+    h.apply(prompt(T0 + 10 * SEC));
+    h.apply(sub_perm_request(Some("a1"), T0 + 11 * SEC, "Bash", "ls"));
+    h.apply(perm_prompt(T0 + 12 * SEC));
+    h.apply(prompt(T0 + 10 * SEC));
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Open));
+}
+
+/// VR7 H1(계약 §15.2): 승인이 묵어 있어도 elicitation·턴 끝 질문은 따로 연다. channel 결정 보호는 그대로.
+#[test]
+fn decision_opens_while_approval_is_open() {
+    let mut h = H::new();
+    h.apply(sub_perm_request(Some("ag1"), T0, "Bash", "rm -rf build"));
+    h.apply(perm_prompt(T0 + 6 * SEC));
+    let fx = h.apply(hook(
+        T0 + 10 * SEC,
+        "Notification",
+        json!({"notification_type": "elicitation_dialog", "message": "Pick one"}),
+    ));
+    assert_eq!(deliveries(&fx).len(), 1, "{fx:?}");
+    let mut k = h.kinds(T0 + 10 * SEC);
+    k.sort();
+    assert_eq!(k, vec![ItemKind::Approval, ItemKind::Decision]);
+    // 턴 끝 질문(Stop은 주 에이전트 요청만 지우므로 ag1의 승인은 남는다)
+    h.apply(stop(T0 + 20 * SEC, "A와 B 중 어느 쪽으로 할까요?"));
+    let d = h.get(ItemKind::Decision, T0 + 20 * SEC).unwrap();
+    assert_eq!(d.state, ItemState::Open);
+    assert_eq!(d.title, "질문이 있어요");
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Open));
+    assert_eq!(h.e.presence().line, "2건이 기다려요 · 먼저 권한 승인");
+    // 병합 항목이 열려 있어도 같다
+    let mut h = H::new();
+    h.apply(perm_request(T0, "Bash", "gh pr merge 1"));
+    h.tick(T0 + 11 * SEC);
+    h.apply(stop(T0 + 12 * SEC, "병합할까요?"));
+    let mut k = h.kinds(T0 + 12 * SEC);
+    k.sort();
+    // 턴 끝은 주 에이전트 요청을 지우므로 병합은 닫히고 질문이 열린다
+    assert_eq!(k, vec![ItemKind::Decision]);
+    let mut h = H::new();
+    h.apply(sub_perm_request(Some("b1"), T0, "Bash", "gh pr merge 1"));
+    h.tick(T0 + 11 * SEC);
+    h.apply(hook(
+        T0 + 12 * SEC,
+        "Notification",
+        json!({"notification_type": "agent_needs_input", "message": "?"}),
+    ));
+    let mut k = h.kinds(T0 + 12 * SEC);
+    k.sort();
+    assert_eq!(k, vec![ItemKind::Merge, ItemKind::Decision]);
+    // channel 결정은 턴 끝 질문이 덮어쓰지 않는다(승인이 열려 있어도)
+    let mut h = H::new();
+    h.apply(sub_perm_request(Some("ag1"), T0, "Bash", "x"));
+    h.apply(perm_prompt(T0 + SEC));
+    h.apply(decision_open(T0 + 2 * SEC, S, "dc_9", &["예", "아니오"]));
+    h.apply(stop(T0 + 3 * SEC, "할까요?"));
+    let d = h.get(ItemKind::Decision, T0).unwrap();
+    assert_eq!(d.decision_id.as_deref(), Some("dc_9"));
+    assert_eq!(d.state, ItemState::Open);
+    // 승인끼리의 순서(approval > merge)는 그대로: 승인이 열려 있으면 병합 보류는 열지 않는다
+    let mut h = H::new();
+    h.apply(perm_request(T0, "Bash", "npm i"));
+    h.apply(perm_prompt(T0 + SEC));
+    h.apply(perm_request(T0 + 2 * SEC, "Bash", "git merge topic"));
+    h.tick(T0 + 20 * SEC);
+    assert!(h.get(ItemKind::Merge, T0).is_none());
+}
+
+/// VR7 M1(계약 §15.3, G-041): `PostToolUse`의 미리보기가 요청과 다르면 같은 이름이라도 지우지 않는다.
+#[test]
+fn post_tool_use_with_other_preview_keeps_request() {
+    let fetch =
+        |url: &str| json!({"tool_name": "WebFetch", "tool_input": {"url": url, "prompt": "p"}});
+    let mut h = H::new();
+    h.apply(hook(T0, "PreToolUse", fetch("https://a.example/")));
+    h.apply(hook(T0, "PreToolUse", fetch("https://b.example/")));
+    h.apply(hook(
+        T0 + SEC,
+        "PermissionRequest",
+        fetch("https://a.example/"),
+    ));
+    h.apply(perm_prompt(T0 + 7 * SEC));
+    let fx = h.apply(hook(
+        T0 + 9 * SEC,
+        "PostToolUse",
+        fetch("https://b.example/"),
+    ));
+    assert!(removed(&fx).is_empty(), "{fx:?}");
+    h.tick(T0 + 30 * SEC);
+    assert_eq!(h.kinds(T0 + 30 * SEC), vec![ItemKind::Approval]);
+    // 같은 호출이 끝나면 지운다
+    let fx = h.apply(hook(
+        T0 + 40 * SEC,
+        "PostToolUse",
+        fetch("https://a.example/"),
+    ));
+    assert_eq!(removed(&fx), vec![item_id(S, ItemKind::Approval)]);
+    // 미리보기가 없는 activity(묶음·옛 로그)는 이름으로 맞춘다
+    let mut h = H::new();
+    h.apply(hook(
+        T0 + SEC,
+        "PermissionRequest",
+        fetch("https://a.example/"),
+    ));
+    h.apply(perm_prompt(T0 + 7 * SEC));
+    h.apply(hook(
+        T0 + 9 * SEC,
+        "PostToolUse",
+        json!({"tool_name": "WebFetch"}),
+    ));
+    assert!(h.open(T0 + 9 * SEC).is_empty());
+    let mut h = H::new();
+    h.apply(hook(
+        T0 + SEC,
+        "PermissionRequest",
+        fetch("https://a.example/"),
+    ));
+    h.apply(perm_prompt(T0 + 7 * SEC));
+    h.apply(batch(None, T0 + 9 * SEC, &["WebFetch"]));
+    assert!(h.open(T0 + 9 * SEC).is_empty());
+    // 요청 쪽에 미리보기가 없으면(알림만 온 대기) 이름이 맞으면 지운다
+    let mut h = H::new();
+    h.apply(perm_prompt(T0));
+    h.apply(hook(T0 + SEC, "PostToolUse", fetch("https://b.example/")));
+    assert!(h.open(T0 + SEC).is_empty());
 }
 
 /// R3 회귀 N4(계약 §14.2): 잘린 입력에서 건진 묶음(`gyeot_partial`)은 요청을 지우지 않고 작업 신호로만 센다.

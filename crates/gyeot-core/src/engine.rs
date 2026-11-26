@@ -329,6 +329,11 @@ struct Req {
     held: bool,
 }
 
+/// `a`가 열려 있으면 `b`를 열지 않고, `a`가 열리면 `b`를 닫는가. 승인끼리(approval → merge)만(§3, §15.2).
+fn overrides(a: ItemKind, b: ItemKind) -> bool {
+    matches!((a, b), (ItemKind::Approval, ItemKind::Merge))
+}
+
 /// 세션마다 기억하는 열린 요청 수.
 const REQS_MAX: usize = 64;
 
@@ -987,8 +992,9 @@ impl Engine {
                     now,
                     fx,
                 );
-                // 사람이 답한 것은 주 에이전트의 대기다. 하위 에이전트의 요청은 그 에이전트의 신호로만 지운다(§14.2).
-                self.drop_reqs(&sid, |r| r.agent_id.is_none() && r.ts <= ts);
+                // 사람이 입력창에 새로 썼다면 기다리는 권한 창이 없다(앞쪽 창은 입력을 막고, 백그라운드 하위
+                // 에이전트는 창 없이 자동 거절한다). 그 시각까지의 모든 요청을 지운다(§15.1, G-040).
+                self.drop_reqs(&sid, |r| r.ts <= ts);
                 self.sync_waits(&sid, now, fx);
             }
             EventBody::WaitingPermission { message, .. } => {
@@ -1048,6 +1054,7 @@ impl Engine {
                 tool,
                 tools,
                 partial,
+                preview: pv,
             } => {
                 if let Some(s) = self.sessions.get_mut(&sid) {
                     s.seen_activity = true;
@@ -1056,7 +1063,7 @@ impl Engine {
                 if !partial {
                     let batch = ev.raw_event.as_deref() == Some("PostToolBatch");
                     let agent = ev.agent_id.as_deref();
-                    self.on_activity(&sid, agent, tool.as_deref(), tools, batch, ts);
+                    self.on_activity(&sid, agent, tool.as_deref(), tools, pv, batch, ts);
                     self.sync_waits(&sid, now, fx);
                 }
             }
@@ -1233,19 +1240,26 @@ impl Engine {
 
     /// activity: 같은 에이전트이고 도구가 맞거나 모르는 가장 오래된 요청 하나를 지운다(이름마다, 도구가 맞는
     /// 것을 먼저). 도구 목록이 없는 `PostToolBatch`는 그 에이전트의 요청을 모두 지운다.
+    #[allow(clippy::too_many_arguments)]
     fn on_activity(
         &mut self,
         sid: &str,
         agent: Option<&str>,
         tool: Option<&str>,
         tools: &[String],
+        pv: &str,
         batch: bool,
         ts: i64,
     ) {
         let Some(list) = self.reqs.get_mut(sid) else {
             return;
         };
-        let mine = |r: &Req| r.agent_id.as_deref() == agent && r.ts <= ts;
+        // 둘 다 미리보기가 있으면 같아야 같은 호출이다(같은 이름의 병렬 호출을 가린다, §15.3).
+        let mine = |r: &Req| {
+            r.agent_id.as_deref() == agent
+                && r.ts <= ts
+                && (pv.is_empty() || r.preview.is_empty() || r.preview == pv)
+        };
         let names: Vec<&str> = if tools.is_empty() {
             tool.into_iter().collect()
         } else {
@@ -1751,11 +1765,11 @@ impl Engine {
         let kind = sig.kind;
         let id = item_id(sid, kind);
         let signature = format!("{}:{}", kind.as_str(), sig.sig_ts);
-        if let Some(rank) = kind.decision_rank() {
-            // 판정 순서가 앞선 결정류가 열려 있으면 이 신호는 열지 않는다.
-            let higher_open = [ItemKind::Approval, ItemKind::Merge, ItemKind::Decision]
+        if kind.decision_rank().is_some() {
+            // 판정 순서는 승인끼리(approval → merge)만 덮는다. 질문·결정은 승인이 열려 있어도 따로 연다(§15.2).
+            let higher_open = [ItemKind::Approval, ItemKind::Merge]
                 .into_iter()
-                .any(|k| k.decision_rank().is_some_and(|r| r < rank) && self.is_live_kind(sid, k));
+                .any(|k| overrides(k, kind) && self.is_live_kind(sid, k));
             if higher_open {
                 return;
             }
@@ -1809,9 +1823,9 @@ impl Engine {
             }
             return;
         }
-        if let Some(rank) = kind.decision_rank() {
-            for k in [ItemKind::Approval, ItemKind::Merge, ItemKind::Decision] {
-                if k.decision_rank().is_some_and(|r| r > rank) {
+        if kind.decision_rank().is_some() {
+            for k in [ItemKind::Approval, ItemKind::Merge] {
+                if overrides(kind, k) {
                     let kid = item_id(sid, k);
                     if self.items.get(&kid).is_some_and(ItemRec::is_live) {
                         self.close(&kid, now, fx);

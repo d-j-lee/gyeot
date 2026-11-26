@@ -269,16 +269,25 @@ fn hook_event(raw: &Value, source: Source, agent: Agent) -> Option<Event> {
             // 승인 요청과 같은 식의 미리보기(같은 호출인지 맞춰 본다, §14.2).
             preview: tool_preview(o.get("tool_input")),
         },
-        "PreToolUse" | "PostToolUse" | "UserPromptExpansion" => EventBody::Activity {
+        "PreToolUse" | "UserPromptExpansion" => EventBody::Activity {
             tool: s(o, "tool_name").map(|t| preview(t, TOOL_NAME_MAX)),
             tools: Vec::new(),
             partial: is_partial(o),
+            preview: String::new(),
+        },
+        // 끝낸 호출의 미리보기도 싣는다(같은 이름의 다른 호출과 가린다, §15.3).
+        "PostToolUse" => EventBody::Activity {
+            tool: s(o, "tool_name").map(|t| preview(t, TOOL_NAME_MAX)),
+            tools: Vec::new(),
+            partial: is_partial(o),
+            preview: tool_preview(o.get("tool_input")),
         },
         // 묶음의 도구 이름들(§13.2). 목록이 없으면 '모르는 도구'다(G-016).
         "PostToolBatch" => EventBody::Activity {
             tool: s(o, "tool_name").map(|t| preview(t, TOOL_NAME_MAX)),
             tools: tool_list(batch_tool_names(o).into_iter()),
             partial: is_partial(o),
+            preview: String::new(),
         },
         "TaskCompleted" => EventBody::TaskDone {
             subject: preview(
@@ -726,6 +735,64 @@ mod tests {
         assert_eq!(v["detail"], json!({"tool": "Bash", "error": ""}));
     }
 
+    /// §15.3: `PostToolUse`의 activity는 요청과 같은 식의 미리보기를 싣는다(다른 activity는 싣지 않는다).
+    #[test]
+    fn post_tool_use_carries_preview() {
+        let ev = one(hook(
+            "PostToolUse",
+            json!({"tool_name": "WebFetch", "tool_input": {"url": "https://b.example/", "prompt": "p"}, "tool_response": "r"}),
+        ));
+        assert_eq!(
+            ev.body,
+            EventBody::Activity {
+                tool: Some("WebFetch".into()),
+                tools: vec![],
+                partial: false,
+                preview: "https://b.example/".into(),
+            }
+        );
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v["detail"],
+            json!({"tool": "WebFetch", "preview": "https://b.example/"})
+        );
+        // 요청의 미리보기와 같은 식(명령·마스킹·300자)
+        let input = json!({"command": format!("curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz' {}", "x".repeat(500))});
+        let post = one(hook(
+            "PostToolUse",
+            json!({"tool_name": "Bash", "tool_input": input}),
+        ));
+        let req = one(hook(
+            "PermissionRequest",
+            json!({"tool_name": "Bash", "tool_input": input}),
+        ));
+        let (
+            EventBody::Activity { preview: a, .. },
+            EventBody::PermissionRequest { preview: b, .. },
+        ) = (post.body, req.body)
+        else {
+            panic!()
+        };
+        assert_eq!(a, b);
+        assert_eq!(a.chars().count(), 300);
+        // PreToolUse·묶음에는 싣지 않는다, 미리보기가 없으면 키가 없다
+        for name in ["PreToolUse", "PostToolBatch", "UserPromptExpansion"] {
+            let ev = one(hook(
+                name,
+                json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+            ));
+            assert!(
+                matches!(ev.body, EventBody::Activity { ref preview, .. } if preview.is_empty()),
+                "{name}"
+            );
+        }
+        let ev = one(hook("PostToolUse", json!({"tool_name": "Read"})));
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap()["detail"],
+            json!({"tool": "Read"})
+        );
+    }
+
     /// §14.2: 심이 잘린 입력에서 건진 페이로드(`gyeot_partial`)의 activity는 `partial`이다.
     #[test]
     fn partial_payload_marks_activity() {
@@ -738,7 +805,8 @@ mod tests {
             EventBody::Activity {
                 tool: Some("Bash".into()),
                 tools: vec![],
-                partial: true
+                partial: true,
+                preview: String::new(),
             }
         );
         let v = serde_json::to_value(&ev).unwrap();
@@ -771,6 +839,7 @@ mod tests {
                     tool: Some("Read".into()),
                     tools: vec![],
                     partial: false,
+                    preview: String::new(),
                 },
                 "{name}"
             );
@@ -782,6 +851,7 @@ mod tests {
                 tool: None,
                 tools: vec![],
                 partial: false,
+                preview: String::new(),
             }
         );
     }
@@ -858,6 +928,7 @@ mod tests {
                 tool: None,
                 tools: vec!["Read".into(), "Bash".into(), "Read".into()],
                 partial: false,
+                preview: String::new(),
             }
         );
         // 이름마다 요청 하나를 지우므로 겹친 이름도 그대로 센다(§14.2)
@@ -884,6 +955,7 @@ mod tests {
                 tool: Some("Read".into()),
                 tools: vec![],
                 partial: false,
+                preview: String::new(),
             }
         );
     }
