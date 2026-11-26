@@ -205,6 +205,30 @@ pub fn assert_no_set_cookie(r: &Resp, what: &str) {
     );
 }
 
+/// SHA-256(소문자 hex).
+pub fn sha256_hex(s: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 계약 §14.1의 얼굴 증명을 시험 쪽에서 따로 계산한다:
+/// `hex(HMAC-SHA256(key = SHA-256(세션 값) 32바이트, msg = "gyeot-face-hello/v1|<포트>|<n>"))`.
+pub fn expected_face(session: &str, port: u16, n: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Digest;
+    let key = sha2::Sha256::digest(session.as_bytes());
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+    mac.update(format!("gyeot-face-hello/v1|{port}|{n}").as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// 계약 §13.1의 hello 증명을 시험 쪽에서 따로 계산한다(서버 코드를 쓰지 않는다).
 pub fn expected_proof(token: &str, port: u16, n: &str) -> String {
     use hmac::{Hmac, Mac};

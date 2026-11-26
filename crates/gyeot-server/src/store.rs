@@ -19,13 +19,7 @@ const STALE_CLAIM: Duration = Duration::from_secs(300);
 /// 데이터 폴더 아래에서 곁이 쓰는 폴더(Unix 0700, 계약 §12.5·§13.4). `open`은 `gyeotd --open`이 쓴다.
 pub const PRIVATE_SUBDIRS: [&str; 3] = ["events", "spool", "open"];
 /// 데이터 폴더 바로 아래의 사용자 전용 파일(Unix 0600, 계약 §13.4).
-pub const PRIVATE_FILES: [&str; 5] = [
-    "token",
-    "sessions.json",
-    "learn.json",
-    "tails.json",
-    "gyeotd.log",
-];
+pub const PRIVATE_FILES: [&str; 4] = ["token", "learn.json", "tails.json", "gyeotd.log"];
 
 /// 데이터 폴더와 하위 폴더(`events`·`spool`)를 만들고, Unix에서는 이미 있던 것까지 사용자 전용으로
 /// 맞춘다(폴더 0700, 파일 0600, 계약 §12.5·§13.4). Windows는 `%LOCALAPPDATA%`의 권한을 이어받는다.

@@ -2,8 +2,10 @@
 //   인증: `Authorization: Bearer <값>` 하나. 값은 토큰(모든 /v1/*) 또는 세션 열쇠(얼굴이 쓰는 경로만, G-031). 쿠키·?t= 는 받지 않는다.
 //   부트 코드: 32바이트 hex, 120초 동안 한 번만, 동시에 8개까지(넘으면 가장 오래된 것부터 버림)
 //   세션 열쇠: 32바이트 hex, 만든 때부터 7일, 20개까지(가장 오래 안 쓴 것부터 버림). 값은 SHA-256 만 둔다.
-// 가짜 데몬이라 파일(sessions.json)에 쓰지 않는다 — 다시 띄우면 세션이 모두 사라진다(얼굴의 401 안내를 보기 좋다).
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+//   얼굴 확인(§14.1): /v1/hello 의 face 목록 — 살아 있는 세션마다 HMAC(key = SHA-256(세션), "gyeot-face-hello/v1|<포트>|<n>"), 섞어서.
+//     보관한 SHA-256 이 곧 HMAC 열쇠라 세션 값 없이 계산한다.
+// 세션은 메모리에만 둔다(§14.1, 진짜 데몬과 같다) — 다시 띄우면 이전 열쇠는 모두 무효라 얼굴이 401 처럼 안내를 보인다.
+import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 
 export const BOOT_TTL_MS = 120_000;
 export const MAX_BOOT_CODES = 8;
@@ -29,6 +31,16 @@ export type Credential = 'token' | 'session';
 /** §13.1: n 은 16–128자 hex */
 export function isHelloNonce(n: string | null | undefined): n is string {
   return typeof n === 'string' && /^[0-9a-fA-F]{16,128}$/.test(n);
+}
+
+/** §14.1: hex(HMAC-SHA256(key = SHA-256(세션 값 UTF-8)의 32바이트, msg = "gyeot-face-hello/v1|<포트>|<n>")) */
+export function faceProof(sessionSha256: Buffer, port: number, n: string): string {
+  return createHmac('sha256', sessionSha256).update(`gyeot-face-hello/v1|${port}|${n}`).digest('hex');
+}
+
+/** 세션 값으로 바로(시험용) */
+export function faceProofOf(session: string, port: number, n: string): string {
+  return faceProof(createHash('sha256').update(session, 'utf8').digest(), port, n);
 }
 
 /** §13.1: proof = hex(HMAC-SHA256(key = 토큰 UTF-8, msg = "gyeot-hello/v1|<포트>|<n>")) */
@@ -100,6 +112,24 @@ export class AuthStore {
     const session = randomBytes(32).toString('hex');
     this.sessions.set(sha256(session), { created: now, used: now });
     return { session, expires_ms: now + SESSION_TTL_MS };
+  }
+
+  /** §14.1: 살아 있는 세션마다 하나, 순서를 섞어서(최대 20개 = MAX_SESSIONS). */
+  faceList(port: number, n: string): string[] {
+    const now = this.now();
+    const out: string[] = [];
+    for (const [h, s] of this.sessions) {
+      if (now - s.created >= SESSION_TTL_MS) {
+        this.sessions.delete(h);
+        continue;
+      }
+      out.push(faceProof(Buffer.from(h, 'hex'), port, n));
+    }
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = randomInt(i + 1);
+      [out[i], out[j]] = [out[j]!, out[i]!];
+    }
+    return out.slice(0, MAX_SESSIONS);
   }
 
   /** 시험·로그용: 보관한 것(세션은 해시만). */

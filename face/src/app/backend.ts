@@ -1,6 +1,6 @@
 import type { DecisionResult, DismissReason, FocusResult, ItemAction, SayResult, SseEvent } from '../types.ts';
 import type { ConnState } from '../state/reducer.ts';
-import { createApi, isUnauthorized, type Api } from '../lib/api.ts';
+import { createApi, isUnauthorized, NotConnected, type Api } from '../lib/api.ts';
 import { FaceAuth } from '../lib/session.ts';
 import { EventStream } from '../lib/stream.ts';
 import { renewSession } from '../lib/tauri.ts';
@@ -35,13 +35,17 @@ export interface HttpBackendDeps {
 
 /**
  * 실제 데몬. 인증은 세션 열쇠(§12.1) — 토큰을 모르고 쿠키를 쓰지 않는다.
- * 열쇠가 없거나(부트 코드도 없음) 스트림·요청이 401 이면 스트림을 멈추고(다시 두드리지 않는다) 셸 안이면 `renew_session` 을 청한다.
- * 브라우저에서는 화면이 열쇠 안내를 보인다(conn.status = 'auth').
+ * 스트림은 열 때마다 hello 로 상대가 내 세션을 아는지 확인한 뒤에만 열쇠를 싣는다(§14.1).
+ * REST 요청은 그렇게 확인된 스트림이 열려 있는 동안에만 보낸다 — 끊긴 동안은 그 포트를 누가 잡았는지 모른다.
+ * 열쇠가 없거나(부트 코드도 없음) 확인에서 모르는 서버이거나 스트림·요청이 401 이면 스트림을 멈추고(다시 두드리지 않는다)
+ * 셸 안이면 `renew_session` 을 청한다. 브라우저에서는 화면이 열쇠 안내를 보인다(conn.status = 'auth').
  */
 export class HttpBackend implements Backend {
   readonly api: Api;
   readonly auth: FaceAuth;
   private stream: EventStream | null = null;
+  /** 스트림이 hello 로 확인되고 열려 있다(그때만 REST 를 보낸다). */
+  private connected = false;
   private readonly deps: HttpBackendDeps;
   private wake = () => this.retryNow();
   private onVisible = () => {
@@ -59,7 +63,11 @@ export class HttpBackend implements Backend {
     this.stream = new EventStream({
       open: (signal) => api.openStream(signal),
       onEvent: (ev) => sink.event(ev),
-      onStatus: (c) => sink.status(c),
+      onStatus: (c) => {
+        // 'open' 은 hello 확인과 스트림 머리를 모두 지난 뒤에만 온다.
+        this.connected = c.status === 'open';
+        sink.status(c);
+      },
       onAuthLost: () => this.renew(),
     });
     // 열쇠도 부트 코드도 없으면 요청을 하나도 보내지 않고 처음부터 안내한다(§12.1-5).
@@ -70,6 +78,7 @@ export class HttpBackend implements Backend {
   }
 
   stop(): void {
+    this.connected = false;
     this.stream?.stop();
     this.stream = null;
     window.removeEventListener('online', this.wake);
@@ -97,10 +106,14 @@ export class HttpBackend implements Backend {
     (this.deps.renew ?? (() => renewSession()))();
   }
 
-  /** 요청이 401 이면 열쇠가 없다고 보고 스트림을 멈춘다(열쇠는 api 가 이미 지웠다). 오류는 그대로 돌려준다(화면이 알림을 띄운다). */
-  private async guard<T>(p: Promise<T>): Promise<T> {
+  /**
+   * 확인된 스트림이 열려 있을 때만 보낸다(아니면 요청 없이 NotConnected).
+   * 요청이 401 이면 열쇠가 없다고 보고 스트림을 멈춘다(열쇠는 api 가 이미 지웠다). 오류는 그대로 돌려준다(화면이 알림을 띄운다).
+   */
+  private async guard<T>(send: () => Promise<T>): Promise<T> {
+    if (!this.connected) throw new NotConnected();
     try {
-      return await p;
+      return await send();
     } catch (e) {
       if (isUnauthorized(e) && this.stream) this.lost();
       throw e;
@@ -108,21 +121,21 @@ export class HttpBackend implements Backend {
   }
 
   itemAction(id: string, action: ItemAction, opts?: { reason?: DismissReason; minutes?: number }) {
-    return this.guard(this.api.itemAction(id, action, opts));
+    return this.guard(() => this.api.itemAction(id, action, opts));
   }
   focus(on: boolean, minutes?: number) {
-    return this.guard(this.api.focus(on, minutes));
+    return this.guard(() => this.api.focus(on, minutes));
   }
   listening(on: boolean) {
-    return this.guard(this.api.listening(on));
+    return this.guard(() => this.api.listening(on));
   }
   say(text: string, session?: string | null) {
-    return this.guard(this.api.say(text, session));
+    return this.guard(() => this.api.say(text, session));
   }
   decide(decisionId: string, choice: string) {
-    return this.guard(this.api.decide(decisionId, choice));
+    return this.guard(() => this.api.decide(decisionId, choice));
   }
   proposal(id: string, accept: boolean) {
-    return this.guard(this.api.proposal(id, accept));
+    return this.guard(() => this.api.proposal(id, accept));
   }
 }

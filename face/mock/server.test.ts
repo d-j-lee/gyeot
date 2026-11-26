@@ -3,7 +3,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer, request } from 'node:http';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -253,7 +253,35 @@ describe('데몬 확인(GET /v1/hello, §13.1)', () => {
     const r = await fetch(`${base()}/v1/hello?n=${n}`);
     expect(r.status).toBe(200);
     const want = createHmac('sha256', TOKEN).update(`gyeot-hello/v1|${port}|${n}`).digest('hex');
-    expect(await r.json()).toEqual({ v: 1, proof: want });
+    const body = (await r.json()) as { v: number; proof: string; face: string[] };
+    expect(body.v).toBe(1);
+    expect(body.proof).toBe(want);
+  });
+
+  it('face: 살아 있는 세션 열쇠마다 hex(HMAC-SHA256(SHA-256(열쇠), "gyeot-face-hello/v1|<포트>|<n>"))(§14.1)', async () => {
+    const key = await session();
+    const n = 'c3'.repeat(32);
+    const proofOf = (k: string, p: number) =>
+      createHmac('sha256', createHash('sha256').update(k, 'utf8').digest()).update(`gyeot-face-hello/v1|${p}|${n}`).digest('hex');
+    const body = (await (await fetch(`${base()}/v1/hello?n=${n}`)).json()) as { v: number; proof: string; face: string[] };
+    expect(Array.isArray(body.face)).toBe(true);
+    expect(body.face).toContain(proofOf(key, port));
+    expect(body.face).not.toContain(proofOf(key, port + 1));
+    expect(body.face).not.toContain(proofOf('ef'.repeat(32), port));
+    expect(body.face.length).toBeLessThanOrEqual(20);
+    for (const f of body.face) expect(f).toMatch(HEX64);
+  });
+
+  it('개발 서버 프록시(x-forwarded-port: 5173)를 거친 hello 는 5173 으로 계산한다 — 가짜 데몬만의 예외, 다른 값은 무시', async () => {
+    const key = await session();
+    const n = 'd4'.repeat(32);
+    const proofOf = (p: number) =>
+      createHmac('sha256', createHash('sha256').update(key, 'utf8').digest()).update(`gyeot-face-hello/v1|${p}|${n}`).digest('hex');
+    const via = async (h: Record<string, string>) => ((await (await fetch(`${base()}/v1/hello?n=${n}`, { headers: h })).json()) as { face: string[] }).face;
+    expect(await via({ 'X-Forwarded-Port': '5173' })).toContain(proofOf(5173));
+    const other = await via({ 'X-Forwarded-Port': '8080' });
+    expect(other).toContain(proofOf(port));
+    expect(other).not.toContain(proofOf(8080));
   });
 
   it('n 이 16–128자 hex 가 아니면 400', async () => {

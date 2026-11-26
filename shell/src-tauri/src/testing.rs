@@ -92,6 +92,7 @@ impl FakeDaemon {
                             port,
                             &hello,
                             (boot_status, boot_body.as_deref()),
+                            &flag,
                             &mut seen,
                         );
                     }
@@ -129,6 +130,7 @@ fn serve(
     port: u16,
     hello: &Hello,
     boot: (u16, Option<&str>),
+    stop: &AtomicBool,
     seen: &mut Vec<Seen>,
 ) {
     s.set_nonblocking(false).unwrap();
@@ -201,6 +203,16 @@ fn serve(
                 )
             });
             (boot.0, body, false)
+        } else if first.starts_with("GET /v1/stream ") {
+            // SSE 흉내: 머리와 ping 하나를 보내고, 멈출 때까지 연결을 붙잡는다. 멈추면 닫는다(데몬이 끝남).
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n: ping\n\n\r\n";
+            if s.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            while !stop.load(SeqCst) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            return;
         } else if first.starts_with("POST /v1/focus ") {
             (200, r#"{"ok":true,"until_ms":123}"#.to_string(), false)
         } else {

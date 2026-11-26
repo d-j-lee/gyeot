@@ -158,6 +158,12 @@ mod tests {
                 "{bad}"
             );
         }
+        // 서버가 더 싣는 필드(얼굴 확인 목록, §14.1)는 셸의 판단에 쓰지 않는다
+        let with_face = format!(
+            r#"{{"v":1,"proof":"{good}","face":["{}"]}}"#,
+            "a".repeat(64)
+        );
+        assert_eq!(check(200, with_face.as_bytes(), TOKEN, 47321, &n), Ok(()));
         // 200이 아니면 본문을 보지 않는다
         assert!(check(404, &body(&good), TOKEN, 47321, &n).is_err());
     }

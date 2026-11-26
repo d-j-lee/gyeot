@@ -324,9 +324,16 @@ fn post_with_token(
     body: &str,
 ) -> Result<http::Response, Failure> {
     let token = paths::read_token(data_dir).map_err(Failure::Other)?;
+    let mut conn = verified_conn(port, &token)?;
+    conn.send("POST", path, Some(&token), Some(body), false)
+        .map_err(|e| Failure::Other(format!("곁 데몬에 닿지 않아요: {e}")))
+}
+
+/// 새 연결을 열어 §13.1로 확인한다. 돌려준 연결로만 토큰을 보낸다(확인한 서버가 받는다).
+fn verified_conn(port: u16, token: &str) -> Result<Conn, Failure> {
     let unreachable = |e: io::Error| Failure::Other(format!("곁 데몬에 닿지 않아요: {e}"));
     let mut conn = Conn::open(port, AUTHED_TIMEOUT).map_err(unreachable)?;
-    match verify(&mut conn, &token, port, true) {
+    match verify(&mut conn, token, port, true) {
         Ok(()) => {}
         Err(Verify::NotMine(why)) => return Err(Failure::NotMine(not_mine(port, &why))),
         Err(Verify::Io(e)) => return Err(unreachable(e)),
@@ -337,8 +344,7 @@ fn post_with_token(
             "곁 데몬이 확인 뒤 연결을 닫아 토큰을 보내지 않았어요".into(),
         ));
     }
-    conn.send("POST", path, Some(&token), Some(body), false)
-        .map_err(unreachable)
+    Ok(conn)
 }
 
 const TOKEN_REFUSED: &str = "토큰이 맞지 않아요(401). 데몬을 다시 시작해 보세요.";
@@ -358,6 +364,25 @@ pub fn request_boot(port: u16, data_dir: Option<&Path>) -> Result<Boot, Failure>
         s => Err(Failure::Other(format!(
             "부트 코드 요청이 HTTP {s}로 끝났어요"
         ))),
+    }
+}
+
+/// 데몬이 살아 있는 동안 붙여 두는 연결: §13.1로 확인한 그 연결로 `GET /v1/stream`(토큰)을 열어 둔다.
+/// 데몬이 끝나면(다시 시작 포함) 연결이 끊기므로, 셸은 10초 감시를 기다리지 않고 곧바로 안다.
+pub fn open_watch(port: u16, data_dir: Option<&Path>) -> Result<Conn, Failure> {
+    let token = paths::read_token(data_dir).map_err(Failure::Other)?;
+    let mut conn = verified_conn(port, &token)?;
+    let head = conn
+        .send_head("GET", "/v1/stream", Some(&token))
+        .map_err(|e| Failure::Other(format!("곁 데몬에 닿지 않아요: {e}")))?;
+    match head.status {
+        200 if head.content_type.starts_with("text/event-stream") => Ok(conn),
+        200 => Err(Failure::Other(format!(
+            "곁 데몬의 스트림 응답 형식이 text/event-stream이 아니에요({})",
+            head.content_type
+        ))),
+        401 => Err(Failure::Other(TOKEN_REFUSED.into())),
+        s => Err(Failure::Other(format!("스트림 요청이 HTTP {s}로 끝났어요"))),
     }
 }
 
@@ -667,6 +692,119 @@ mod tests {
             "확인한 그 연결로 토큰을 보낸다(사이에 서버가 바뀌지 않게)"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn watch_stream_rides_the_verified_connection_and_ends_with_the_daemon() {
+        let token = "8d".repeat(32);
+        let dir = testing::data_dir_with_token("watch-ok", &token);
+        let fake = FakeDaemon::start(Hello::Correct(token.clone()));
+        let mut conn = open_watch(fake.port, Some(&dir)).expect("붙여 둘 연결");
+        let waiter = thread::spawn(move || {
+            let started = Instant::now();
+            (conn.wait_closed(Duration::from_secs(5)), started.elapsed())
+        });
+        // 데몬이 끝난다(가짜를 멈추면 연결을 닫는다).
+        thread::sleep(Duration::from_millis(200));
+        let seen = fake.finish();
+        let (closed, waited) = waiter.join().unwrap();
+        assert!(matches!(closed, http::Closed::Eof), "{closed:?}");
+        assert!(
+            waited < Duration::from_secs(3),
+            "끊기면 곧바로 안다: {waited:?}"
+        );
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].first_line().starts_with("GET /v1/hello?n="));
+        assert!(!seen[0].raw.contains(&token));
+        assert_eq!(seen[1].first_line(), "GET /v1/stream HTTP/1.1");
+        assert!(seen[1]
+            .raw
+            .contains(&format!("\r\nAuthorization: Bearer {token}\r\n")));
+        assert_eq!(seen[0].conn, seen[1].conn, "확인한 그 연결로 스트림을 연다");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn watch_stream_is_not_opened_on_a_server_that_is_not_mine() {
+        let token = "9e".repeat(32);
+        for hello in not_mine_cases(&token) {
+            let dir = testing::data_dir_with_token("watch-notmine", &token);
+            let fake = FakeDaemon::start(hello.clone());
+            let e = open_watch(fake.port, Some(&dir)).map(|_| ()).unwrap_err();
+            let seen = fake.finish();
+            assert!(e.is_not_mine(), "{hello:?}: {e}");
+            assert!(!testing::token_sent(&seen, &token), "{hello:?}: {seen:?}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// 실제 gyeotd와 맞춰 본다(가짜가 아니라). 기본은 건너뛴다:
+    /// `GYEOT_SHELL_SMOKE_GYEOTD=<gyeotd 경로> cargo test --locked real_daemon -- --nocapture`.
+    /// 확인 → 같은 연결로 부트·집중 모드, 붙여 둔 스트림이 데몬 종료를 곧바로 알림, 다시 띄운 데몬도 다시 확인.
+    #[test]
+    fn real_daemon_smoke() {
+        let Some(exe) = std::env::var_os("GYEOT_SHELL_SMOKE_GYEOTD") else {
+            eprintln!("건너뜀: GYEOT_SHELL_SMOKE_GYEOTD 가 없어요");
+            return;
+        };
+        let home = std::env::temp_dir().join(format!("gyeot-shell-smoke-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let start = || {
+            Command::new(&exe)
+                .env("GYEOT_HOME", &home)
+                .env("GYEOT_PORT", port.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("gyeotd")
+        };
+        let wait_mine = || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !matches!(probe(port, Some(&home)), Probe::Mine) {
+                assert!(Instant::now() < deadline, "실제 데몬이 확인되지 않아요");
+                thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let mut child = start();
+        wait_mine();
+        let boot = request_boot(port, Some(&home)).expect("실제 데몬의 부트 코드");
+        assert_eq!(boot.code.len(), 64);
+        assert!(set_focus(port, Some(&home), true, Some(1))
+            .expect("집중 모드")
+            .is_some());
+        assert_eq!(set_focus(port, Some(&home), false, None), Ok(None));
+        let mut conn = open_watch(port, Some(&home)).expect("붙여 둘 스트림");
+        let waiter = thread::spawn(move || {
+            let t = Instant::now();
+            (conn.wait_closed(Duration::from_secs(30)), t.elapsed())
+        });
+        thread::sleep(Duration::from_millis(300));
+        let killed = Instant::now();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (closed, _) = waiter.join().unwrap();
+        eprintln!("데몬을 끝내고 {:?} 뒤 알았어요: {closed}", killed.elapsed());
+        assert!(
+            killed.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            killed.elapsed()
+        );
+        assert!(!matches!(closed, http::Closed::Idle), "{closed}");
+        assert!(matches!(probe(port, Some(&home)), Probe::Down(_)));
+        // 다시 띄운 데몬도 처음부터 확인한다.
+        let mut child = start();
+        wait_mine();
+        assert!(open_watch(port, Some(&home)).is_ok());
+        assert!(request_boot(port, Some(&home)).is_ok());
+        child.kill().ok();
+        child.wait().ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

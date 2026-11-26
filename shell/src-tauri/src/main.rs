@@ -5,6 +5,7 @@
 //! - 데몬이 없으면 창 없이 띄우고,
 //! - 그 포트의 서버가 내 곁 데몬인지 확인한 연결로(§13.1) 토큰을 보내 일회용 부트 코드를 받고,
 //!   데몬이 서빙하는 얼굴(`/?mode=overlay`)을 투명·항상 위 창에 띄우고(얼굴이 세션 열쇠로 바꾼다, §12.1),
+//! - 확인한 연결로 데몬의 스트림을 붙여 두어 데몬이 멈추면 곧바로 얼굴을 닫고(§14.1),
 //! - 얼굴이 알려 준 영역에서만 클릭을 받으며,
 //! - 트레이·전역 단축키(Ctrl+Alt+Space)를 제공한다.
 
@@ -76,6 +77,7 @@ fn main() {
             overlay::start_pointer_thread(handle.clone());
             overlay::connect_async(handle.clone(), false);
             overlay::start_watchdog(handle.clone());
+            overlay::start_liveness(handle.clone());
             Ok(())
         })
         .build(tauri::generate_context!());

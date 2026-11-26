@@ -90,6 +90,18 @@ fn bad_config_fails_with_message() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("곁 데몬 오류"));
 }
 
+/// 계약 §14.1: 세션은 데몬 메모리에만 있어 데몬을 다시 띄우면 브라우저 얼굴은 `gyeotd --open`을 다시 해야 한다.
+const REOPEN: &str = "데몬을 다시 띄우면 이전 열쇠는 쓸 수 없어요. 브라우저로 연 얼굴은 gyeotd --open으로 다시 여세요";
+
+#[test]
+fn help_says_to_reopen_after_restart() {
+    let out = bin().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("gyeotd --open"), "{s}");
+    assert!(s.contains(REOPEN), "{s}");
+}
+
 #[test]
 fn unknown_argument_exits_2() {
     let out = bin().arg("--nope").output().unwrap();
@@ -243,9 +255,10 @@ fn open_print_gets_a_boot_url_from_the_running_daemon() {
         .map(|rd| rd.count())
         .unwrap_or(0);
     assert_eq!(pages, 0);
-    // 시작할 때 여는 방법을 알려 준다
+    // 시작할 때 여는 방법과, 다시 띄우면 브라우저 얼굴을 다시 열어야 한다는 것을 알려 준다(§14.1)
     let log = std::fs::read_to_string(d.path().join("gyeotd.log")).unwrap();
     assert!(log.contains("얼굴 열기: gyeotd --open"), "{log}");
+    assert!(log.contains(REOPEN), "{log}");
 }
 
 #[test]

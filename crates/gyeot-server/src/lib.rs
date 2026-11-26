@@ -90,17 +90,13 @@ pub async fn bind(cfg: ServerConfig) -> Result<Server> {
         .context("상태를 되살리지 못했어요")??;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let sessions_path = cfg.sessions_path();
-    let sessions =
-        tokio::task::spawn_blocking(move || auth::Sessions::load(&sessions_path, now_ms()))
-            .await
-            .context("세션을 읽지 못했어요")?;
+    remove_leftover_sessions(&cfg.home);
     let shared = Arc::new(Shared::new(
         addr.port(),
         token,
         cfg.face_dir.clone(),
         hub,
-        sessions,
+        auth::Sessions::new(),
         shutdown_rx,
     ));
     Ok(Server {
@@ -112,6 +108,28 @@ pub async fn bind(cfg: ServerConfig) -> Result<Server> {
         log,
         log_thread,
     })
+}
+
+/// 옛 판이 남긴 세션 파일(`sessions.json`과 쓰다 만 `sessions.tmp-*`)을 지운다. 세션은 메모리에만 두고
+/// 디스크의 해시로 이전 열쇠를 되살리지 않는다(계약 §14.1, G-036).
+fn remove_leftover_sessions(home: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(home) else {
+        return;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name != "sessions.json" && !name.starts_with("sessions.tmp-") {
+            continue;
+        }
+        let is_file = e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink());
+        if !is_file {
+            continue;
+        }
+        match std::fs::remove_file(e.path()) {
+            Ok(()) => tracing::info!("옛 세션 파일 {name}을 지웠어요(세션은 메모리에만 둬요)"),
+            Err(e) => tracing::warn!("옛 세션 파일 {name}을 지우지 못했어요: {e}"),
+        }
+    }
 }
 
 fn restore(
@@ -240,10 +258,6 @@ impl Server {
             let _ = t.await;
         }
         save_learn(&shared, &cfg).await;
-        {
-            let sh = shared.clone();
-            let _ = tokio::task::spawn_blocking(move || sh.sessions().flush()).await;
-        }
         drop(shared);
         let log2 = log.clone();
         let _ = tokio::task::spawn_blocking(move || log2.flush_blocking()).await;

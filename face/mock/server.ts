@@ -165,6 +165,14 @@ const UNAUTHORIZED = { ok: false, error: '열쇠가 없거나 틀렸어요' };
 const FORBIDDEN = { ok: false, error: '이 열쇠로는 쓸 수 없어요' };
 
 let listenPort = PORT;
+
+/**
+ * 얼굴 확인(§14.1)에 넣을 포트: 이 서버가 묶인 포트. 가짜 데몬만의 예외로, vite 개발 서버 프록시(xfwd)를 거친 요청
+ * (`x-forwarded-port: 5173`)은 개발 서버 포트로 계산한다 — 그 얼굴은 자기 주소의 포트(5173)로 계산하기 때문이다. 진짜 데몬은 이렇게 하지 않는다.
+ */
+function facePort(req: IncomingMessage): number {
+  return req.headers['x-forwarded-port'] === String(DEV_PORT) ? DEV_PORT : listenPort;
+}
 const allowedHosts = () => new Set([`127.0.0.1:${listenPort}`, `localhost:${listenPort}`]);
 // §7·§12.2: 같은 출처만. Tauri 출처는 받지 않는다. 개발 서버(vite) 출처는 가짜 데몬만의 예외다.
 const allowedOrigins = () =>
@@ -337,10 +345,11 @@ const server = createServer(async (req, res) => {
   try {
     if (method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, version: '0.1.0-mock' });
     // §13.1: 데몬 확인. 인증 없이, 토큰·실제로 묶인 포트·n 의 HMAC.
+    // §14.1: face — 살아 있는 세션마다의 HMAC(얼굴이 열쇠를 보내기 전에 본다).
     if (method === 'GET' && url.pathname === '/v1/hello') {
       const n = url.searchParams.get('n');
       if (!isHelloNonce(n)) return json(res, 400, { ok: false, error: 'n 은 16–128자 hex 여야 해요' });
-      return json(res, 200, { v: 1, proof: helloProof(TOKEN, listenPort, n) });
+      return json(res, 200, { v: 1, proof: helloProof(TOKEN, listenPort, n), face: auth.faceList(facePort(req), n) });
     }
     // §12.1-3: 부트 코드 → 세션 열쇠. 인증 없이 코드만으로. 쿠키를 달지 않는다.
     if (url.pathname === '/v1/session') {

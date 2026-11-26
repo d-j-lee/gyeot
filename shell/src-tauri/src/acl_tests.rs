@@ -351,3 +351,73 @@ fn renewed_face_cannot_loop_through_renew_session() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn face_from_a_stopped_daemon_does_not_reopen_through_renew_session() {
+    // 데몬이 멈춘 것을 셸이 봤다(붙여 둔 연결이 끊김). 그 사이 옛 얼굴이 새 데몬에서 401을 받고 부른 renew_session은
+    // 창을 열지 않는다: 새 데몬이 뜨면 감시가 한 번 연다(두 번 열지 않게, 고리 제한에도 걸리지 않게).
+    let token = "ad".repeat(32);
+    let dir = testing::data_dir_with_token("acl-renew-stale", &token);
+    let fake = FakeDaemon::start(Hello::Correct(token.clone()));
+    let app = app_with(fake.port, Some(dir.clone()));
+    let win = window(&app, overlay::MAIN);
+    let before = win.url().unwrap();
+    app.state::<OverlayState>().daemon_gone();
+    let e = renew_reached(&win, FACE).unwrap();
+    assert!(e.contains("다시 시작돼서"), "{e}");
+    let seen = fake.finish();
+    assert!(seen.is_empty(), "데몬에 묻지도 않는다: {seen:?}");
+    assert_eq!(win.url().unwrap(), before, "창을 옮기지 않는다");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn held_stream_ending_closes_the_face_at_once() {
+    // 붙여 둔 연결(확인한 /v1/stream)이 끊기면(데몬이 끝남) 10초 감시를 기다리지 않고 바로 얼굴을 닫는다(§14.1).
+    let token = "be".repeat(32);
+    let dir = testing::data_dir_with_token("acl-liveness", &token);
+    let fake = FakeDaemon::start(Hello::Correct(token.clone()));
+    let app = app_with(fake.port, Some(dir.clone()));
+    let win = window(&app, overlay::MAIN);
+    win.navigate(FACE.parse().unwrap()).unwrap();
+    app.state::<OverlayState>().face_shown();
+    overlay::start_liveness(app.handle().clone());
+    // 연결이 붙을 시간을 준다(붙었는지는 가짜가 받은 GET /v1/stream으로 아래에서 확인한다).
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(
+        overlay::classify(&win.url().unwrap(), 47321),
+        overlay::Page::Face,
+        "붙어 있는 동안은 얼굴"
+    );
+    assert!(!app.state::<OverlayState>().face_is_stale());
+    // 데몬이 끝난다.
+    let started = std::time::Instant::now();
+    let seen = fake.finish();
+    while started.elapsed() < std::time::Duration::from_secs(3)
+        && overlay::classify(&win.url().unwrap(), 47321) == overlay::Page::Face
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        overlay::classify(&win.url().unwrap(), 47321),
+        overlay::Page::Loading,
+        "곧바로 대체 화면으로"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        app.state::<OverlayState>().face_is_stale(),
+        "옛 얼굴은 지난 세대"
+    );
+    assert!(
+        seen.iter()
+            .any(|s| s.first_line() == "GET /v1/stream HTTP/1.1"),
+        "{seen:?}"
+    );
+    assert!(seen[0].first_line().starts_with("GET /v1/hello?n="));
+    app.state::<OverlayState>().set_quitting();
+    std::fs::remove_dir_all(&dir).ok();
+}

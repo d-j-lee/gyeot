@@ -7,6 +7,7 @@ import type {
   Snapshot,
 } from '../types.ts';
 import type { FaceAuth } from './session.ts';
+import { checkPeer } from './peer.ts';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
@@ -39,6 +40,17 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 확인된 스트림이 열려 있지 않아 요청을 보내지 않았다(§14.1). 끊긴 동안 그 포트를 누가 잡았는지 모르므로
+ * 열쇠를 싣는 요청은 스트림이 hello 로 확인하고 열린 동안에만 보낸다.
+ */
+export class NotConnected extends Error {
+  constructor() {
+    super('확인된 연결이 없어 보내지 않음');
+    this.name = 'NotConnected';
+  }
+}
+
 export function isUnauthorized(e: unknown): boolean {
   return e instanceof ApiError && e.status === 401;
 }
@@ -52,12 +64,15 @@ export function describeError(e: unknown): string {
     if (e.status >= 500) return '데몬 안에서 오류가 났어요';
     return `요청이 거절됐어요(${e.status})`;
   }
+  if (e instanceof NotConnected) return '곁 데몬과 연결되어 있지 않아요';
   if (e instanceof DOMException && e.name === 'AbortError') return '응답이 너무 늦어요';
   return '곁 데몬에 닿지 않아요';
 }
 
 /**
  * 데몬 API(§7). 인증은 세션 열쇠 하나를 `Authorization: Bearer` 머리로 싣는 것뿐이다(§12.1-3).
+ * 스트림을 열 때마다 열쇠를 싣기 전에 hello 로 그 포트의 서버가 내 세션을 아는지 확인한다(§14.1).
+ * REST 는 그렇게 확인된 스트림이 열려 있는 동안에만 보낸다(HttpBackend 가 지킨다).
  * 얼굴은 토큰을 모르고, 주소·쿠키에 비밀을 두지 않는다(쿠키는 싣지도 받지도 않는다: credentials 'omit').
  * 열쇠가 없으면 요청을 보내지 않고 401 로 다룬다. 401 을 받으면 그 열쇠를 지운다(§12.1-5).
  */
@@ -70,13 +85,19 @@ export interface Api {
   say(text: string, session?: string | null): Promise<SayResult>;
   decide(decisionId: string, choice: string): Promise<DecisionResult>;
   proposal(id: string, accept: boolean): Promise<void>;
-  /** GET /v1/stream(§8). 머리가 오면(200 text/event-stream) 응답을, 아니면 ApiError 를 던진다. 몸은 부른 쪽이 읽는다. */
+  /**
+   * GET /v1/stream(§8). 열쇠를 싣기 전에 늘 hello 로 상대를 확인한다(§14.1).
+   * 내 세션을 모르는 서버면 열쇠를 보내지 않고 지운 뒤 ApiError(401). hello 를 확인하지 못하면 PeerUnverified(끊김).
+   * 머리가 오면(200 text/event-stream) 응답을, 아니면 ApiError 를 던진다. 몸은 부른 쪽이 읽는다.
+   */
   openStream(signal: AbortSignal): Promise<Response>;
 }
 
 export interface ApiDeps {
   auth: FaceAuth;
   fetchImpl?: typeof fetch;
+  /** 얼굴 확인에 넣을 포트(기본: API 출처의 포트, 같은 출처면 이 페이지의 포트) */
+  port?: string;
 }
 
 /** 요청 머리가 늦을 때 끊는 시간. 스트림은 머리가 온 뒤로는 끊지 않는다(ping 으로 살아 있음을 본다). */
@@ -86,10 +107,20 @@ export function createApi(base: string, deps: ApiDeps): Api {
   const { auth } = deps;
   const fetchImpl = deps.fetchImpl ?? ((...a) => fetch(...a));
 
-  /** 열쇠를 실어 보낸다. 열쇠가 없으면 보내지 않고 401. 401 이면 그 열쇠를 지운다. */
-  async function send(method: 'GET' | 'POST', path: string, init: { body?: unknown; accept?: string; signal?: AbortSignal }): Promise<Response> {
+  /**
+   * 열쇠를 실어 보낸다. 열쇠가 없으면 보내지 않고 401. 401 이면 그 열쇠를 지운다.
+   * verify 면 싣기 전에 hello 로 상대를 확인한다 — 모르는 서버면 보내지 않고 지운 뒤 401(§14.1).
+   */
+  async function send(method: 'GET' | 'POST', path: string, init: { body?: unknown; accept?: string; signal?: AbortSignal; verify?: boolean }): Promise<Response> {
     const key = await auth.key();
     if (!key) throw new ApiError(401, `${method} ${path} → 열쇠 없음`);
+    if (init.verify) {
+      const peer = await checkPeer({ base, key, port: deps.port, fetchImpl, signal: init.signal });
+      if (peer === 'unknown') {
+        auth.invalidate(key);
+        throw new ApiError(401, `${method} ${path} → 이 서버는 내 세션을 몰라요(hello)`);
+      }
+    }
     const headers: Record<string, string> = { Authorization: `Bearer ${key}` };
     if (init.body !== undefined) headers['Content-Type'] = 'application/json';
     if (init.accept) headers.Accept = init.accept;
@@ -148,7 +179,7 @@ export function createApi(base: string, deps: ApiDeps): Api {
       else signal.addEventListener('abort', onAbort, { once: true });
       const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
       try {
-        const res = await send('GET', '/v1/stream', { accept: 'text/event-stream', signal: ctrl.signal });
+        const res = await send('GET', '/v1/stream', { accept: 'text/event-stream', signal: ctrl.signal, verify: true });
         const type = res.headers.get('content-type') ?? '';
         if (!/^text\/event-stream\b/i.test(type)) {
           void res.body?.cancel().catch(() => {});

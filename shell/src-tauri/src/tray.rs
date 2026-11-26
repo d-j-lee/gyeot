@@ -105,14 +105,16 @@ fn on_menu(app: &AppHandle, event: &MenuEvent, autostart: &CheckMenuItem<tauri::
         id::FOCUS_OFF => focus(app, false),
         id::RESTART => {
             set_tip(app, "곁 · 데몬을 다시 시작하는 중…", None);
+            // 얼굴을 먼저 닫는다: 옛 얼굴이 새 데몬에서 401 → renew_session으로 따로 다시 열지 않게(§14.1).
+            overlay::before_daemon_restart(app);
             let app = app.clone();
             thread::spawn(move || {
                 let cfg = app.state::<AppConfig>();
                 match daemon::restart(cfg.port, cfg.data_dir.as_deref()) {
                     Ok(_) => {
                         set_tip(&app, TIP, None);
-                        // 새 부트 코드로 얼굴을 다시 연다(데몬이 떠 있으니 띄우지는 않는다).
-                        overlay::connect_async(app.clone(), false);
+                        // 새 부트 코드로 여는 것은 감시가 한 번 한다(붙여 둔 연결이 다시 이어지면 깨어난다).
+                        overlay::wake_watchdog(&app);
                     }
                     Err(reason) => {
                         crate::warn!("데몬 다시 시작 실패: {reason}");

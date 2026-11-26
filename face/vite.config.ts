@@ -20,7 +20,8 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5173,
     proxy: {
-      '/v1': { target: daemon, changeOrigin: true },
+      // xfwd: x-forwarded-port(5173)를 실어, mock 이 얼굴 확인(§14.1)의 face 값을 개발 서버 포트로 계산하게 한다.
+      '/v1': { target: daemon, changeOrigin: true, xfwd: true },
       '/health': { target: daemon, changeOrigin: true },
     },
   },

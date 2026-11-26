@@ -16,26 +16,37 @@ const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// `--open`이 데몬의 답을 기다리는 시간.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 시작할 때 보이는 얼굴 여는 방법.
-const OPEN_HINT: &str = "얼굴 열기: gyeotd --open";
+/// 데몬을 다시 띄운 뒤의 안내(계약 §14.1: 세션 열쇠는 데몬 메모리에만 있다). 셸은 저절로 다시 연다.
+macro_rules! reopen_note {
+    () => {
+        "데몬을 다시 띄우면 이전 열쇠는 쓸 수 없어요. 브라우저로 연 얼굴은 gyeotd --open으로 다시 여세요"
+    };
+}
+const OPEN_HINT: &str = concat!("얼굴 열기: gyeotd --open (", reopen_note!(), ")");
 /// hello가 맞지 않을 때(계약 §13.1).
 const NOT_MY_DAEMON: &str =
     "이 포트의 서버는 내 곁 데몬이 아니에요(다른 사용자나 프로그램일 수 있어요)";
 /// 열기 쪽을 남겨 두는 시간. 넘으면 다음 `--open`이 지운다(계약 §12.1).
 const OPEN_PAGE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
-const HELP: &str = "곁 데몬
+const HELP: &str = concat!(
+    "곁 데몬
 
 사용:
   gyeotd                 서버를 돌린다(Ctrl+C로 멈춤)
   gyeotd --open          실행 중인 데몬이 내 데몬인지 확인하고 일회용 열기 코드를 받아 기본 브라우저로 얼굴을 연다
                          (주소는 프로그램 인자가 아니라 <데이터>/open/의 나만 읽는 파일로 넘긴다)
   gyeotd --open --print  여는 대신 주소만 표준 출력에 보인다(120초 안에 한 번 쓸 수 있다)
+                         ",
+    reopen_note!(),
+    " (트레이의 셸은 저절로 다시 열어요)
   gyeotd --init          데이터 폴더와 토큰을 만들고 경로를 보인다
   gyeotd --print-config  실제로 쓰는 설정을 보인다
   gyeotd --version       판을 보인다
   gyeotd --help          이 도움말
 
-환경 변수: GYEOT_HOME(데이터 폴더), GYEOT_PORT(포트), GYEOT_FACE_DIR(얼굴 폴더), RUST_LOG(로그 수준)";
+환경 변수: GYEOT_HOME(데이터 폴더), GYEOT_PORT(포트), GYEOT_FACE_DIR(얼굴 폴더), RUST_LOG(로그 수준)"
+);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Cmd {

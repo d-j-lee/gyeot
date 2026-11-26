@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import { createHmac } from 'node:crypto';
-import { AuthStore, BOOT_TTL_MS, helloProof, isHelloNonce, MAX_BOOT_CODES, MAX_SESSIONS, SESSION_TTL_MS } from './auth.ts';
+import { AuthStore, BOOT_TTL_MS, faceProofOf, helloProof, isHelloNonce, MAX_BOOT_CODES, MAX_SESSIONS, SESSION_TTL_MS } from './auth.ts';
 
 const TOKEN = 'ab'.repeat(32);
 
@@ -113,5 +113,51 @@ describe('데몬 확인(§13.1 /v1/hello)', () => {
     expect(isHelloNonce('a'.repeat(129))).toBe(false);
     expect(isHelloNonce('zz'.repeat(10))).toBe(false);
     expect(isHelloNonce(null)).toBe(false);
+  });
+});
+
+describe('얼굴 확인 목록(§14.1 face)', () => {
+  // 서버 담당과 같은 공유 시험 값. 기대값은 파이썬 hashlib·hmac 으로 따로 계산했다.
+  const SHARED_SESSION = '0123456789abcdef'.repeat(4);
+  const SHARED_N = 'ab'.repeat(32);
+
+  it('공유 시험 값: HMAC-SHA256(key = SHA-256(세션 UTF-8), "gyeot-face-hello/v1|47321|" + n)', () => {
+    expect(faceProofOf(SHARED_SESSION, 47321, SHARED_N)).toBe('607b8f06e715b5b23515fbb572a63617cf35019b687b1444f4433e27a7d368e4');
+    expect(faceProofOf(SHARED_SESSION, 47322, SHARED_N)).toBe('fcb875c58193eea573405310509b4ded38cafc4c0296e5189bad09d3a6d83f91');
+  });
+
+  it('살아 있는 세션마다 하나(해시만으로 계산), 끝난 세션·모르는 열쇠는 없다', () => {
+    const { s, tick } = store();
+    const a = s.redeem(s.issueCode().code)!.session;
+    tick(SESSION_TTL_MS - 10);
+    const b = s.redeem(s.issueCode().code)!.session;
+    const n = 'cd'.repeat(32);
+    expect(s.faceList(47321, n).sort()).toEqual([faceProofOf(a, 47321, n), faceProofOf(b, 47321, n)].sort());
+    expect(s.faceList(47321, n)).not.toContain(faceProofOf('ef'.repeat(32), 47321, n));
+    tick(10); // a 가 7일을 다 채웠다
+    expect(s.faceList(47321, n)).toEqual([faceProofOf(b, 47321, n)]);
+  });
+
+  it('최대 20개, 순서는 섞는다', () => {
+    const { s, tick } = store();
+    const keys = Array.from({ length: MAX_SESSIONS }, () => {
+      tick(1);
+      return s.redeem(s.issueCode().code)!.session;
+    });
+    const n = 'ab'.repeat(32);
+    const inOrder = keys.map((k) => faceProofOf(k, 47321, n));
+    const lists = Array.from({ length: 5 }, () => s.faceList(47321, n));
+    for (const l of lists) {
+      expect(l).toHaveLength(MAX_SESSIONS);
+      expect([...l].sort()).toEqual([...inOrder].sort());
+    }
+    expect(lists.some((l) => l.join() !== inOrder.join())).toBe(true);
+  });
+
+  it('보관한 것에 세션 값이 없어도 계산한다(값은 SHA-256 만 둔다)', () => {
+    const { s } = store();
+    const v = s.redeem(s.issueCode().code)!.session;
+    expect(JSON.stringify(s.dump())).not.toContain(v);
+    expect(s.faceList(1, 'a'.repeat(16))).toEqual([faceProofOf(v, 1, 'a'.repeat(16))]);
   });
 });

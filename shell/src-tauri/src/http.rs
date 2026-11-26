@@ -39,6 +39,8 @@ pub struct Conn {
     /// 앞 응답 뒤에 이미 받아 둔 바이트.
     buf: Vec<u8>,
     closed: bool,
+    /// [`Conn::send_head`]로 연 응답이 chunked인지.
+    chunked: bool,
 }
 
 impl Conn {
@@ -53,6 +55,7 @@ impl Conn {
             deadline,
             buf: Vec::with_capacity(1024),
             closed: false,
+            chunked: false,
         })
     }
 
@@ -110,6 +113,189 @@ impl Conn {
                 ));
             }
             self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+}
+
+/// 붙여 둔 응답(스트림)이 끝난 까닭.
+#[derive(Debug)]
+pub enum Closed {
+    /// 서버가 연결을 닫았다(데몬이 끝남).
+    Eof,
+    /// 서버가 스트림 응답을 끝냈다(끝 청크).
+    Ended,
+    /// 이 시간 동안 아무것도 오지 않았다(데몬은 15초마다 ping을 보낸다).
+    Idle,
+    /// 읽기 오류(연결이 끊김 등).
+    Error(io::Error),
+}
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Closed::Eof => f.write_str("데몬이 연결을 닫음"),
+            Closed::Ended => f.write_str("데몬이 스트림을 끝냄"),
+            Closed::Idle => f.write_str("한동안 아무것도 오지 않음"),
+            Closed::Error(e) => write!(f, "읽기 오류: {e}"),
+        }
+    }
+}
+
+/// 응답 머리.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Head {
+    pub status: u16,
+    pub content_type: String,
+    pub chunked: bool,
+}
+
+impl Conn {
+    /// 요청을 보내고(keep-alive) 응답 머리까지만 읽는다. 본문은 연결에 남는다. 스트림(SSE)을 열어 둘 때 쓴다.
+    pub fn send_head(
+        &mut self,
+        method: &str,
+        target: &str,
+        bearer: Option<&str>,
+    ) -> io::Result<Head> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "곁 데몬이 연결을 닫았어요",
+            ));
+        }
+        let raw_request = build_request(self.port, method, target, bearer, None, true)?;
+        self.stream
+            .set_write_timeout(Some(remaining(self.deadline)?))?;
+        self.stream.write_all(raw_request.as_bytes())?;
+        let mut chunk = [0u8; 8192];
+        loop {
+            if let Some(head_end) = find(&self.buf, b"\r\n\r\n") {
+                let (_, status, headers) = parse_head(&self.buf[..head_end])?;
+                self.buf.drain(..head_end + 4);
+                let get = |name: &str| {
+                    headers
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, v)| v.to_ascii_lowercase())
+                        .unwrap_or_default()
+                };
+                let head = Head {
+                    status,
+                    content_type: get("content-type"),
+                    chunked: get("transfer-encoding").contains("chunked"),
+                };
+                self.chunked = head.chunked;
+                return Ok(head);
+            }
+            self.stream
+                .set_read_timeout(Some(remaining(self.deadline)?))?;
+            let n = match self.stream.read(&mut chunk) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if n == 0 {
+                self.closed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "응답 머리가 중간에 끊겼어요",
+                ));
+            }
+            if self.buf.len() + n > MAX_RESPONSE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "응답이 너무 커요",
+                ));
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// [`Conn::send_head`]로 연 응답을 버리며 읽다가, 서버가 닫거나 응답을 끝내거나 `idle` 동안 아무것도
+    /// 오지 않으면 돌아온다. 그 뒤로는 이 연결을 쓰지 않는다.
+    pub fn wait_closed(&mut self, idle: Duration) -> Closed {
+        let mut skipper = self.chunked.then(ChunkSkipper::default);
+        let first = std::mem::take(&mut self.buf);
+        self.closed = true;
+        if let Some(sk) = skipper.as_mut() {
+            match sk.feed(first) {
+                Ok(true) => return Closed::Ended,
+                Ok(false) => {}
+                Err(e) => return Closed::Error(e),
+            }
+        }
+        if let Err(e) = self.stream.set_read_timeout(Some(idle)) {
+            return Closed::Error(e);
+        }
+        let mut chunk = [0u8; 8192];
+        loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return Closed::Eof,
+                Ok(n) => {
+                    if let Some(sk) = skipper.as_mut() {
+                        match sk.feed(chunk[..n].to_vec()) {
+                            Ok(true) => return Closed::Ended,
+                            Ok(false) => {}
+                            Err(e) => return Closed::Error(e),
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Closed::Idle
+                }
+                Err(e) => return Closed::Error(e),
+            }
+        }
+    }
+}
+
+/// chunked 본문을 버리며 끝 청크(0)를 찾는다. 청크 크기 줄만 잠깐 모은다.
+#[derive(Default)]
+struct ChunkSkipper {
+    line: Vec<u8>,
+    /// 지금 청크에서 더 버릴 바이트(데이터 + CRLF).
+    skip: usize,
+}
+
+impl ChunkSkipper {
+    /// 받은 바이트를 먹인다. 끝 청크를 봤으면 `true`.
+    fn feed(&mut self, mut data: Vec<u8>) -> io::Result<bool> {
+        loop {
+            if self.skip > 0 {
+                let n = self.skip.min(data.len());
+                self.skip -= n;
+                data.drain(..n);
+                if self.skip > 0 || data.is_empty() {
+                    return Ok(false);
+                }
+            }
+            self.line.extend_from_slice(&data);
+            let Some(end) = find(&self.line, b"\r\n") else {
+                if self.line.len() > 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "청크 크기 줄이 너무 길어요",
+                    ));
+                }
+                return Ok(false);
+            };
+            let size_line = std::str::from_utf8(&self.line[..end])
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "청크 크기"))?;
+            let size_hex = size_line.split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(size_hex, 16)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "청크 크기"))?;
+            if size == 0 {
+                return Ok(true);
+            }
+            data = self.line.split_off(end + 2);
+            self.line.clear();
+            self.skip = size + 2;
         }
     }
 }
@@ -198,18 +384,13 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// 받은 바이트로 응답 하나가 끝났으면 `Some((응답, 쓴 바이트 수))`. `eof`이면 남은 것을 본문으로 본다.
-pub fn try_parse(buf: &[u8], eof: bool) -> io::Result<Option<(Response, usize)>> {
+/// 응답 머리의 (소문자 이름, 값) 목록.
+type Headers = Vec<(String, String)>;
+
+/// 응답 머리(빈 줄 앞까지)를 읽는다: (프로토콜, 상태 코드, 머리 목록).
+fn parse_head(raw: &[u8]) -> io::Result<(String, u16, Headers)> {
     let invalid = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
-    let Some(head_end) = find(buf, b"\r\n\r\n") else {
-        return if eof {
-            Err(invalid("HTTP 머리가 끝나지 않았어요"))
-        } else {
-            Ok(None)
-        };
-    };
-    let head = std::str::from_utf8(&buf[..head_end])
-        .map_err(|_| invalid("HTTP 머리가 UTF-8이 아니에요"))?;
+    let head = std::str::from_utf8(raw).map_err(|_| invalid("HTTP 머리가 UTF-8이 아니에요"))?;
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let mut parts = status_line.splitn(3, ' ');
@@ -221,16 +402,29 @@ pub fn try_parse(buf: &[u8], eof: bool) -> io::Result<Option<(Response, usize)>>
         .next()
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| invalid("상태 코드를 읽지 못했어요"))?;
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    Ok((proto.to_string(), status, headers))
+}
 
+/// 받은 바이트로 응답 하나가 끝났으면 `Some((응답, 쓴 바이트 수))`. `eof`이면 남은 것을 본문으로 본다.
+pub fn try_parse(buf: &[u8], eof: bool) -> io::Result<Option<(Response, usize)>> {
+    let invalid = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+    let Some(head_end) = find(buf, b"\r\n\r\n") else {
+        return if eof {
+            Err(invalid("HTTP 머리가 끝나지 않았어요"))
+        } else {
+            Ok(None)
+        };
+    };
+    let (proto, status, headers) = parse_head(&buf[..head_end])?;
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
     let mut connection = String::new();
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim();
+    for (name, value) in &headers {
+        let value = value.as_str();
         if name == "content-length" {
             content_length = Some(
                 value
@@ -583,6 +777,71 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn chunk_skipper_finds_the_last_chunk_across_reads() {
+        let body = b"8\r\n: ping\n\n\r\n1a;x=y\r\nevent: presence\ndata: {}\n\n\r\n0\r\n\r\n";
+        for cut in 1..body.len() {
+            let mut sk = ChunkSkipper::default();
+            let first = sk.feed(body[..cut].to_vec()).unwrap();
+            let done = first || sk.feed(body[cut..].to_vec()).unwrap();
+            assert!(done, "자른 곳 {cut}");
+        }
+        // 끝 청크가 아직 오지 않았으면 끝이 아니다(데이터 안의 "0"에 속지 않는다)
+        let mut sk = ChunkSkipper::default();
+        assert!(!sk.feed(b"3\r\n0\r\n\r\n".to_vec()).unwrap());
+        assert!(sk.feed(b"0\r\n\r\n".to_vec()).unwrap());
+        assert!(ChunkSkipper::default().feed(b"zz\r\n".to_vec()).is_err());
+    }
+
+    /// 스트림 서버 흉내: 머리와 청크를 보낸 뒤 `then`대로 한다.
+    fn stream_server(then: &'static str) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut b = [0u8; 1024];
+            let _ = s.read(&mut b).unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n: ping\n\n\r\n")
+                .unwrap();
+            thread::sleep(Duration::from_millis(150));
+            match then {
+                "close" => {}
+                "end" => {
+                    s.write_all(b"0\r\n\r\n").unwrap();
+                    thread::sleep(Duration::from_millis(800));
+                }
+                _ => thread::sleep(Duration::from_millis(800)),
+            }
+        });
+        (port, server)
+    }
+
+    #[test]
+    fn stream_head_then_wait_until_the_server_goes() {
+        for (then, idle) in [("close", 2000), ("end", 2000), ("silent", 300)] {
+            let (port, server) = stream_server(then);
+            let mut conn = Conn::open(port, Duration::from_secs(2)).unwrap();
+            let head = conn.send_head("GET", "/v1/stream", Some("tok")).unwrap();
+            assert_eq!(head.status, 200);
+            assert!(head.content_type.starts_with("text/event-stream"));
+            assert!(head.chunked);
+            let started = Instant::now();
+            let closed = conn.wait_closed(Duration::from_millis(idle));
+            match then {
+                "close" => assert!(matches!(closed, Closed::Eof), "{closed:?}"),
+                "end" => assert!(matches!(closed, Closed::Ended), "{closed:?}"),
+                _ => assert!(matches!(closed, Closed::Idle), "{closed:?}"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_millis(700),
+                "{then}: {:?}",
+                started.elapsed()
+            );
+            assert!(conn.is_closed());
+            server.join().unwrap();
+        }
     }
 
     #[test]

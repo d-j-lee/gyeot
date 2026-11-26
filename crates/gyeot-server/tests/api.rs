@@ -1336,7 +1336,10 @@ async fn hello_proves_token_port_and_nonce() {
         assert_eq!(r.status, 200, "{}", r.text());
         let v = r.json();
         assert_eq!(v["v"], 1, "{v}");
-        assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
+        let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["face", "proof", "v"], "{v}");
+        assert!(v["face"].is_array(), "{v}");
         v["proof"].as_str().unwrap().to_owned()
     };
     // 인증 머리 없이 받는다
@@ -1421,9 +1424,10 @@ async fn at_most_eight_open_boot_codes() {
     srv.stop().await;
 }
 
-/// 세션은 SHA-256만 0600 파일에 남기고, 만든 때부터 7일, 데몬을 다시 띄워도 이어진다. 최대 20개.
+/// R5 H1(계약 §14.1·§12.1 4번, G-036): 세션은 데몬 메모리에만 있다. 최대 20개, `sessions.json`을
+/// 쓰지 않고, 데몬을 다시 띄우면 이전 열쇠는 모두 401이다.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sessions_are_hashed_on_disk_and_survive_restart() {
+async fn sessions_live_only_in_memory_and_die_with_the_daemon() {
     let d = tempfile::tempdir().unwrap();
     let srv = TestServer::start(d.path()).await;
     let mut keys = Vec::new();
@@ -1440,40 +1444,191 @@ async fn sessions_are_hashed_on_disk_and_survive_restart() {
     for k in &keys[1..] {
         assert_eq!(srv.with_key("GET", "/v1/state", k, None).await.status, 200);
     }
+    assert!(
+        !d.path().join("sessions.json").exists(),
+        "돌 때도 쓰지 않는다"
+    );
     srv.stop().await;
-    let path = d.path().join("sessions.json");
-    let text = std::fs::read_to_string(&path).unwrap();
-    let v: Value = serde_json::from_str(&text).unwrap();
-    let list = v["sessions"].as_array().unwrap();
-    assert_eq!(list.len(), 20);
-    for k in &keys {
-        assert!(!text.contains(k.as_str()), "세션 값이 그대로 남으면 안 됨");
+    // 끌 때도 쓰지 않고, 데이터 폴더 어디에도 열쇠·해시가 없다
+    assert!(
+        !d.path().join("sessions.json").exists(),
+        "끌 때도 쓰지 않는다"
+    );
+    let mut stack = vec![d.path().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let bytes = std::fs::read(&p).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            for k in &keys {
+                assert!(!text.contains(k.as_str()), "{}: 열쇠가 남음", p.display());
+                assert!(
+                    !text.contains(&sha256_hex(k)),
+                    "{}: 열쇠의 해시가 남음",
+                    p.display()
+                );
+            }
+        }
     }
-    for e in list {
-        let h = e["sha256"].as_str().unwrap();
-        assert_eq!(h.len(), 64);
-        let created = e["created_ms"].as_i64().unwrap();
-        assert_eq!(e["expires_ms"].as_i64().unwrap(), created + 7 * 86_400_000);
-        assert!(e["last_ms"].as_i64().unwrap() >= created);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
+    // 다시 띄우면 이전 열쇠는 모두 401(가장 최근 것도)
     let srv = TestServer::start(d.path()).await;
+    for k in &keys {
+        assert_eq!(srv.with_key("GET", "/v1/state", k, None).await.status, 401);
+    }
+    assert_eq!(srv.hello(&"ab".repeat(32)).await.json()["face"], json!([]));
+    // 새로 연 세션은 쓸 수 있다
+    let fresh = srv.open_session().await;
     assert_eq!(
-        srv.with_key("GET", "/v1/state", &keys[20], None)
-            .await
-            .status,
+        srv.with_key("GET", "/v1/state", &fresh, None).await.status,
         200
     );
+    srv.stop().await;
+}
+
+/// R5 H1(계약 §14.1): 옛 판이 남긴 `sessions.json`(과 쓰다 만 임시 파일)은 시작할 때 지우고 읽지 않는다.
+/// 그 파일에 해시가 있던 열쇠도 401이다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leftover_sessions_file_is_removed_and_ignored() {
+    let d = tempfile::tempdir().unwrap();
+    let key = "5".repeat(64);
+    let now = now_ms();
+    let old = json!({
+        "version": 1,
+        "sessions": [{
+            "sha256": sha256_hex(&key),
+            "created_ms": now - 1000,
+            "last_ms": now - 1000,
+            "expires_ms": now - 1000 + 7 * 86_400_000_i64,
+        }]
+    });
+    std::fs::write(d.path().join("sessions.json"), old.to_string()).unwrap();
+    std::fs::write(d.path().join("sessions.tmp-4242"), old.to_string()).unwrap();
+    let other = d.path().join("sessions-notes.txt");
+    std::fs::write(&other, "x").unwrap();
+    let srv = TestServer::start(d.path()).await;
+    assert!(!d.path().join("sessions.json").exists(), "시작할 때 지운다");
+    assert!(!d.path().join("sessions.tmp-4242").exists(), "임시 파일도");
+    assert!(other.exists(), "상관없는 파일은 둔다");
     assert_eq!(
-        srv.with_key("GET", "/v1/state", &keys[0], None)
-            .await
-            .status,
+        srv.with_key("GET", "/v1/state", &key, None).await.status,
         401
+    );
+    assert_eq!(srv.hello(&"ab".repeat(32)).await.json()["face"], json!([]));
+    srv.stop().await;
+    assert!(!d.path().join("sessions.json").exists());
+}
+
+/// 얼굴 담당과 같은 공유 값(파이썬 hmac·hashlib으로 따로 계산): 세션 `"0123456789abcdef"×4`,
+/// n `"ab"×32`, 포트 47321. 시험 쪽 계산이 계약 식과 같은지 먼저 확인한다.
+#[test]
+fn face_proof_helper_matches_shared_vector() {
+    let session = "0123456789abcdef".repeat(4);
+    let n = "ab".repeat(32);
+    assert_eq!(
+        sha256_hex(&session),
+        "a8ae6e6ee929abea3afcfc5258c8ccd6f85273e0d4626d26c7279f3250f77c8e"
+    );
+    assert_eq!(
+        expected_face(&session, 47321, &n),
+        "607b8f06e715b5b23515fbb572a63617cf35019b687b1444f4433e27a7d368e4"
+    );
+    assert_eq!(
+        expected_face(&session, 47322, &n),
+        "fcb875c58193eea573405310509b4ded38cafc4c0296e5189bad09d3a6d83f91"
+    );
+}
+
+/// R5 H1(계약 §14.1, G-036): hello의 `face`는 살아 있는 세션마다
+/// `hex(HMAC-SHA256(SHA-256(세션 값), "gyeot-face-hello/v1|<실제 포트>|<n>"))`이고 순서를 섞는다.
+/// 얼굴은 이 목록으로 상대가 내 세션을 아는지 확인한 뒤에만 열쇠를 보낸다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_lists_face_proofs_of_live_sessions() {
+    let d = tempfile::tempdir().unwrap();
+    let srv = TestServer::start(d.path()).await;
+    let port = srv.addr.port();
+    let n = "ab".repeat(32);
+    let face_of = |r: &Resp| -> Vec<String> {
+        assert_eq!(r.status, 200, "{}", r.text());
+        r.json()["face"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}", r.text()))
+            .iter()
+            .map(|x| x.as_str().unwrap().to_owned())
+            .collect()
+    };
+    // 세션이 없으면 빈 목록(증명은 그대로)
+    let r = srv.hello(&n).await;
+    assert_eq!(face_of(&r), Vec::<String>::new());
+    assert_eq!(
+        r.json()["proof"].as_str().unwrap(),
+        expected_proof(&srv.token, port, &n)
+    );
+    // 세션 둘이면 둘, 값은 계약 식과 같다
+    let k1 = srv.open_session().await;
+    let k2 = srv.open_session().await;
+    let mut got = face_of(&srv.hello(&n).await);
+    got.sort();
+    let mut want = vec![expected_face(&k1, port, &n), expected_face(&k2, port, &n)];
+    want.sort();
+    assert_eq!(got, want);
+    for f in &got {
+        assert_eq!(f.len(), 64);
+        assert!(
+            f.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        for k in [&k1, &k2] {
+            assert_ne!(f, k, "열쇠를 내보이지 않는다");
+            assert_ne!(f, &sha256_hex(k), "해시를 내보이지 않는다");
+        }
+    }
+    // n이 다르면 다르다(다시 쓰지 못한다)
+    let m = "cd".repeat(32);
+    let mut got_m = face_of(&srv.hello(&m).await);
+    got_m.sort();
+    let mut want_m = vec![expected_face(&k1, port, &m), expected_face(&k2, port, &m)];
+    want_m.sort();
+    assert_eq!(got_m, want_m);
+    assert!(got_m.iter().all(|f| !got.contains(f)));
+    // 토큰을 붙여도, 세션 열쇠를 붙여도 같은 목록(인증과 무관)
+    let mut with_key = face_of(
+        &srv.with_key("GET", &format!("/v1/hello?n={n}"), &k1, None)
+            .await,
+    );
+    with_key.sort();
+    assert_eq!(with_key, want);
+    // 20개를 채우면 20개, 순서는 섞인다
+    let mut keys = vec![k1.clone(), k2.clone()];
+    for _ in 0..18 {
+        keys.push(srv.open_session().await);
+    }
+    let mut want20: Vec<String> = keys.iter().map(|k| expected_face(k, port, &n)).collect();
+    want20.sort();
+    let mut orders = std::collections::HashSet::new();
+    for _ in 0..6 {
+        let got = face_of(&srv.hello(&n).await);
+        assert_eq!(got.len(), 20);
+        let mut sorted = got.clone();
+        sorted.sort();
+        assert_eq!(sorted, want20);
+        orders.insert(got);
+    }
+    assert!(
+        orders.len() > 1,
+        "순서를 섞는다(20개를 6번 받아 같은 순서만 나옴)"
+    );
+    // 21번째가 들어오면 밀려난 세션의 증명은 빠진다
+    let k21 = srv.open_session().await;
+    let got = face_of(&srv.hello(&n).await);
+    assert_eq!(got.len(), 20);
+    assert!(got.contains(&expected_face(&k21, port, &n)));
+    assert!(
+        !got.contains(&expected_face(&k1, port, &n)),
+        "가장 오래 안 쓴 것"
     );
     srv.stop().await;
 }
@@ -1532,10 +1687,14 @@ async fn data_home_is_private_on_unix() {
     for f in logs
         .iter()
         .cloned()
-        .chain(["token", "sessions.json", "learn.json"].map(|n| home.join(n)))
+        .chain(["token", "learn.json"].map(|n| home.join(n)))
     {
         assert_eq!(mode(&f), 0o600, "{}", f.display());
     }
+    assert!(
+        !home.join("sessions.json").exists(),
+        "세션은 디스크에 없다(§14.1)"
+    );
     // 이미 있던 느슨한 것: 폴더 0755, 파일 0644
     let yesterday = gyeot_core::paths::event_log_name(now_ms() - 86_400_000);
     let old_log = home.join("events").join(&yesterday);
@@ -1554,7 +1713,6 @@ async fn data_home_is_private_on_unix() {
     let files = [
         old_log.clone(),
         home.join("token"),
-        home.join("sessions.json"),
         home.join("learn.json"),
         home.join("gyeotd.log"),
         home.join("tails.json"),

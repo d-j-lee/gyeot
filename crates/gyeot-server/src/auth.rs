@@ -3,15 +3,15 @@
 //! 토큰을 가진 쪽(셸·`gyeotd --open`)이 `POST /v1/boot`로 코드를 받고, 얼굴 스크립트가
 //! `POST /v1/session`으로 그 코드를 세션 열쇠로 바꾼다. 열쇠는 `Authorization: Bearer`로만 받는다.
 //! 쿠키는 포트를 가리지 않아 같은 호스트의 다른 포트로 새므로 쓰지 않는다(G-030).
-//! 세션 값은 디스크에 SHA-256으로만 남는다.
+//! 세션은 **데몬 메모리에만** 있고 세션 값의 SHA-256만 든다. 디스크에 쓰지 않으므로 데몬이 다시 뜨면
+//! 이전 열쇠는 모두 무효다(§14.1, G-036). 얼굴은 열쇠를 보내기 전에 `/v1/hello`의 `face` 목록
+//! ([`Sessions::face_proofs`])으로 상대가 내 세션을 아는지 확인한다.
 
-use crate::store::{new_token, write_private};
+use crate::store::new_token;
 use anyhow::Result;
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
 
 /// 부트 코드가 살아 있는 시간.
 pub const BOOT_TTL_MS: i64 = 120_000;
@@ -21,10 +21,10 @@ pub const BOOT_MAX: usize = 8;
 pub const SESSION_TTL_MS: i64 = 7 * 86_400_000;
 /// 기억하는 세션 수.
 pub const SESSION_MAX: usize = 20;
-/// 마지막 사용 시각만 바뀌었을 때 파일에 쓰는 간격.
-const LAST_SAVE_EVERY_MS: i64 = 10 * 60_000;
 /// hello 증명에 묶는 글의 머리(계약 §13.1).
 pub const HELLO_PREFIX: &str = "gyeot-hello/v1|";
+/// hello의 얼굴 증명에 묶는 글의 머리(계약 §14.1).
+pub const FACE_HELLO_PREFIX: &str = "gyeot-face-hello/v1|";
 
 /// 32바이트 난수 hex(64자)인가.
 fn is_hex64(s: &str) -> bool {
@@ -35,9 +35,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     crate::http::ct_eq(a, b)
 }
 
-/// 세션 값의 SHA-256(소문자 hex).
-pub fn session_hash(id: &str) -> String {
-    crate::store::hex(&Sha256::digest(id.as_bytes()))
+/// 세션 값(UTF-8)의 SHA-256 32바이트. 서버가 들고 있는 것은 이것뿐이다.
+pub fn session_digest(id: &str) -> [u8; 32] {
+    Sha256::digest(id.as_bytes()).into()
 }
 
 // ───────────────────────── 데몬 확인(hello) ─────────────────────────
@@ -63,6 +63,14 @@ pub fn valid_nonce(n: &str) -> bool {
 pub fn hello_proof(token: &str, port: u16, n: &str) -> String {
     let msg = format!("{HELLO_PREFIX}{port}|{n}");
     hmac_sha256_hex(token.as_bytes(), msg.as_bytes())
+}
+
+/// 계약 §14.1의 얼굴 증명: `hex(HMAC-SHA256(key = SHA-256(세션 값) 32바이트,
+/// msg = "gyeot-face-hello/v1|<포트>|<n>"))`. 얼굴은 자기 열쇠로 같은 값을 계산해(WebCrypto) 목록에서 찾는다.
+/// 열쇠도 해시도 내보이지 않고, `n`마다 달라 다시 쓸 수 없다.
+pub fn face_proof(digest: &[u8; 32], port: u16, n: &str) -> String {
+    let msg = format!("{FACE_HELLO_PREFIX}{port}|{n}");
+    hmac_sha256_hex(digest, msg.as_bytes())
 }
 
 // ───────────────────────── 부트 코드 ─────────────────────────
@@ -126,87 +134,36 @@ impl BootCodes {
 
 // ───────────────────────── 세션 ─────────────────────────
 
-/// `sessions.json`의 세션 하나. 세션 값 자체는 저장하지 않는다.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 세션 하나(메모리에만). 세션 값 자체는 들고 있지 않다.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
-    /// 세션 값의 SHA-256(소문자 hex).
-    pub sha256: String,
+    /// 세션 값의 SHA-256.
+    pub digest: [u8; 32],
     /// 만든 시각.
     pub created_ms: i64,
-    /// 마지막으로 쓴 시각.
+    /// 마지막으로 쓴 시각(개수 상한에서 버릴 순서에만 쓴다).
     pub last_ms: i64,
     /// 끝나는 시각(만든 시각 + 7일).
     pub expires_ms: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SessionsFile {
-    version: u32,
-    sessions: Vec<SessionRecord>,
-}
-
-/// 세션 목록. `path`가 있으면 바뀔 때 파일에 쓴다(Unix 0600).
-#[derive(Debug)]
+/// 세션 목록. 데몬 메모리에만 있고 파일에 쓰지도 읽지도 않는다(§14.1, G-036).
+#[derive(Debug, Default)]
 pub struct Sessions {
-    path: Option<PathBuf>,
     list: Vec<SessionRecord>,
-    dirty: bool,
-    saved_ms: i64,
 }
 
 impl Sessions {
-    /// 파일 없이(시험용).
-    pub fn in_memory() -> Sessions {
-        Sessions {
-            path: None,
-            list: Vec::new(),
-            dirty: false,
-            saved_ms: 0,
-        }
+    /// 빈 목록. 데몬이 뜰 때마다 빈 채로 시작한다.
+    pub fn new() -> Sessions {
+        Sessions::default()
     }
 
-    /// 파일에서 읽는다. 없거나 망가졌으면 빈 목록, 지난 것·이상한 것은 버린다.
-    pub fn load(path: &Path, now_ms: i64) -> Sessions {
-        let mut s = Sessions {
-            path: Some(path.to_path_buf()),
-            ..Sessions::in_memory()
-        };
-        s.saved_ms = now_ms;
-        match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice::<SessionsFile>(&bytes) {
-                Ok(f) => {
-                    let before = f.sessions.len();
-                    // 지난 것, 7일보다 길게 적힌 것(쿠키 시절의 30일 세션 포함)은 버린다.
-                    s.list = f
-                        .sessions
-                        .into_iter()
-                        .filter(|r| {
-                            is_hex64(&r.sha256)
-                                && r.expires_ms > now_ms
-                                && r.expires_ms <= r.created_ms + SESSION_TTL_MS
-                        })
-                        .collect();
-                    s.list.sort_by_key(|r| std::cmp::Reverse(r.last_ms));
-                    s.list.truncate(SESSION_MAX);
-                    s.dirty = s.list.len() != before;
-                }
-                Err(e) => {
-                    tracing::warn!("{}을 읽지 못해 빈 세션으로 시작해요: {e}", path.display());
-                    s.dirty = true;
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!("{}을 열지 못했어요: {e}", path.display()),
-        }
-        s
-    }
-
-    /// 새 세션을 만들고 (세션 열쇠, 끝나는 시각)을 돌려준다. 열쇠 자체는 저장하지 않는다.
+    /// 새 세션을 만들고 (세션 열쇠, 끝나는 시각)을 돌려준다. 열쇠 자체는 들고 있지 않는다.
     /// 20개가 넘으면 가장 오래 안 쓴 것부터 버린다.
     pub fn create(&mut self, now_ms: i64) -> Result<(String, i64)> {
         let id = new_token()?;
         self.insert(&id, now_ms);
-        self.save();
         Ok((id, now_ms + SESSION_TTL_MS))
     }
 
@@ -227,20 +184,15 @@ impl Sessions {
             }
         }
         self.list.push(SessionRecord {
-            sha256: session_hash(id),
+            digest: session_digest(id),
             created_ms: now_ms,
             last_ms: now_ms,
             expires_ms: now_ms + SESSION_TTL_MS,
         });
-        self.dirty = true;
     }
 
     fn purge(&mut self, now_ms: i64) {
-        let before = self.list.len();
         self.list.retain(|r| r.expires_ms > now_ms);
-        if self.list.len() != before {
-            self.dirty = true;
-        }
     }
 
     /// 세션 열쇠가 살아 있는 세션인가(해시를 상수 시간으로 대조). 맞으면 마지막 사용 시각을 갱신한다.
@@ -248,61 +200,44 @@ impl Sessions {
         if !is_hex64(id) {
             return false;
         }
-        let before = self.list.len();
         self.purge(now_ms);
-        let h = session_hash(id);
+        let h = session_digest(id);
         let mut found = false;
         for r in &mut self.list {
-            if ct_eq(r.sha256.as_bytes(), h.as_bytes()) {
+            if ct_eq(&r.digest, &h) {
                 if now_ms > r.last_ms {
                     r.last_ms = now_ms;
                 }
                 found = true;
             }
         }
-        if self.list.len() != before {
-            self.save();
-        } else if found {
-            self.dirty = true;
-            if now_ms - self.saved_ms >= LAST_SAVE_EVERY_MS {
-                self.save();
-            }
-        }
         found
     }
 
-    /// 바뀐 것이 있으면 파일에 쓴다(끌 때).
-    pub fn flush(&mut self) {
-        if self.dirty {
-            self.save();
-        }
-    }
-
-    fn save(&mut self) {
-        let Some(path) = &self.path else {
-            self.dirty = false;
-            return;
-        };
-        let file = SessionsFile {
-            version: 1,
-            sessions: self.list.clone(),
-        };
-        match serde_json::to_vec_pretty(&file)
-            .map_err(anyhow::Error::from)
-            .and_then(|b| write_private(path, &b))
-        {
-            Ok(()) => {
-                self.dirty = false;
-                self.saved_ms = self.list.iter().map(|r| r.last_ms).max().unwrap_or(0);
-            }
-            Err(e) => tracing::error!("세션 파일을 쓰지 못했어요: {e:#}"),
-        }
+    /// hello의 `face` 목록(§14.1): 살아 있는 세션마다 [`face_proof`], 순서는 섞는다(최대 20개).
+    pub fn face_proofs(&self, port: u16, n: &str, now_ms: i64) -> Vec<String> {
+        let mut out: Vec<(u64, String)> = self
+            .list
+            .iter()
+            .filter(|r| r.expires_ms > now_ms)
+            .take(SESSION_MAX)
+            .map(|r| (shuffle_key(), face_proof(&r.digest, port, n)))
+            .collect();
+        out.sort_unstable();
+        out.into_iter().map(|(_, p)| p).collect()
     }
 
     /// 세션 기록(시험·진단용).
     pub fn records(&self) -> &[SessionRecord] {
         &self.list
     }
+}
+
+/// 순서 섞기용 난수(비밀이 아니다). 난수원이 없으면 0이라 만든 순서 그대로가 된다.
+fn shuffle_key() -> u64 {
+    let mut b = [0u8; 8];
+    let _ = getrandom::fill(&mut b);
+    u64::from_le_bytes(b)
 }
 
 #[cfg(test)]
@@ -371,7 +306,7 @@ mod tests {
             7 * 86_400_000,
             "계약 §12.1: 만든 때부터 7일"
         );
-        let mut s = Sessions::in_memory();
+        let mut s = Sessions::new();
         let (a, exp) = s.create(T).unwrap();
         assert!(is_hex64(&a));
         assert_eq!(exp, T + 7 * 86_400_000);
@@ -383,7 +318,7 @@ mod tests {
         );
         assert!(s.records().is_empty());
 
-        let mut s = Sessions::in_memory();
+        let mut s = Sessions::new();
         let ids: Vec<String> = (0..SESSION_MAX as i64)
             .map(|i| {
                 let id = format!("{i:064x}");
@@ -401,60 +336,86 @@ mod tests {
         assert!(!s.validate("not-hex", T));
     }
 
+    /// 얼굴 담당과 같은 공유 값(파이썬 hmac·hashlib으로 따로 계산, 계약 §14.1).
     #[test]
-    fn session_file_keeps_only_hashes() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("sessions.json");
-        let mut s = Sessions::load(&p, T);
-        let (id, _) = s.create(T).unwrap();
-        let text = std::fs::read_to_string(&p).unwrap();
-        assert!(!text.contains(&id));
-        assert!(text.contains(&session_hash(&id)));
-        // 다시 읽어도 이어지고, 지난 것·망가진 것은 버린다
-        let mut s2 = Sessions::load(&p, T + 1);
-        assert!(s2.validate(&id, T + 2));
-        let mut s3 = Sessions::load(&p, T + SESSION_TTL_MS);
-        assert!(!s3.validate(&id, T + SESSION_TTL_MS));
-        std::fs::write(&p, "{broken").unwrap();
-        let mut s4 = Sessions::load(&p, T);
-        assert!(!s4.validate(&id, T));
-        // 마지막 사용 시각은 10분마다 쓴다
-        let mut s = Sessions::load(&p, T);
-        let (id, _) = s.create(T).unwrap();
-        assert!(s.validate(&id, T + 60_000));
-        let on_disk: SessionsFile = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
-        assert_eq!(on_disk.sessions[0].last_ms, T);
-        assert!(s.validate(&id, T + LAST_SAVE_EVERY_MS));
-        let on_disk: SessionsFile = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
-        assert_eq!(on_disk.sessions[0].last_ms, T + LAST_SAVE_EVERY_MS);
-        assert!(s.validate(&id, T + LAST_SAVE_EVERY_MS + 5));
-        s.flush();
-        let on_disk: SessionsFile = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
-        assert_eq!(on_disk.sessions[0].last_ms, T + LAST_SAVE_EVERY_MS + 5);
+    fn face_proof_matches_shared_vectors() {
+        let session = "0123456789abcdef".repeat(4);
+        let n = "ab".repeat(32);
+        let d = session_digest(&session);
+        assert_eq!(
+            crate::store::hex(&d),
+            "a8ae6e6ee929abea3afcfc5258c8ccd6f85273e0d4626d26c7279f3250f77c8e"
+        );
+        assert_eq!(
+            face_proof(&d, 47321, &n),
+            "607b8f06e715b5b23515fbb572a63617cf35019b687b1444f4433e27a7d368e4"
+        );
+        assert_eq!(
+            face_proof(&d, 47322, &n),
+            "fcb875c58193eea573405310509b4ded38cafc4c0296e5189bad09d3a6d83f91"
+        );
+        // 열쇠는 해시 32바이트(hex 글자가 아니다), 머리는 얼굴용(토큰 증명과 섞이지 않는다)
+        assert_eq!(
+            face_proof(&d, 47321, &n),
+            hmac_sha256_hex(&d, format!("gyeot-face-hello/v1|47321|{n}").as_bytes())
+        );
+        assert_ne!(
+            face_proof(&d, 47321, &n),
+            hmac_sha256_hex(
+                crate::store::hex(&d).as_bytes(),
+                format!("gyeot-face-hello/v1|47321|{n}").as_bytes()
+            )
+        );
+        assert_ne!(
+            face_proof(&d, 47321, &n),
+            hello_proof(&crate::store::hex(&d), 47321, &n)
+        );
+        assert_ne!(
+            face_proof(&d, 47321, &n),
+            face_proof(&d, 47321, &"cd".repeat(32))
+        );
     }
 
-    /// 쿠키 시절(30일)의 세션 기록은 읽을 때 버리고, 파일도 다시 쓴다(G-030).
+    /// §14.1: 살아 있는 세션만, 세션마다 하나, 순서는 섞는다. 지난 세션은 빠진다.
     #[test]
-    fn legacy_thirty_day_sessions_are_dropped_on_load() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("sessions.json");
-        let id = hex('9');
-        let legacy = serde_json::json!({
-            "version": 1,
-            "sessions": [{
-                "sha256": session_hash(&id),
-                "created_ms": T,
-                "last_ms": T,
-                "expires_ms": T + 30 * 86_400_000_i64,
-            }]
-        });
-        std::fs::write(&p, legacy.to_string()).unwrap();
-        let mut s = Sessions::load(&p, T + 1);
+    fn face_proofs_list_live_sessions_shuffled() {
+        let n = "ab".repeat(32);
+        let mut s = Sessions::new();
+        assert!(s.face_proofs(47321, &n, T).is_empty());
+        let (a, _) = s.create(T).unwrap();
+        let (b, _) = s.create(T + 10).unwrap();
+        let mut got = s.face_proofs(47321, &n, T + 20);
+        got.sort();
+        let mut want = vec![
+            face_proof(&session_digest(&a), 47321, &n),
+            face_proof(&session_digest(&b), 47321, &n),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+        // a는 만든 때부터 7일이 지나면 빠진다(목록을 바꾸지 않고 걸러도)
+        assert_eq!(
+            s.face_proofs(47321, &n, T + SESSION_TTL_MS),
+            vec![face_proof(&session_digest(&b), 47321, &n)]
+        );
+        assert!(s.face_proofs(47321, &n, T + 10 + SESSION_TTL_MS).is_empty());
+        // 20개를 여러 번 받으면 순서가 한 가지만 나오지 않는다
+        let mut s = Sessions::new();
+        for i in 0..SESSION_MAX as i64 {
+            s.create(T + i).unwrap();
+        }
+        let orders: std::collections::HashSet<Vec<String>> =
+            (0..6).map(|_| s.face_proofs(47321, &n, T + 100)).collect();
+        assert!(orders.len() > 1, "순서를 섞는다");
+        assert!(orders.iter().all(|o| o.len() == SESSION_MAX));
+    }
+
+    /// §14.1: 세션은 메모리에만. 새 목록은 늘 비어 있다(파일을 읽는 길이 없다).
+    #[test]
+    fn new_sessions_start_empty() {
+        let s = Sessions::new();
         assert!(s.records().is_empty());
-        assert!(!s.validate(&id, T + 2));
-        s.flush();
-        let on_disk: SessionsFile = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
-        assert!(on_disk.sessions.is_empty(), "버린 기록을 파일에서도 지운다");
+        let mut s2 = Sessions::new();
+        assert!(!s2.validate(&hex('9'), T));
     }
 
     /// RFC 4231 시험 벡터(HMAC-SHA256 1·2번)와 계약 §13.1의 묶음 글.

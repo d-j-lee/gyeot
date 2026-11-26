@@ -200,6 +200,11 @@ try {
   check('같은 코드 재사용 → 401', (await raw('POST', '/v1/session', { headers: { 'Content-Type': 'application/json' }, body: { code: boot.json?.code } })).status === 401);
   const asSession = (method, p, body) => raw(method, p, { headers: { Authorization: `Bearer ${SESSION}`, 'Content-Type': 'application/json' }, body });
   check('세션 열쇠로 /v1/state → 200', (await asSession('GET', '/v1/state')).status === 200);
+  const n2 = crypto.randomBytes(32).toString('hex');
+  const hello2 = JSON.parse((await raw('GET', `/v1/hello?n=${n2}`)).body || '{}');
+  const keyHash = crypto.createHash('sha256').update(SESSION).digest();
+  const myFace = crypto.createHmac('sha256', keyHash).update(`gyeot-face-hello/v1|${PORT}|${n2}`).digest('hex');
+  check('hello의 face 목록에 내 세션의 HMAC이 있음(§14.1)', Array.isArray(hello2.face) && hello2.face.includes(myFace) && !hello2.face.includes(SESSION));
   check('세션 열쇠로 ingest → 403(토큰만)', (await asSession('POST', '/v1/ingest/claude-code', { payload: {} })).status === 403);
   check('세션 열쇠로 channel 등록 → 403(토큰만)', (await asSession('POST', '/v1/channel/register', { pid: 1, ppid: 1, cwd: '/' })).status === 403);
   check('세션 열쇠로 부트 코드 → 403(토큰만)', (await asSession('POST', '/v1/boot', {})).status === 403);
@@ -355,13 +360,41 @@ try {
   // 16. 재시작해도 상태가 이벤트 로그 재생으로 돌아온다
   const before = (await api('GET', '/v1/state')).json.items.map((i) => `${i.session}:${i.kind}:${i.state}`).sort();
   await stopDaemon(daemon);
+
+  // 16a. 데몬이 멈춘 사이 다른 서버가 포트를 잡아도 열린 얼굴은 열쇠를 보내지 않는다(§14.1, R5 H1)
+  if (chromeProc) {
+    const seenByFake = { hello: 0, auth: 0 };
+    const fake = http.createServer((req, res) => {
+      if (req.headers.authorization) seenByFake.auth++;
+      if (req.url.startsWith('/v1/hello')) seenByFake.hello++;
+      res.setHeader('Content-Type', 'application/json');
+      if (req.url.startsWith('/v1/hello')) return res.end(JSON.stringify({ v: 1, proof: '0'.repeat(64), face: ['0'.repeat(64)] }));
+      if (req.url.startsWith('/v1/stream')) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        return res.write(': ping\n\n');
+      }
+      res.end('{}');
+    });
+    const listened = await new Promise((resolve) => {
+      fake.once('error', (e) => resolve(e.code ?? 'error'));
+      fake.listen(PORT, '127.0.0.1', () => resolve('ok'));
+    });
+    if (listened === 'ok') {
+      await waitFor(() => seenByFake.hello > 0, 20000, 200);
+      await sleep(2000);
+      check('데몬이 멈춘 사이 포트를 잡은 서버에 얼굴이 열쇠를 보내지 않음', seenByFake.hello > 0 && seenByFake.auth === 0, `hello ${seenByFake.hello}, Authorization ${seenByFake.auth}`);
+      await new Promise((r) => fake.close(r));
+      fake.closeAllConnections?.();
+    } else {
+      console.log(`건너뜀  가짜 서버가 같은 포트에 묶이지 못함(${listened})`);
+    }
+  }
   daemon = startDaemon();
   await waitFor(async () => (await raw('GET', '/health').catch(() => null))?.status === 200, 15000, 100);
   const after = (await api('GET', '/v1/state')).json.items.map((i) => `${i.session}:${i.kind}:${i.state}`).sort();
   check('재시작 뒤 같은 항목(재생)', JSON.stringify(before) === JSON.stringify(after), after.join(', '));
-  check('재시작 뒤에도 세션 열쇠 유효(sessions.json)', (await raw('GET', '/v1/state', { headers: { Authorization: `Bearer ${SESSION}` } })).status === 200);
-  const sess = fs.readFileSync(path.join(HOME, 'sessions.json'), 'utf8');
-  check('sessions.json에 세션 값 원문이 없음(해시만)', !sess.includes(SESSION));
+  check('재시작 뒤 이전 세션 열쇠는 401(세션은 메모리에만)', (await raw('GET', '/v1/state', { headers: { Authorization: `Bearer ${SESSION}` } })).status === 401);
+  check('sessions.json을 쓰지 않음', !fs.existsSync(path.join(HOME, 'sessions.json')));
   const logs = fs.readdirSync(path.join(HOME, 'events'));
   const logText = logs.map((f) => fs.readFileSync(path.join(HOME, 'events', f), 'utf8')).join('');
   check('프롬프트 본문은 저장하지 않음', !logText.includes('테스트 하네스를 붙여 줘'));

@@ -103,7 +103,7 @@ impl Shared {
         self.boot.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// 세션 목록(끌 때 저장하려고 공개).
+    /// 세션 목록(메모리에만, §14.1).
     pub fn sessions(&self) -> std::sync::MutexGuard<'_, Sessions> {
         self.sessions.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -343,18 +343,26 @@ fn no_store(mut r: Response) -> Response {
     r
 }
 
-/// `GET /v1/hello?n=<16–128자 hex>`(인증 없음, 계약 §13.1): 토큰과 실제로 묶인 포트·`n`으로 만든 증명.
-/// 토큰을 가진 쪽이 토큰을 보내기 전에 이 서버가 곁 데몬인지 확인한다.
+/// `GET /v1/hello?n=<16–128자 hex>`(인증 없음): 토큰과 실제로 묶인 포트·`n`으로 만든 증명(§13.1)과,
+/// 살아 있는 세션마다의 얼굴 증명 목록 `face`(§14.1, 순서를 섞음). 토큰을 가진 쪽과 얼굴은 비밀을
+/// 보내기 전에 이것으로 이 서버가 내 곁 데몬인지 확인한다.
 async fn hello(State(st): State<St>, uri: Uri) -> Response {
     let n = uri
         .query()
         .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("n=")))
         .filter(|n| auth::valid_nonce(n));
     match n {
-        Some(n) => no_store(json_resp(
-            StatusCode::OK,
-            json!({ "v": 1, "proof": auth::hello_proof(&st.token, st.port, n) }),
-        )),
+        Some(n) => {
+            let face = st.sessions().face_proofs(st.port, n, now_ms());
+            no_store(json_resp(
+                StatusCode::OK,
+                json!({
+                    "v": 1,
+                    "proof": auth::hello_proof(&st.token, st.port, n),
+                    "face": face,
+                }),
+            ))
+        }
         None => err(StatusCode::BAD_REQUEST, "n은 16–128자 hex여야 해요"),
     }
 }

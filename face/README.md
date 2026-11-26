@@ -1,7 +1,7 @@
 # 곁의 얼굴 (`face/`)
 
 곁 데몬이 `/`에서 내보내는 웹 화면과 아바타다. TypeScript + Vite + Preact, UI 키트 없이 만든다.
-규격은 `../docs/contracts.md`(Snapshot·Item·Presence·Delivery·Proposal·Session, REST §7, SSE §8, 보완 §10.1, 열쇠·답 §12, 데몬 확인·소리 설정·결정 카드 §13),
+규격은 `../docs/contracts.md`(Snapshot·Item·Presence·Delivery·Proposal·Session, REST §7, SSE §8, 보완 §10.1, 열쇠·답 §12, 데몬 확인·소리 설정·결정 카드 §13, 얼굴 확인·메모리 세션 §14.1),
 아바타는 `../docs/avatar-spec.md`를 따른다.
 
 ## 명령
@@ -45,7 +45,8 @@ npm run dev                            # 터미널 2 → 터미널 1의 '개발 
   `curl -s -X POST -H "Authorization: Bearer <토큰>" http://127.0.0.1:47321/v1/boot` → `{"code","url","expires_ms"}`.
 - 개발 서버에서는 얼굴이 `/v1/session`·`/v1/*`을 개발 서버(같은 출처)로 부르고, `vite.config.ts` 프록시가 데몬으로 넘긴다. 열쇠는 개발 서버 출처(`127.0.0.1:5173`)의 `sessionStorage`에 생긴다.
 - 열쇠는 탭마다 따로다(탭을 닫으면 사라진다). 같은 탭에서 새로 고침하면 그대로 쓴다. 새 탭은 새 부트 주소로 연다.
-- 열쇠도 `boot`도 없이 열면 요청을 하나도 보내지 않고 열쇠 안내를 보인다. mock을 다시 띄워도(세션을 메모리에만 둔다) 다음 요청이 401이라 같은 안내가 뜬다.
+- 열쇠도 `boot`도 없이 열면 요청을 하나도 보내지 않고 열쇠 안내를 보인다. mock을 다시 띄워도(진짜 데몬처럼 세션을 메모리에만 둔다, §14.1) 다시 잇는 얼굴의 hello 확인에서 열쇠가 걸러져 같은 안내가 뜬다(열쇠는 보내지 않는다).
+- 개발 서버 프록시는 `/v1`에 `x-forwarded-port`를 싣는다(`xfwd`). 얼굴은 자기 주소의 포트(5173)로 확인 값을 계산하므로, mock은 `x-forwarded-port: 5173`인 hello에만 5173으로 계산해 준다(가짜 데몬만의 예외, 진짜 데몬은 하지 않는다).
 - 쿠키는 쓰지 않는다(요청은 `credentials: 'omit'`). `?t=`도 받지 않는다.
 
 mock은 90초마다 작업 중 → nudge → 끝남 → 답장 → interrupt 대본을 돈다(`--quiet`로 끈다). 손으로 일으키려면(토큰만, 세션 열쇠는 403, `?t=`는 안 받음):
@@ -111,12 +112,19 @@ curl -H "Authorization: Bearer <토큰>" "http://127.0.0.1:47321/mock/trigger?wh
      `boot`가 없으면 저장된 열쇠를 쓴다(만료가 지났거나 꼴이 이상하면 버린다). 열쇠도 `boot`도 없으면 요청을 보내지 않는다.
   3. 그 뒤 모든 요청(REST·스트림)은 `Authorization: Bearer <세션 열쇠>` 하나로 인증한다. 쿠키는 싣지도 받지도 않는다(`credentials: 'omit'`). 주소에 비밀을 싣지 않는다.
   - `/v1/session`이 401(코드가 틀렸거나 지났거나 이미 씀)이면 아래 401과 같이 다룬다(저장된 열쇠도 지운다). 데몬에 닿지 않으면(네트워크·5xx) 코드를 쥔 채 다시 잇기 때 다시 바꾼다.
+- **얼굴 확인(§14.1, G-036)**: 열쇠를 싣기 전에 — 시작할 때(저장된 열쇠든 방금 받은 열쇠든) 그리고 스트림을 새로 열 때마다(다시 잇기 포함) — `GET /v1/hello?n=<32바이트 난수 hex>`를 인증 머리 없이 보낸다.
+  자기 열쇠로 `hex(HMAC-SHA256(key = SHA-256(열쇠 UTF-8)의 32바이트, msg = "gyeot-face-hello/v1|<포트>|<n>"))`를 WebCrypto로 계산해 응답의 `face` 목록에 있는지 본다(`src/lib/peer.ts`, 포트는 API 출처의 포트 = 같은 출처면 이 페이지의 포트).
+  - 목록에 없으면(데몬이 멈춘 사이 그 포트를 잡은 다른 사용자의 서버, 다시 떠서 세션을 잃은 데몬) 열쇠를 **보내지 않고** 지운 뒤 401과 같이 다룬다.
+  - hello가 닿지 않음·5xx·4xx·꼴 이상(`face` 목록이 없음 등)이면 끊긴 것으로 보고 다시 시도 간격을 따른다. 열쇠는 보내지도 지우지도 않는다.
+  - 방금 `/v1/session`으로 받은 열쇠도 첫 스트림 전에 똑같이 확인한다(규칙 하나로 둔다).
+  - REST 요청(항목 동작·말 걸기·집중 모드 등)은 이렇게 확인된 스트림이 열려 있는 동안에만 보낸다. 확인 전·끊긴 동안은 요청 없이 "곁 데몬과 연결되어 있지 않아요"로 실패한다.
 - 스트림(§8): `EventSource`는 머리를 실을 수 없어서 `fetch` 스트림을 직접 읽는다(`src/lib/sse.ts`: `event:`·여러 줄 `data:`·`:` 주석 ping·`id` 없어도 됨·빈 줄에서 끝, CR/LF/CRLF, 조각난 청크·UTF-8 경계).
   끊기면(연결 실패·스트림 끝·오류) 1→2→4→…→30초 간격으로 다시 잇는다. 45초 동안 아무것도(ping 포함) 오지 않으면 끊고 다시 잇는다(데몬은 15초마다 ping). 다시 이으면 데몬이 `snapshot`을 먼저 보내 상태가 맞춰진다.
   연결마다 세대 번호를 늘려, 늦게 끝난 옛 연결의 머리·이벤트·401이 새 연결을 건드리지 못하게 한다.
-- **401**(스트림이든 REST든 `/v1/session`이든): 그 열쇠를 지우고 스트림을 멈추며 **저절로 다시 두드리지 않는다**. 열쇠가 없으면 지금 다시·다시 확인·창 복귀·온라인 복귀도 요청을 보내지 않는다(안내가 깜빡이지 않는다).
+- **401**(스트림이든 REST든 `/v1/session`이든, hello가 내 열쇠를 모르든): 그 열쇠를 지우고 스트림을 멈추며 **저절로 다시 두드리지 않는다**. 열쇠가 없으면 지금 다시·다시 확인·창 복귀·온라인 복귀도 요청을 보내지 않는다(안내가 깜빡이지 않는다).
   셸 안(`window.__TAURI__.core.invoke`가 있음)이면 `invoke('renew_session')`을 부른다 — 셸이 새 부트 코드로 이 창을 다시 연다. 30초에 한 번까지이고, 마지막으로 부른 시각을 이 창의 sessionStorage에 두어 다시 열린 창이 곧바로 또 부르지 않는다.
   브라우저면 열쇠 안내를 보인다(트레이의 ‘곁 열기’나 `gyeotd --open`이 새 탭을 연다).
+  데몬이 다시 뜨면 세션이 모두 무효라(메모리에만 둔다) 이 흐름을 탄다: 스트림이 끊기고 → 다시 잇기 hello에서 걸러져 → 셸은 `renew_session` 한 번, 브라우저는 안내. 안내 뒤로 상태가 오락가락하거나 요청을 되풀이하지 않는다.
 - REST는 8초 넘게 답이 없으면 끊는다.
 - 순수 리듀서 `applyEvent(state, sseEvent)`(`src/state/reducer.ts`)가 snapshot·item·item_removed·presence·deliver·reply·proposal·sessions를 처리한다. 이상한 값은 버리거나 기본값으로 바꾼다.
 - 처리함·넘기기·내일 다시·제안 답·집중 모드는 낙관적으로 바로 반영하고, 실패하면 되돌리며 한국어 알림을 띄운다. 숨긴 항목은 서명(`signature`)이 바뀌면(새 신호) 다시 보인다.
@@ -128,7 +136,7 @@ curl -H "Authorization: Bearer <토큰>" "http://127.0.0.1:47321/mock/trigger?wh
 
 - `invoke('set_hit_rect', {x, y, width, height})` — 클릭을 받을 영역(CSS px, 아바타+말풍선+패널을 감싼 사각형, 4px 여유). ResizeObserver·창 크기·패널·말풍선이 바뀔 때마다, 값이 달라졌을 때만. 기본 화면에서는 창 전체.
 - `invoke('set_expanded', {expanded})` — 오버레이 패널을 펼치고 접을 때.
-- `invoke('renew_session')` — 세션 열쇠가 없거나(열쇠도 `boot`도 없이 열림) 401을 받았을 때(`/v1/session`의 401 포함, 30초에 한 번까지). 셸이 새 부트 코드로 창을 다시 연다(§12.1-5). 데몬에 닿지 않는 것은 401이 아니므로 부르지 않고 다시 잇는다.
+- `invoke('renew_session')` — 세션 열쇠가 없거나(열쇠도 `boot`도 없이 열림) 401을 받았거나(`/v1/session`의 401 포함) hello가 내 열쇠를 모를 때(30초에 한 번까지). 셸이 새 부트 코드로 창을 다시 연다(§12.1-5). 데몬에 닿지 않는 것은 401이 아니므로 부르지 않고 다시 잇는다.
 - 셸은 데몬 주소(`http://127.0.0.1:<포트>/?mode=overlay&boot=…`)를 직접 열므로 얼굴은 늘 같은 출처다. Tauri 출처(`tauri://`·`tauri.localhost`)에서 데몬을 부르지 않는다(§12.2).
 
 ## 폴더
@@ -138,12 +146,12 @@ src/
   types.ts            계약 타입
   state/reducer.ts    applyEvent·낙관적 숨김·고르개
   app/                Controller(상태·말풍선·소리·낙관적 동작), Backend(HTTP·401 처리), createBackend(주소→백엔드), Observable
-  lib/                api(Authorization 머리)·session(부트 코드·세션 열쇠)·stream(fetch 스트림)·sse(해석기)·bubble(차례)·time(한국어 시각)·items(정렬·점수식·FNV id)·labels·audio·voice·prefs·tauri·shape
+  lib/                api(Authorization 머리)·session(부트 코드·세션 열쇠)·peer(얼굴 확인 hello)·stream(fetch 스트림)·sse(해석기)·bubble(차례)·time(한국어 시각)·items(정렬·점수식·FNV id)·labels·audio·voice·prefs·tauri·shape
   components/         Avatar·Bubble·Panel·TurnTab·ItemCard·ChatTab·SettingsTab·StatusLine·SessionList·MoodSheet·AuthNotice
   demo/               표본 데이터(mock 서버와 같이 씀)·DemoBackend
   styles/             theme(색 토큰, WCAG AA 시험)·avatar(움직임)·app
 mock/server.ts        가짜 데몬(npm run mock). server.test.ts 가 실제로 띄워 HTTP 로 시험한다
-mock/auth.ts          가짜 데몬의 부트 코드·세션 열쇠 보관함(§12.1, 해시만 둔다)·데몬 확인 HMAC(§13.1)
+mock/auth.ts          가짜 데몬의 부트 코드·세션 열쇠 보관함(§12.1, 메모리에 해시만 둔다)·데몬 확인 HMAC(§13.1)·얼굴 확인 face 목록(§14.1)
 scripts/              screenshots.ts·icon.ts
 screenshots/          찍은 화면
 ```
@@ -156,7 +164,8 @@ screenshots/          찍은 화면
 §12: 토큰 없음(meta·`?t=`), 주소에서 `boot`만 지우기(`replaceState`, 다른 쿼리 글자 그대로), `/v1/session` 교환(한 번만·401·닿지 않음), `sessionStorage['gyeot.session']`, 모든 요청의 `Authorization: Bearer`, 쿠키·`EventSource` 안 씀(코드 전체 검사), 배포 빌드의 `?api=` 무시,
 401이면 열쇠 지움·스트림 멈춤·`renew_session` 30초 제한·안내, 열쇠도 `boot`도 없으면 요청 0개, 집중·sleep 때 답은 배지로만, 데모는 네트워크·IPC를 안 씀(`main.tsx`를 실제로 띄워서도 본다),
 §13: 결정 카드 안내(§13.5), 설정 탭의 `approval_interrupt`(§13.3),
-가짜 데몬(`mock/`)의 부트 코드·`/v1/session`·세션 열쇠 범위(ingest·channel·boot는 403)·쿠키 거절·`/v1/hello` HMAC·보안 머리글·Host·Origin(실제로 띄워 HTTP로), vite 프록시가 `/v1`·`/health`만 넘기는지.
+§14.1: 얼굴 확인 값(서버 담당과 같은 공유 시험 값), hello를 먼저·인증 머리 없이·스트림마다 새 n, 모르는 서버면 열쇠 0건·지움·renew/안내, hello 실패는 끊김, 데몬 재시작 흐름, REST는 확인된 연결에서만,
+가짜 데몬(`mock/`)의 부트 코드·`/v1/session`·세션 열쇠 범위(ingest·channel·boot는 403)·쿠키 거절·`/v1/hello` HMAC과 `face` 목록(섞임·최대 20·끝난 세션 없음)·보안 머리글·Host·Origin(실제로 띄워 HTTP로), vite 프록시가 `/v1`·`/health`만 넘기고 `/v1`에 `xfwd`를 싣는지.
 
 ## 한계
 
@@ -167,5 +176,7 @@ screenshots/          찍은 화면
   그래서 개발 서버(`npm run dev`)는 mock에만 붙인다. 진짜 데몬에 붙이면 브라우저가 POST에 싣는 `Origin: http://127.0.0.1:5173` 때문에 `POST /v1/session`이 403이라 열쇠를 받지 못한다(프록시에서 Origin을 지우는 것은 검사를 느슨하게 하므로 하지 않았다).
   mock은 세션을 메모리에만 두고 `sessions.json`에 쓰지 않는다. 훅 수집·channel은 흉내 내지 않는다(토큰이면 404, 세션 열쇠면 403 — 경계만 계약대로).
 - 열쇠는 출처(스킴·호스트·**포트**)마다 갈리는 `sessionStorage`에 있으므로 `127.0.0.1`과 `localhost`, 개발 서버(5173)와 데몬(47321)은 서로 다른 열쇠를 쓴다. 각자 부트 주소로 연다.
+- 부트 코드는 `/v1/session`에 확인 없이 보낸다(아직 열쇠가 없어 확인할 값이 없다). 코드는 120초·한 번만이고 데몬 메모리에만 있어, 데몬이 멈춘 사이 포트를 잡은 서버가 받아도 다시 뜬 데몬에서는 쓸 수 없다.
+- 확인된 스트림이 열려 있는 동안 데몬이 죽고 다른 서버가 포트를 잡으면, 얼굴이 끊김을 알아채기 전(보통 곧바로, 늦어도 45초 감시)에 보낸 REST 요청 하나는 그 서버로 갈 수 있다. 스트림은 다시 이을 때 늘 다시 확인한다.
 - 세션 열쇠를 가진 페이지 스크립트는 얼굴이 할 수 있는 일을 다 할 수 있다(계약 §12.7). CSP가 외부 스크립트를 막지만, 얼굴에 스크립트 주입이 생기면 열쇠를 읽을 수 있다.
 - 셸의 `renew_session`(창 다시 열기)은 얼굴 쪽 호출만 시험했다. 실제 셸(WebView2)에서 `navigate`로 다시 연 창이 같은 `sessionStorage`를 이어 쓰는지(30초 제한 기록)는 셸과 함께 확인해야 한다.

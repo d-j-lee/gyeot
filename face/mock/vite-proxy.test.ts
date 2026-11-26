@@ -4,7 +4,11 @@ import { describe, expect, it } from 'vitest';
 import config from '../vite.config.ts';
 
 describe('vite 개발 서버 프록시', () => {
-  const proxy = (config.server?.proxy ?? {}) as Record<string, { target: string; changeOrigin?: boolean }>;
+  const proxy = (config.server?.proxy ?? {}) as Record<string, { target: string; changeOrigin?: boolean; xfwd?: boolean }>;
+
+  it('/v1 은 x-forwarded-* 를 싣는다 — mock 이 얼굴 확인(§14.1)을 개발 서버 포트로 계산하게', () => {
+    expect(proxy['/v1']?.xfwd).toBe(true);
+  });
 
   it('/v1 과 /health 만 데몬으로 넘긴다(부트 주소·쿠키 길은 없다)', () => {
     expect(Object.keys(proxy).sort()).toEqual(['/health', '/v1']);

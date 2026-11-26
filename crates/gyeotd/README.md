@@ -17,4 +17,6 @@ gyeotd --version
 2. `POST /v1/boot`(토큰)로 일회용 주소를 받는다.
 3. 주소를 프로그램 인자에 싣지 않는다(다른 사용자가 `ps`·`/proc`로 읽을 수 있다). `<데이터>/open/open-<난수>.html`(폴더 0700, 파일 0600)에 그 주소로 넘어가는 쪽을 쓰고, 그 파일 경로로 브라우저를 연다(Windows `rundll32 url.dll,FileProtocolHandler`, Linux `xdg-open`, macOS `open`). 5분 넘은 `open-*.html`은 실행마다 지운다.
 
+세션 열쇠는 데몬 메모리에만 있다(계약 §14.1). 데몬을 다시 띄우면 이전 열쇠는 쓸 수 없으니, 브라우저로 연 얼굴은 `gyeotd --open`으로 다시 연다(트레이의 셸은 저절로 다시 연다). 시작할 때 로그와 `--help`에도 이 안내가 나온다.
+
 로그는 표준 오류와 `<데이터>/gyeotd.log`(Unix 0600)에 남는다(5 MiB를 넘으면 시작할 때 비운다). 자세히 보려면 `RUST_LOG=debug`.
