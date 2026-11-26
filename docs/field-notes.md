@@ -105,3 +105,15 @@
 VR7 검증자가 자기 발견의 이벤트 열을 그대로 다시 돌렸다(약 5분). H1·M1·M2와 다른 회귀 검증의 R-M1은 FIXED, L1(자동 거절된 병합이 다음 입력까지 말풍선 없이 남음)은 PARTIAL, L2(늦게 온 요청이 항목을 다시 열지 않음)는 그대로(낮음). 새 문제는 낮음 3건뿐(권한 창 중 입력이 오면 대기가 지워질 수 있음 — 실측 전, 창에서 고쳐 승인하면 미리보기가 달라 다음 묶음까지 남음, `--secret-scanning=false` 거짓 양성). 변이 4개 모두 잡힘. 높음·중간 0으로 검증 라운드를 멈췄다(새 눈 라운드는 더 돌리지 않았다). 남은 것은 계약 §12.7·§14.6·§15.6과 roadmap F1–F13.
 
 같은 날 CI(windows-latest 포함) ea2057c 전부 통과.
+
+## 2026-11-26 · 배포 흐름의 독립 점검과 고친 판(개발 컨테이너)
+
+작업 맥락이 없는 에이전트가 32fe1b7의 설치 흐름(INSTALL-WITH-CLAUDE.md·bootstrap·doctor·CI release)을 "업무 PC에서 이 한 줄만으로 되는가"로 봤다(읽기와 Linux pwsh 실측). 높음 1, 중간 7, 낮음 11.
+
+- 높음: Git Bash 도구에서 `-File '$env:…'`가 풀리지 않는다. 블록마다 작은따옴표 없이 쓰고 `MSYS_NO_PATHCONV=1 powershell.exe -Command '…; exit $LASTEXITCODE'`로 감싸게 바꿨다.
+- 중간: 문서를 main에서 읽어 릴리스와 판이 어긋날 수 있음(→ 릴리스 자산을 curl로), 업데이트가 미리보기 없이 설치(→ 같은 1~5단계, 지금 선택은 doctor로 읽음), 옛 경로의 셸 형식 훅만 있어도 점검 통과·병합이 새 항목을 안 더함(→ 병합은 그 줄을 두고 이 설치 항목을 더하고 알림, doctor는 실패), 포트를 잡은 다른 서버를 "닿지 않음"으로 보임(→ "다른 프로그램이 쓰고 있어요"), 훅 없이 한 설치를 실패로 봄(→ 경고), 실행 정책·제한 언어 모드를 만나면 멈춘다는 규칙 없음, `-ZipPath` 단계 번호 오류.
+- 낮음: gh 호스트 고정(`GH_HOST=github.com`), 선택별 되돌리기, 풀 곳을 %TEMP%로, bootstrap.ps1 자체 해시, 자식 출력 UTF-8, install의 Node 20 문구, channel의 `GYEOT_HOME`, CHANGELOG 절 정확히 맞추기 등을 고쳤다.
+- 같이 넣은 것: 저장소를 공개로 바꾸기로 해(비공개 저장소의 Actions 분이 다해 32fe1b7의 CI가 시작되지 않았다) gh 없이 HTTPS로 받는 길, 릴리스 자산의 artifact attestation과 bootstrap의 `gh attestation verify`, rc 태그로 먼저 거르는 릴리스, 올린 릴리스를 Windows에서 받아 설치·업데이트·점검·지우기까지 하는 `release-check`.
+- 시험: `test-bootstrap` 64(+21: 저장소·태그 꼴, 받기 주소, BUILD 판, 경로 비교, 훅 처리기 경로, 셸 형식 병합 3, 127.0.0.1 HTTP 상태·청크·HTTP 아님, 받기 함수, doctor의 훅 없음·옛 경로·없는 파일 하나·활동 훅 없음·다른 서버), `test-install` 134(+4). PSScriptAnalyzer 경고 0, 5.1 문법 호환 0.
+- 변이 4개(병합 되돌리기, 다른 서버를 응답 없음으로, 없는 파일을 경고로, 훅 없음을 실패로)가 모두 잡혔다. 처음에는 "없는 파일" 변이가 살아남아(다른 실패가 함께 나서 가려짐) 그 경우만 따로 보는 시험을 더했다.
+- 추론: Claude Code의 셸 도구가 끝나도 bootstrap이 띄운 데몬은 산다. libuv는 직접 띄운 자식만 kill-on-close 잡에 넣고 손자는 빼기 때문이다(libuv `uv__init_global_job_handle`의 SILENT_BREAKAWAY_OK). 실측 전이라, `-RegisterStartup`이면 작업 스케줄러로 띄우고 안 뜨면 직접 띄운다.

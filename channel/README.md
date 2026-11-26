@@ -45,7 +45,7 @@ stdout에는 MCP 프로토콜만 쓴다. 기록은 모두 stderr로 간다(Claud
 ## 설치 (Windows)
 
 1. 빌드: 이 폴더에서 `npm ci` → `npm run build`. 결과는 의존성을 모두 묶은 파일 하나 `dist/gyeot-channel.mjs`다.
-2. 복사: `dist/gyeot-channel.mjs`를 `%LOCALAPPDATA%\gyeot\bin\gyeot-channel.mjs`에 둔다. 실행에는 Node.js 20 이상만 있으면 된다.
+2. 복사: `dist/gyeot-channel.mjs`를 `%LOCALAPPDATA%\gyeot\bin\gyeot-channel.mjs`에 둔다. 실행에는 Node.js 22 이상만 있으면 된다.
 3. 등록: 쓰려는 프로젝트 폴더의 `.mcp.json`에 넣는다(`<you>`는 Windows 사용자 이름). Windows에서는 실행 파일이 있어야 하므로 `node` + 스크립트 경로로 적는다.
 
    ```json

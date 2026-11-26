@@ -282,6 +282,7 @@ try {
 
     Write-Host '== 4. -NoActivityHook 은 곁의 PostToolBatch만 뺀다, 기본으로 되돌리면 다시 넣는다' -ForegroundColor White
     # 사용자가 셸 형식으로 손수 고친 곁 훅(args 없음)은 -NoActivityHook 도 건드리지 않아야 한다.
+    # 그 항목이 이 설치가 아닌 경로를 부르면, 고치지 않고 두되 이 설치의 항목을 따로 더한다(이벤트가 빠지지 않게).
     $tree = Read-GyeotTree $settings
     $handMade = 'C:\hand\gyeot-hook.exe claude-code'
     $hand = New-GyeotDict
@@ -290,11 +291,22 @@ try {
     $tree['hooks']['SessionEnd'][0]['hooks'][0] = $hand
     Write-GyeotTextFile -Path $settings -Text ((ConvertTo-GyeotJson $tree) + "`n")
     Start-Sleep -Seconds 1  # 백업 이름(초 단위)이 겹치지 않게
-    $code = Invoke-GyeotScript 'install.ps1' ($common + @('-ApplyClaudeHooks', '-NoActivityHook'))
-    Assert-Gyeot ($code -eq 0) "-NoActivityHook 설치 종료 코드 0 (받은 값 $code)"
+    $run = Invoke-GyeotScriptOutput 'install.ps1' ($common + @('-ApplyClaudeHooks', '-NoActivityHook'))
+    Assert-Gyeot ($run.Code -eq 0) "-NoActivityHook 설치 종료 코드 0 (받은 값 $($run.Code))"
     $tree = Read-GyeotTree $settings
     $se = $tree['hooks']['SessionEnd']
-    Assert-Gyeot ($se.Count -eq 1 -and $se[0]['hooks'].Count -eq 1 -and $se[0]['hooks'][0]['command'] -eq $handMade -and -not $se[0]['hooks'][0].Contains('args')) '-NoActivityHook: 손수 고친 곁 훅(SessionEnd)은 그대로'
+    Assert-Gyeot ($se[0]['hooks'].Count -eq 1 -and $se[0]['hooks'][0]['command'] -eq $handMade -and -not $se[0]['hooks'][0].Contains('args')) '-NoActivityHook: 손수 고친 곁 훅(SessionEnd)은 그대로'
+    Assert-Gyeot ($se.Count -eq 2 -and $se[1]['hooks'][0]['command'] -eq $hookExe) '다른 경로를 부르는 셸 형식 곁 훅만 있으면 이 설치의 항목을 더한다'
+    Assert-Gyeot ($run.Text -match '이 설치가 아닌 경로를 불러요' -and $run.Text.Contains('C:\hand\gyeot-hook.exe')) '그 셸 형식 항목을 경고로 알린다'
+    # 셸 형식이 이 설치의 gyeot-hook 를 부르면 "있음"으로 친다(중복으로 더하지 않는다).
+    $tree['hooks']['SessionEnd'][0]['hooks'][0]['command'] = "`"$hookExe`" claude-code"
+    $tree['hooks']['SessionEnd'].RemoveAt(1)
+    Write-GyeotTextFile -Path $settings -Text ((ConvertTo-GyeotJson $tree) + "`n")
+    Start-Sleep -Seconds 1
+    $run = Invoke-GyeotScriptOutput 'install.ps1' ($common + @('-ApplyClaudeHooks', '-NoActivityHook'))
+    $tree = Read-GyeotTree $settings
+    Assert-Gyeot ($run.Code -eq 0 -and $tree['hooks']['SessionEnd'].Count -eq 1 -and -not $tree['hooks']['SessionEnd'][0]['hooks'][0].Contains('args')) '이 설치를 부르는 셸 형식 곁 훅은 그대로 두고 더하지 않는다'
+    Assert-Gyeot ($run.Text -notmatch '이 설치가 아닌 경로를 불러요') '그때는 경고하지 않는다'
 
     Assert-Gyeot ((Get-GyeotHookCount -Settings $tree -EventName 'PostToolBatch') -eq 0) '-NoActivityHook: 곁의 PostToolBatch 0개'
     Assert-Gyeot ($tree['hooks']['PostToolBatch'].Count -eq 1 -and $tree['hooks']['PostToolBatch'][0]['hooks'][0]['command'] -eq 'batch-logger') '-NoActivityHook: 사용자의 PostToolBatch 훅은 그대로'

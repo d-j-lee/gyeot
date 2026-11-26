@@ -67,6 +67,15 @@ function Get-GyeotFullPath([string]$Path) {
     return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
 }
 
+# 두 경로가 같은 파일을 가리키는지(대소문자 무시). 해석할 수 없는 경로(없는 드라이브 등)는 글자 그대로 비교한다.
+function Test-GyeotSamePath([string]$A, [string]$B) {
+    if (-not $A -or -not $B) { return $false }
+    $fa = $A; $fb = $B
+    try { $fa = Get-GyeotFullPath $A } catch { $fa = $A }
+    try { $fb = Get-GyeotFullPath $B } catch { $fb = $B }
+    return $fa.TrimEnd('\', '/').Equals($fb.TrimEnd('\', '/'), [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Test-GyeotPathUnder([string]$Path, [string]$Root) {
     if (-not $Path -or -not $Root) { return $false }
     $p = (Get-GyeotFullPath $Path).TrimEnd('\', '/')
@@ -455,10 +464,12 @@ function New-GyeotClaudeHooksSnippet([string]$HookExe, [switch]$NoActivity) {
 
 # settings 나무에 곁의 훅을 더한다. 기존 훅은 지우지 않는다. 이미 있으면 경로만 맞춘다.
 # -NoActivity 이면 PostToolBatch 를 더하지 않고, 이미 있는 곁의 PostToolBatch 처리기만 뺀다.
-# 돌려주는 값: @{ Added = n; Updated = n; Kept = n; Removed = n }
+# 셸 형식(args 없음)으로 손수 넣은 곁 항목은 고치지 않는다. 그 항목이 이 설치의 gyeot-hook 를
+# 부르면 "있음"으로 치고, 다른 경로를 부르면 그대로 둔 채 이 설치의 항목을 더하고 Stale 로 센다.
+# 돌려주는 값: @{ Added = n; Updated = n; Kept = n; Removed = n; Stale = n; StalePaths = @(…) }
 function Merge-GyeotClaudeHook {
     param($Settings, [string]$HookExe, [switch]$NoActivity)
-    $result = @{ Added = 0; Updated = 0; Kept = 0; Removed = 0 }
+    $result = @{ Added = 0; Updated = 0; Kept = 0; Removed = 0; Stale = 0; StalePaths = @() }
     if (-not $Settings.Contains('hooks') -or $null -eq $Settings['hooks']) {
         $Settings['hooks'] = (New-GyeotDict)
     }
@@ -479,12 +490,17 @@ function Merge-GyeotClaudeHook {
             if ($handlers -isnot [System.Collections.IList]) { continue }
             foreach ($h in $handlers) {
                 if (-not (Test-GyeotHookHandler $h)) { continue }
-                $found = $true
                 if (-not $h.Contains('args')) {
-                    # 셸 형식으로 손수 넣은 항목: 건드리지 않고 중복만 피한다.
-                    $result.Kept++
+                    # 셸 형식으로 손수 넣은 항목: 건드리지 않는다.
+                    $exe = Get-GyeotHookHandlerExe $h
+                    if (Test-GyeotSamePath $exe $HookExe) { $found = $true; $result.Kept++ }
+                    else {
+                        $result.Stale++
+                        if ($result.StalePaths -notcontains $exe) { $result.StalePaths += $exe }
+                    }
                     continue
                 }
+                $found = $true
                 $wanted = New-GyeotClaudeHandler $HookExe
                 $same = ($h['command'] -eq $HookExe) -and (ConvertTo-GyeotJson $h['args']) -eq (ConvertTo-GyeotJson $wanted['args'])
                 if ($same) { $result.Kept++; continue }
@@ -705,8 +721,9 @@ function Write-GyeotCheck($Check) {
     }
 }
 
-# 127.0.0.1 에 HTTP/1.1 GET 을 직접 보내 본문을 돌려준다. 시스템 프록시 설정을 타지 않게 소켓을 쓴다.
-# 200이 아니면 예외. 응답은 64 KiB까지만 읽는다.
+# 127.0.0.1 에 HTTP/1.1 GET 을 직접 보낸다. 시스템 프록시 설정을 타지 않게 소켓을 쓴다.
+# 연결하지 못하면 예외. 연결됐으면 @{ Status = 상태 코드(HTTP 꼴이 아니면 0); Body = 본문 } 을 돌려준다.
+# 응답은 64 KiB까지만 읽는다.
 function Get-GyeotLoopbackText([int]$Port, [string]$PathAndQuery, [int]$TimeoutMs = 3000) {
     $client = New-Object System.Net.Sockets.TcpClient
     try {
@@ -721,18 +738,22 @@ function Get-GyeotLoopbackText([int]$Port, [string]$PathAndQuery, [int]$TimeoutM
         $stream.Write($bytes, 0, $bytes.Length)
         $buf = New-Object byte[] 65536
         $ms = New-Object System.IO.MemoryStream
-        while ($ms.Length -lt 65536) {
-            $n = $stream.Read($buf, 0, $buf.Length)
-            if ($n -le 0) { break }
-            $ms.Write($buf, 0, $n)
+        try {
+            while ($ms.Length -lt 65536) {
+                $n = $stream.Read($buf, 0, $buf.Length)
+                if ($n -le 0) { break }
+                $ms.Write($buf, 0, $n)
+            }
+        } catch [System.IO.IOException] {
+            if ($ms.Length -eq 0) { return @{ Status = 0; Body = '' } }
         }
         $text = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
     } finally { $client.Close() }
     $sep = $text.IndexOf("`r`n`r`n")
-    if ($sep -lt 0) { throw '응답이 HTTP 꼴이 아니에요' }
+    if ($sep -lt 0 -or $text -notmatch '^HTTP/1\.[01] (\d{3}) ') { return @{ Status = 0; Body = $text } }
+    $status = [int]$Matches[1]
     $head = $text.Substring(0, $sep)
     $body = $text.Substring($sep + 4)
-    if ($head -notmatch '^HTTP/1\.[01] 200 ') { throw "응답: $(($head -split "`r`n")[0])" }
     if ($head -match '(?im)^transfer-encoding:\s*chunked') {
         $out = New-Object System.Text.StringBuilder
         $rest = $body
@@ -746,5 +767,29 @@ function Get-GyeotLoopbackText([int]$Port, [string]$PathAndQuery, [int]$TimeoutM
         }
         $body = $out.ToString()
     }
-    return $body
+    return @{ Status = $status; Body = $body }
+}
+
+# 곁 훅 처리기가 부르는 실행 파일 경로. exec 형식이면 command, 셸 형식이면 그 안의 gyeot-hook 경로.
+function Get-GyeotHookHandlerExe($Handler) {
+    $cmd = [string]$Handler['command']
+    if ($Handler.Contains('args')) { return $cmd }
+    if ($cmd -match '^\s*"([^"]*gyeot-hook(?:\.exe)?)"') { return $Matches[1] }
+    if ($cmd -match '^\s*(\S*gyeot-hook(?:\.exe)?)') { return $Matches[1] }
+    return $cmd
+}
+
+# settings 나무에서 곁 훅 처리기를 모두 꺼낸다: @{ Event; Exe }. 부르는 쪽은 @( ) 로 받는다.
+function Get-GyeotHookHandlerList($Settings) {
+    $list = @()
+    if (-not $Settings.Contains('hooks') -or $Settings['hooks'] -isnot [System.Collections.IDictionary]) { return }
+    foreach ($evName in @($Settings['hooks'].Keys)) {
+        foreach ($g in @($Settings['hooks'][$evName])) {
+            if ($g -isnot [System.Collections.IDictionary] -or -not $g.Contains('hooks')) { continue }
+            foreach ($h in @($g['hooks'])) {
+                if (Test-GyeotHookHandler $h) { $list += [pscustomobject]@{ Event = [string]$evName; Exe = [string](Get-GyeotHookHandlerExe $h) } }
+            }
+        }
+    }
+    return $list
 }

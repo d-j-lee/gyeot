@@ -1,10 +1,12 @@
 ﻿<#
 .SYNOPSIS
-    GitHub 릴리스에서 곁(gyeot)을 받아 해시를 확인하고 설치(또는 업데이트)한 뒤 점검합니다.
+    GitHub 릴리스에서 곁(gyeot)을 받아 확인하고 설치(또는 업데이트)한 뒤 점검합니다.
 .DESCRIPTION
-    1) gh 로 릴리스의 gyeot-windows-x64.zip 과 SHA256SUMS.txt 를 받습니다(또는 -ZipPath 로 이미 받은 파일).
-    2) SHA-256 이 맞지 않으면 멈춥니다.
-    3) zip 을 풀고 install.ps1 -DryRun 으로 할 일을 보입니다.
+    1) 릴리스의 gyeot-windows-x64.zip 과 SHA256SUMS.txt 를 받습니다. gh 가 github.com 에 로그인돼 있으면 gh 로,
+       아니면 HTTPS(공개 저장소)로 받습니다. -ZipPath 로 이미 받은 파일을 줄 수도 있습니다.
+    2) SHA-256(받다가 깨지지 않았는지)이 맞지 않으면 멈춥니다. gh 로 받았으면 출처 증명(GitHub Actions 가
+       이 저장소에서 만든 파일인지, gh attestation verify)도 확인하고, 맞지 않으면 멈춥니다.
+    3) zip 을 %TEMP% 아래에 풀고 install.ps1 -DryRun 으로 할 일을 보입니다.
     4) -Install 을 주었을 때만 실제로 설치하고, 원하면 channel 을 claude mcp(사용자 범위)에 등록하고, doctor.ps1 로 점검합니다.
     같은 명령을 다시 실행하면 업데이트입니다(install.ps1 이 실행 중인 곁을 멈추고 바꾼 뒤 다시 띄웁니다).
     이 파일 하나만 있으면 됩니다. 실행 정책은 이 프로세스에만 Bypass 로 주세요(시스템 설정은 바꾸지 않습니다).
@@ -14,6 +16,9 @@
     릴리스 태그(v0.2.0 등). 없으면 가장 최근 릴리스.
 .PARAMETER ZipPath
     이미 받은 gyeot-windows-x64.zip. 같은 폴더의 SHA256SUMS.txt 로 확인합니다(-SumsPath 로 바꿀 수 있음).
+    출처 증명은 확인하지 않으니, 필요하면 gh attestation verify <zip> --repo d-j-lee/gyeot 로 따로 보세요.
+.PARAMETER SkipAttestation
+    출처 증명 확인을 건너뜁니다. 확인이 실패한 이유(회사망 차단 등)를 안 뒤에만 쓰세요.
 .PARAMETER ApplyClaudeHooks
     ~/.claude/settings.json 을 백업한 뒤 곁의 훅을 더합니다(기존 훅은 그대로).
 .PARAMETER RegisterStartup
@@ -41,6 +46,7 @@ param(
     [switch]$RegisterStartup,
     [switch]$RegisterChannel,
     [switch]$StartShell,
+    [switch]$SkipAttestation,
     [string]$InstallRoot,
     [string]$ClaudeSettingsPath,
     [switch]$AllowNonWindows
@@ -109,15 +115,24 @@ function Get-BootPowerShellExe {
 }
 
 # 지금 쓰는 PowerShell 로 스크립트를 새 프로세스에서 돌린다(그 스크립트의 exit 가 이쪽을 끝내지 않게).
+# 자식은 출력이 파이프라 UTF-8 로 쓴다. 이쪽도 그동안 UTF-8 로 읽어야 한글이 깨지지 않는다.
 function Invoke-BootScript([string]$Script, [string[]]$Arguments) {
     $host_ = Get-BootPowerShellExe
     $all = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Script) + $Arguments
-    & $host_ @all | ForEach-Object { Write-Host $_ }
-    return $LASTEXITCODE
+    $prev = $null
+    try { $prev = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $prev = $null }
+    try {
+        & $host_ @all | ForEach-Object { Write-Host $_ }
+        $code = $LASTEXITCODE
+    } finally {
+        if ($null -ne $prev) { try { [Console]::OutputEncoding = $prev } catch { Write-Verbose $_.Exception.Message } }
+    }
+    return $code
 }
 
-function Invoke-BootNative([string]$Exe, [string[]]$Arguments, [int]$TimeoutMs = 120000) {
+function Invoke-BootNative([string]$Exe, [string[]]$Arguments, [int]$TimeoutMs = 120000, [hashtable]$Env) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
+    if ($Env) { foreach ($k in $Env.Keys) { $psi.EnvironmentVariables[$k] = [string]$Env[$k] } }
     $psi.FileName = $Exe
     $psi.Arguments = ConvertTo-BootArgLine $Arguments
     $psi.UseShellExecute = $false
@@ -137,6 +152,11 @@ function Invoke-BootNative([string]$Exe, [string[]]$Arguments, [int]$TimeoutMs =
     return [pscustomobject]@{ Code = $p.ExitCode; Out = $out.Result; Err = $err.Result }
 }
 
+# gh 는 늘 github.com 을 보게 한다(회사 GitHub Enterprise 에 로그인돼 있어도 섞이지 않게).
+function Invoke-BootGh([string]$Gh, [string[]]$Arguments, [int]$TimeoutMs = 120000) {
+    return (Invoke-BootNative $Gh $Arguments $TimeoutMs @{ GH_HOST = 'github.com' })
+}
+
 # claude CLI 는 claude.exe 일 수도 npm 의 claude.cmd 일 수도 있다. Windows 에서는 cmd 를 거쳐 부른다.
 function Invoke-BootClaude([string[]]$Arguments) {
     if ($env:ComSpec) { return (Invoke-BootNative $env:ComSpec (@('/d', '/c', 'claude') + $Arguments)) }
@@ -146,7 +166,62 @@ function Invoke-BootClaude([string[]]$Arguments) {
 
 # 그 포트에서 HTTP 200 을 주는 무언가가 있는지(내 데몬인지는 doctor.ps1 이 hello 로 본다).
 function Test-BootDaemonUp([int]$Port) {
-    try { [void](Get-GyeotLoopbackText -Port $Port -PathAndQuery '/health' -TimeoutMs 1000); return $true } catch { return $false }
+    try { return ((Get-GyeotLoopbackText -Port $Port -PathAndQuery '/health' -TimeoutMs 1000).Status -eq 200) } catch { return $false }
+}
+
+# 저장소·태그는 URL 과 명령줄에 들어가므로 꼴을 좁힌다.
+function Test-BootRepoName([string]$Name) { return ($Name -match '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$') }
+function Test-BootTagName([string]$Name) { return ($Name -match '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') }
+
+function Get-BootReleaseUrl([string]$Repo, [string]$Tag, [string]$Asset) {
+    if ($Tag) { return "https://github.com/$Repo/releases/download/$Tag/$Asset" }
+    return "https://github.com/$Repo/releases/latest/download/$Asset"
+}
+
+# HTTPS 로 한 파일을 받는다. 5.1 은 TLS 1.2 를 켜야 하고, 진행 막대를 끄면 몇 배 빠르다.
+# 인증 프록시(NTLM 등)를 위해 기본 자격 증명을 쓰게 한다(5.1).
+function Invoke-BootDownload([string]$Url, [string]$OutFile) {
+    $ProgressPreference = 'SilentlyContinue'
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        try { [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials } catch { Write-Verbose $_.Exception.Message }
+    }
+    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -Headers @{ 'User-Agent' = 'gyeot-bootstrap' }
+}
+
+# BUILD.txt 의 "version: x.y.z" 줄.
+function Get-BootBuildVersion([string]$BuildText) {
+    if ($BuildText -match '(?m)^version:\s*(\S+)') { return $Matches[1] }
+    return $null
+}
+
+# 곁 데몬을 띄운다. -PreferTask 이고 작업 스케줄러에 곁 데몬 작업이 있으면 그것으로 띄운다
+# (부른 도구의 프로세스 트리와 떨어져 돈다). 돌려주는 값: 띄운 방법.
+function Start-BootDaemon([string]$DaemonExe, [string]$Root, [switch]$PreferTask) {
+    $bin = Split-Path -Parent $DaemonExe
+    if (Test-BootWindows) {
+        if ($PreferTask) {
+            $task = $null
+            try { $task = Get-ScheduledTask -TaskName 'gyeot-daemon' -ErrorAction Stop } catch { $task = $null }
+            if ($task) {
+                try { Start-ScheduledTask -TaskName 'gyeot-daemon' -ErrorAction Stop; return '작업 스케줄러' } catch { Write-Verbose $_.Exception.Message }
+            }
+        }
+        Start-Process -FilePath $DaemonExe -WorkingDirectory $bin -WindowStyle Hidden
+        return '숨긴 창'
+    }
+    Start-Process -FilePath $DaemonExe -WorkingDirectory $bin `
+        -RedirectStandardOutput (Join-Path $Root 'gyeotd.stdout.log') -RedirectStandardError (Join-Path $Root 'gyeotd.stderr.log')
+    return '시험용 프로세스'
+}
+
+function Wait-BootDaemon([int]$Port, [int]$Seconds) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-BootDaemonUp $Port) { return $true }
+        Start-Sleep -Milliseconds 300
+    }
+    return (Test-BootDaemonUp $Port)
 }
 
 function Test-BootWindows {
@@ -156,6 +231,8 @@ function Test-BootWindows {
 function Invoke-Bootstrap {
     if (-not (Test-BootWindows) -and -not $AllowNonWindows) { throw '곁은 Windows용이에요. 이 PC는 Windows가 아니에요.' }
     if ($PSVersionTable.PSVersion.Major -lt 5) { throw "PowerShell 5.1 이상이 필요해요(지금 $($PSVersionTable.PSVersion))." }
+    if (-not (Test-BootRepoName $Repo)) { throw "저장소 이름 꼴이 아니에요: $Repo" }
+    if ($Tag -and -not (Test-BootTagName $Tag)) { throw "태그 꼴이 아니에요(v0.2.0 처럼): $Tag" }
 
     $base = $WorkDir
     if (-not $base) {
@@ -165,6 +242,9 @@ function Invoke-Bootstrap {
     }
 
     # ── 1. 릴리스 파일 ──
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    $ghReady = $false
+    $via = ''
     if ($ZipPath) {
         Write-BootStep "이미 받은 파일 쓰기: $ZipPath"
         $zip = (Resolve-Path -LiteralPath $ZipPath).Path
@@ -172,36 +252,78 @@ function Invoke-Bootstrap {
         if (-not (Test-Path -LiteralPath $SumsPath)) { throw "$($script:SumsName) 이 없어요($SumsPath). 릴리스 페이지에서 zip 과 함께 받으세요." }
         $sums = (Resolve-Path -LiteralPath $SumsPath).Path
         $label = 'local'
+        $dir = Join-Path $base 'local'
+        $via = 'local'
     } else {
-        Write-BootStep "GitHub 릴리스 확인: $Repo"
-        $gh = Get-Command gh -ErrorAction SilentlyContinue
-        if (-not $gh) { throw 'gh(GitHub CLI)가 없어요. https://cli.github.com 에서 설치하고 gh auth login 하거나, 릴리스 페이지에서 zip·SHA256SUMS.txt 를 받아 -ZipPath 로 주세요.' }
-        $st = Invoke-BootNative $gh.Source @('auth', 'status')
-        if ($st.Code -ne 0) { throw "gh 에 로그인돼 있지 않아요. gh auth login 을 한 뒤 다시 하세요. ($($st.Err.Trim()))" }
-        $viewArgs = @('release', 'view')
-        if ($Tag) { $viewArgs += $Tag }
-        $viewArgs += @('--repo', $Repo, '--json', 'tagName', '--jq', '.tagName')
-        $v = Invoke-BootNative $gh.Source $viewArgs
-        if ($v.Code -ne 0 -or -not $v.Out.Trim()) { throw "릴리스를 찾지 못했어요($Repo $Tag). 저장소 접근 권한과 태그를 확인하세요. ($($v.Err.Trim()))" }
-        $label = $v.Out.Trim()
-        $dir = Join-Path $base $label
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Write-BootInfo "릴리스 $label → $dir"
-        $d = Invoke-BootNative $gh.Source @('release', 'download', $label, '--repo', $Repo, '--pattern', $script:ZipName, '--pattern', $script:SumsName, '--dir', $dir, '--clobber') 600000
-        if ($d.Code -ne 0) { throw "릴리스 파일을 받지 못했어요: $($d.Err.Trim())" }
+        Write-BootStep "GitHub 릴리스 받기: $Repo $(if ($Tag) { $Tag } else { '(가장 최근)' })"
+        if ($gh) {
+            $st = Invoke-BootGh $gh.Source @('auth', 'status', '--hostname', 'github.com')
+            $ghReady = ($st.Code -eq 0)
+        }
+        $label = $Tag
+        if ($ghReady) {
+            try {
+                $viewArgs = @('release', 'view')
+                if ($Tag) { $viewArgs += $Tag }
+                $viewArgs += @('--repo', $Repo, '--json', 'tagName', '--jq', '.tagName')
+                $v = Invoke-BootGh $gh.Source $viewArgs
+                if ($v.Code -ne 0 -or -not $v.Out.Trim()) { throw "릴리스를 찾지 못했어요($($v.Err.Trim()))" }
+                $label = $v.Out.Trim()
+                if (-not (Test-BootTagName $label)) { throw "릴리스 태그 꼴이 아니에요: $label" }
+                $dir = Join-Path $base $label
+                if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                $d = Invoke-BootGh $gh.Source @('release', 'download', $label, '--repo', $Repo, '--pattern', $script:ZipName, '--pattern', $script:SumsName, '--dir', $dir, '--clobber') 600000
+                if ($d.Code -ne 0) { throw "릴리스 파일을 받지 못했어요($($d.Err.Trim()))" }
+                $via = 'gh'
+            } catch {
+                Write-BootWarn "gh 로 받지 못했어요: $($_.Exception.Message) — HTTPS 로 다시 해 볼게요."
+                $label = $Tag
+            }
+        }
+        if (-not $via) {
+            $dir = Join-Path $base $(if ($Tag) { $Tag } else { 'latest' })
+            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            foreach ($asset in @($script:SumsName, $script:ZipName)) {
+                $url = Get-BootReleaseUrl $Repo $Tag $asset
+                Write-BootInfo "받기: $url"
+                try { Invoke-BootDownload $url (Join-Path $dir $asset) }
+                catch { throw "릴리스 파일을 받지 못했어요($url): $($_.Exception.Message). 회사망이 github.com 을 막으면 gh auth login 뒤 다시 하거나, 릴리스 페이지에서 받아 -ZipPath 로 주세요." }
+            }
+            $via = 'https'
+        }
         $zip = Join-Path $dir $script:ZipName
         $sums = Join-Path $dir $script:SumsName
+        Write-BootInfo "받은 곳: $dir ($via)"
     }
 
-    # ── 2. 해시 ──
-    Write-BootStep 'SHA-256 확인'
+    # ── 2. 확인: 무결성(SHA-256), 출처(gh 로 받았을 때) ──
+    Write-BootStep '받은 파일 확인'
     $map = Read-BootSumFile ([System.IO.File]::ReadAllText($sums))
     $hash = Assert-BootHash $zip $map
-    Write-BootOk "$($script:ZipName) $($hash.Substring(0, 16))… 일치"
+    Write-BootOk "SHA-256 일치(받다가 깨지지 않았어요): $($hash.Substring(0, 16))…"
+    if ($via -eq 'local') {
+        Write-BootInfo "출처 증명은 확인하지 않았어요(-ZipPath). 필요하면: gh attestation verify `"$zip`" --repo $Repo"
+    } elseif ($SkipAttestation) {
+        Write-BootWarn '출처 증명 확인을 건너뛰었어요(-SkipAttestation).'
+    } elseif (-not $ghReady) {
+        Write-BootInfo '출처 증명(GitHub Actions 가 이 저장소에서 만든 파일인지)은 gh 가 github.com 에 로그인돼 있을 때만 확인해요. 이번엔 SHA-256 만 봤어요.'
+    } else {
+        $help = Invoke-BootGh $gh.Source @('attestation', 'verify', '--help')
+        if ($help.Code -ne 0) {
+            Write-BootInfo 'gh 가 오래돼 출처 증명을 확인하지 못했어요(gh 2.49 이상 필요). 이번엔 SHA-256 만 봤어요.'
+        } else {
+            $av = Invoke-BootGh $gh.Source @('attestation', 'verify', $zip, '--repo', $Repo) 180000
+            if ($av.Code -ne 0) {
+                throw "출처 증명을 확인하지 못했어요: $((($av.Err + ' ' + $av.Out).Trim() -split "`r?`n")[0]). 파일이 바뀌었거나 회사망이 확인 주소(GitHub·sigstore)를 막았을 수 있어요. 이유를 확인한 뒤에만 -SkipAttestation 을 붙이세요."
+            }
+            Write-BootOk "출처 증명 일치: $Repo 의 GitHub Actions 가 만든 파일이에요."
+        }
+    }
 
-    # ── 3. 풀기 ──
-    $stage = Join-Path (Split-Path -Parent $zip) 'gyeot-windows-x64'
+    # ── 3. 풀기(%TEMP% 아래, 받은 폴더와 같은 곳) ──
+    $stage = Join-Path $dir 'gyeot-windows-x64'
     Write-BootStep "풀기 → $stage"
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
     Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
     if (Test-BootWindows) { Get-ChildItem -LiteralPath $stage -Recurse -File | Unblock-File }
@@ -213,7 +335,16 @@ function Invoke-Bootstrap {
     if (-not (Test-Path -LiteralPath $installer)) { $installer = Join-Path (Join-Path $stage 'scripts') 'install.ps1' }
     if (-not (Test-Path -LiteralPath $installer)) { throw 'zip 안에 scripts\install.ps1 이 없어요.' }
     $build = Join-Path $stage 'BUILD.txt'
-    if (Test-Path -LiteralPath $build) { foreach ($l in (Get-Content -LiteralPath $build -Encoding UTF8)) { Write-BootInfo $l } }
+    if (Test-Path -LiteralPath $build) {
+        $buildText = [System.IO.File]::ReadAllText($build)
+        foreach ($l in ($buildText -split "`r?`n")) { if ($l.Trim()) { Write-BootInfo $l } }
+        $ver = Get-BootBuildVersion $buildText
+        if ($ver) {
+            if (-not $label) { $label = "v$ver" }
+            elseif ($label -eq 'local') { $label = "v$ver(받은 파일)" }
+        }
+    }
+    if (-not $label) { $label = '(판 모름)' }
 
     # ── 4. 미리보기(늘) ──
     Write-BootStep '미리보기(install.ps1 -DryRun)'
@@ -247,14 +378,15 @@ function Invoke-Bootstrap {
     $cfg = ConvertFrom-GyeotPrintConfig ($pc.Out + "`n" + $pc.Err)
     if (-not (Test-BootDaemonUp $cfg.Port)) {
         Write-BootStep "곁 데몬 띄우기(127.0.0.1:$($cfg.Port))"
-        if (Test-BootWindows) { Start-Process -FilePath $daemonExe -WorkingDirectory $bin -WindowStyle Hidden }
-        else {
-            Start-Process -FilePath $daemonExe -WorkingDirectory $bin `
-                -RedirectStandardOutput (Join-Path $root 'gyeotd.stdout.log') -RedirectStandardError (Join-Path $root 'gyeotd.stderr.log')
+        $how = Start-BootDaemon $daemonExe $root -PreferTask
+        $up = Wait-BootDaemon $cfg.Port $(if ($how -eq '작업 스케줄러') { 8 } else { 15 })
+        if (-not $up -and $how -eq '작업 스케줄러') {
+            # 로그인 세션이 없는 환경 등에서는 작업이 바로 돌지 않는다. 그때는 직접 띄운다.
+            Write-BootInfo '작업 스케줄러로 뜨지 않아 직접 띄워요.'
+            $how = Start-BootDaemon $daemonExe $root
+            $up = Wait-BootDaemon $cfg.Port 15
         }
-        $deadline = (Get-Date).AddSeconds(15)
-        while (-not (Test-BootDaemonUp $cfg.Port) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
-        if (Test-BootDaemonUp $cfg.Port) { Write-BootOk '떴어요.' } else { Write-BootWarn '15초 안에 뜨지 않았어요. 점검 결과를 보세요.' }
+        if ($up) { Write-BootOk "떴어요($how)." } else { Write-BootWarn '15초 안에 뜨지 않았어요. 점검 결과를 보세요.' }
     }
 
     # ── 6. channel 등록(선택) ──
@@ -276,7 +408,13 @@ function Invoke-Bootstrap {
                     Write-BootInfo '다른 경로로 등록된 gyeot 를 사용자 범위에서 지우고 다시 등록해요.'
                     [void](Invoke-BootClaude @('mcp', 'remove', 'gyeot', '--scope', 'user'))
                 }
-                $a = Invoke-BootClaude @('mcp', 'add', '--transport', 'stdio', '--scope', 'user', 'gyeot', '--', 'node', $channelJs)
+                $addArgs = @('mcp', 'add', '--transport', 'stdio', '--scope', 'user')
+                # 데이터 폴더가 기본(%LOCALAPPDATA%\gyeot)이 아니면 channel 도 같은 곳을 보게 GYEOT_HOME 을 고정한다.
+                $defaultHome = $null
+                if ($env:LOCALAPPDATA) { $defaultHome = Join-Path $env:LOCALAPPDATA 'gyeot' }
+                if ($cfg.Home -and -not (Test-GyeotSamePath $cfg.Home $defaultHome)) { $addArgs += @('-e', "GYEOT_HOME=$($cfg.Home)") }
+                $addArgs += @('gyeot', '--', 'node', $channelJs)
+                $a = Invoke-BootClaude $addArgs
                 if ($a.Code -eq 0) { Write-BootOk "등록했어요: node `"$channelJs`"" }
                 else { Write-BootWarn "등록하지 못했어요: $($a.Err.Trim()) $($a.Out.Trim())" }
             }
@@ -305,7 +443,8 @@ function Invoke-Bootstrap {
     Write-Host "곁 $label 설치·점검을 마쳤어요." -ForegroundColor White
     Write-BootInfo "얼굴 열기: 트레이의 '곁 열기', 또는 `"$(Join-Path $bin 'gyeotd.exe')`" --open"
     Write-BootInfo '대화하려면 Claude Code 세션을 이렇게 시작: claude --dangerously-load-development-channels server:gyeot'
-    Write-BootInfo "지우기: powershell -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path (Join-Path $root 'scripts') 'uninstall.ps1')`""
+    Write-BootInfo "점검만 다시: powershell -NoProfile -ExecutionPolicy Bypass -File `"$doctor`""
+    Write-BootInfo "지우기: powershell -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path (Join-Path $root 'scripts') 'uninstall.ps1')`" -RemoveClaudeHooks"
     return 0
 }
 

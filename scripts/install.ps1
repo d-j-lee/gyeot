@@ -138,6 +138,20 @@ function Start-GyeotDaemonHidden {
     Start-Process -FilePath $DaemonExe -WorkingDirectory (Split-Path -Parent $DaemonExe) -WindowStyle Hidden
 }
 
+# 로그인 시작 작업이 있으면 작업 스케줄러로 띄운다(이 스크립트를 부른 도구의 프로세스 트리와 떨어져 돈다).
+function Start-GyeotDaemonPreferTask {
+    param([string]$DaemonExe)
+    if (Test-GyeotWindowsHost) {
+        $task = $null
+        try { $task = Get-ScheduledTask -TaskName $script:GyeotTaskName -ErrorAction Stop } catch { $task = $null }
+        if ($task) {
+            try { Start-ScheduledTask -TaskName $script:GyeotTaskName -ErrorAction Stop; return '작업 스케줄러' } catch { Write-Verbose $_.Exception.Message }
+        }
+    }
+    Start-GyeotDaemonHidden $DaemonExe
+    return '숨긴 창'
+}
+
 try {
     $mode = ''
     if ($DryRun) { $mode = ' (미리보기: 아무것도 바꾸지 않아요)' }
@@ -361,7 +375,7 @@ try {
         Write-GyeotBlock 'channel (.mcp.json)' $mcpSnippet
         Write-GyeotInfo '세션 시작: claude --dangerously-load-development-channels server:gyeot'
         if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-            Write-GyeotWarn 'node 가 PATH에 없어요. channel에는 Node.js 20 이상이 필요해요.'
+            Write-GyeotWarn 'node 가 PATH에 없어요. channel에는 Node.js 22 이상이 필요해요.'
         }
     }
     if ($customRoot) {
@@ -390,6 +404,10 @@ try {
         $d = $res.Detail
         $removedNote = ''
         if ($d.Removed -gt 0) { $removedNote = ", 곁의 PostToolBatch $($d.Removed)개 뺌" }
+        if ($d.Stale -gt 0) {
+            Write-GyeotWarn "손으로 넣은 셸 형식 곁 훅 $($d.Stale)개가 이 설치가 아닌 경로를 불러요: $($d.StalePaths -join ', ')"
+            Write-GyeotWarn '  그 항목은 고치지 않고 두었고, 이 설치의 항목을 따로 더했어요. 필요 없으면 settings.json 에서 그 줄을 지우세요(이벤트가 두 번 갈 수 있어요).'
+        }
         if (-not $res.Changed) {
             Write-GyeotOk "이미 들어 있어요(그대로 둠, 곁 항목 $($d.Kept)개)."
         } elseif ($DryRun) {
@@ -447,8 +465,8 @@ try {
     # ── 9. 멈췄던 것 다시 띄우기 ──
     if (-not $DryRun) {
         if ($wasDaemon -and -not (Get-GyeotProcessesUnder @('gyeotd') $BinDir).Count) {
-            Start-GyeotDaemonHidden $dst.Daemon
-            Write-GyeotOk '멈췄던 곁 데몬을 다시 띄웠어요.'
+            $how = Start-GyeotDaemonPreferTask $dst.Daemon
+            Write-GyeotOk "멈췄던 곁 데몬을 다시 띄웠어요($how)."
         }
         if ($wasShell -and $src.Shell) {
             Start-Process -FilePath $dst.Shell -WorkingDirectory $BinDir

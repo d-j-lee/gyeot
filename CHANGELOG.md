@@ -5,9 +5,10 @@
 첫 배포판이다. v0.1(개발 중 판)에서 독립 검증을 여러 번 돌려 실제로 뚫린 것을 막았다. 자세한 기록은 `docs/field-notes.md`, 결정은 `docs/decisions.md` G-023~G-042.
 
 **설치**
-- 릴리스에서 `bootstrap.ps1`이 zip을 받아 SHA-256을 확인하고 설치·점검까지 한다. 다시 실행하면 업데이트다.
-- 업무 PC에서는 `INSTALL-WITH-CLAUDE.md`의 한 줄을 Claude Code에 주면 된다.
-- `doctor.ps1`로 설치 상태를 언제든 점검한다(아무것도 바꾸지 않음).
+- 업무 PC에서는 `INSTALL-WITH-CLAUDE.md`의 한 줄을 Claude Code에 주면 된다. 로그인은 필요 없다.
+- 릴리스의 `bootstrap.ps1`이 zip을 받아(gh가 github.com에 로그인돼 있으면 gh로, 아니면 HTTPS로) SHA-256을 확인하고, gh로 받았으면 출처 증명(이 저장소의 GitHub Actions가 만든 파일인지)도 확인한 뒤 설치·점검까지 한다. 다시 실행하면 업데이트다.
+- `doctor.ps1`로 설치 상태를 언제든 점검한다(아무것도 바꾸지 않음). 포트를 잡은 다른 프로그램, 옛 경로를 부르는 훅, 훅 없이 한 설치를 가려 알린다.
+- 릴리스 자산마다 artifact attestation을 붙인다. CI가 올린 릴리스를 Windows에서 받아 설치·업데이트·점검·지우기까지 해 본다.
 
 **보안**
 - 얼굴 페이지에 비밀이 없다. 일회용 부트 코드를 세션 열쇠로 바꿔 탭 저장소에만 두고 `Authorization` 머리로만 보낸다. 쿠키·쿼리 토큰은 쓰지 않는다.

@@ -132,17 +132,22 @@ try {
     $mine = $false
     if ($token) {
         $n = New-GyeotNonce
-        $body = $null
+        $resp = $null
         $helloErr = ''
-        try { $body = Get-GyeotLoopbackText -Port $cfg.Port -PathAndQuery "/v1/hello?n=$n" } catch { $body = $null; $helloErr = $_.Exception.Message }
-        if ($null -eq $body) {
-            Add-GyeotCheck '데몬' 'fail' "127.0.0.1:$($cfg.Port) 에 닿지 않아요 — 셸을 띄우거나 `"$daemon`" 를 실행하세요 ($helloErr)"
+        try { $resp = Get-GyeotLoopbackText -Port $cfg.Port -PathAndQuery "/v1/hello?n=$n" } catch { $resp = $null; $helloErr = $_.Exception.Message }
+        $hello = $null
+        if ($resp -and $resp.Status -eq 200) { try { $hello = $resp.Body | ConvertFrom-Json } catch { $hello = $null } }
+        $proof = $null
+        if ($hello -and ($hello.PSObject.Properties.Name -contains 'proof')) { $proof = [string]$hello.proof }
+        if ($null -eq $resp) {
+            Add-GyeotCheck '데몬' 'fail' "127.0.0.1:$($cfg.Port) 에 닿지 않아요(아무것도 듣고 있지 않음) — 셸을 띄우거나 `"$daemon`" 를 실행하세요 ($helloErr)"
+        } elseif (-not $proof) {
+            # 연결은 됐는데 곁 hello 가 아니다: 다른 프로그램이 포트를 잡았다. 곁이 그 포트에 토큰을 보내면 안 된다.
+            Add-GyeotCheck '데몬' 'fail' "127.0.0.1:$($cfg.Port) 을 다른 프로그램이 쓰고 있어요(곁 hello 응답이 아님, HTTP $($resp.Status)) — 그 프로그램을 끄거나 config.toml 의 port 를 바꾸세요"
+        } elseif (Test-GyeotSameHex $proof (Get-GyeotHelloProof $token $cfg.Port $n)) {
+            $mine = $true; Add-GyeotCheck '데몬' 'ok' "127.0.0.1:$($cfg.Port) 은 내 곁 데몬(hello 증명 일치)"
         } else {
-            $proof = $null
-            try { $proof = ($body | ConvertFrom-Json).proof } catch { $proof = $null }
-            $want = Get-GyeotHelloProof $token $cfg.Port $n
-            if (Test-GyeotSameHex $proof $want) { $mine = $true; Add-GyeotCheck '데몬' 'ok' "127.0.0.1:$($cfg.Port) 은 내 곁 데몬(hello 증명 일치)" }
-            else { Add-GyeotCheck '데몬' 'fail' "127.0.0.1:$($cfg.Port) 의 서버가 내 토큰을 몰라요 — 다른 사용자나 프로그램이 포트를 잡았을 수 있어요" }
+            Add-GyeotCheck '데몬' 'fail' "127.0.0.1:$($cfg.Port) 의 곁 데몬이 내 토큰을 몰라요 — 다른 사용자나 다른 설치의 데몬이 포트를 잡았을 수 있어요"
         }
     } else {
         Add-GyeotCheck '데몬' 'skip' '토큰이 없어 확인하지 않았어요'
@@ -158,32 +163,49 @@ try {
     }
 
     # 6. Claude Code 훅
+    # 곁 처리기가 하나도 없으면 훅 없이 설치한 것으로 보고 경고만 한다. 있으면 이벤트마다 이 설치의
+    # gyeot-hook 를 불러야 하고, 없는 파일을 부르는 처리기가 있으면 실패(그 훅은 매번 실패한다).
+    $hookAdvice = 'bootstrap.ps1 -ApplyClaudeHooks -Install 로 다시 설치하세요(처음에 준 다른 선택도 함께)'
     if ($NoHooks) {
         Add-GyeotCheck 'Claude 훅' 'skip' '-NoHooks'
     } else {
         if (-not $ClaudeSettingsPath) { $ClaudeSettingsPath = Join-Path (Join-Path (Get-GyeotHomeDir) '.claude') 'settings.json' }
-        if (-not (Test-Path -LiteralPath $ClaudeSettingsPath)) {
-            Add-GyeotCheck 'Claude 훅' 'warn' "$ClaudeSettingsPath 가 없어요 — install.ps1 -ApplyClaudeHooks 로 넣으세요"
-        } else {
+        $handlers = @()
+        if (Test-Path -LiteralPath $ClaudeSettingsPath) {
             $tree = ConvertFrom-GyeotJsonText (Read-GyeotTextFile $ClaudeSettingsPath)
+            $handlers = @(Get-GyeotHookHandlerList $tree)
+        }
+        if ($handlers.Count -eq 0) {
+            Add-GyeotCheck 'Claude 훅' 'warn' "곁 훅이 없어요($ClaudeSettingsPath) — 훅 없이 설치했다면 그대로 두세요. 넣으려면 $hookAdvice"
+        } else {
+            $broken = @()
+            $other = @()
+            foreach ($h in $handlers) {
+                $exe = $h.Exe
+                if (Test-GyeotSamePath $exe $hook) { continue }
+                $exists = $false
+                if ($exe -match '[\\/]') { try { $exists = Test-Path -LiteralPath $exe -PathType Leaf } catch { $exists = $false } }
+                else { $exists = [bool](Get-Command $exe -ErrorAction SilentlyContinue) }
+                if ($exists) { if ($other -notcontains $exe) { $other += $exe } }
+                elseif ($broken -notcontains $exe) { $broken += $exe }
+            }
             $lack = @()
             foreach ($ev in (Get-GyeotClaudeEventList -NoActivity:$NoActivityHook)) {
-                if ((Get-GyeotHookCount $tree $ev.Name) -lt 1) { $lack += $ev.Name }
+                $mineHere = @($handlers | Where-Object { $_.Event -ceq $ev.Name -and (Test-GyeotSamePath $_.Exe $hook) })
+                if ($mineHere.Count -lt 1) { $lack += $ev.Name }
             }
-            $paths = @()
-            if ($tree.Contains('hooks') -and $tree['hooks'] -is [System.Collections.IDictionary]) {
-                foreach ($evName in @($tree['hooks'].Keys)) {
-                    foreach ($g in @($tree['hooks'][$evName])) {
-                        if ($g -isnot [System.Collections.IDictionary] -or -not $g.Contains('hooks')) { continue }
-                        foreach ($h in @($g['hooks'])) { if (Test-GyeotHookHandler $h) { $paths += [string]$h['command'] } }
-                    }
-                }
-            }
-            $stale = @($paths | Where-Object { $_ -and ((Get-GyeotFullPath $_) -ne (Get-GyeotFullPath $hook)) } | Select-Object -Unique)
             $expected = @(Get-GyeotClaudeEventList -NoActivity:$NoActivityHook).Count
-            if ($lack.Count -gt 0) { Add-GyeotCheck 'Claude 훅' 'fail' "빠진 이벤트: $($lack -join ', ') — install.ps1 -ApplyClaudeHooks 를 다시 하세요" }
-            elseif ($stale.Count -gt 0) { Add-GyeotCheck 'Claude 훅' 'warn' "다른 경로의 gyeot-hook 를 가리키는 항목: $($stale -join ', ')" }
-            else { Add-GyeotCheck 'Claude 훅' 'ok' "$expected 개 이벤트가 $hook 를 불러요" }
+            $activity = $script:GyeotClaudeActivityEvent.Name
+            if ($lack.Count -eq 1 -and $lack[0] -ceq $activity) {
+                # -NoActivityHook 으로 설치한 모양: 활동 훅만 없다.
+                Add-GyeotCheck 'Claude 훅' 'warn' "활동 훅($activity)이 없어요 — -NoActivityHook 으로 설치했다면 정상이에요(그때는 doctor.ps1 -NoActivityHook)"
+                $lack = @()
+                $expected--
+            }
+            if ($broken.Count -gt 0) { Add-GyeotCheck 'Claude 훅' 'fail' "없는 파일을 부르는 곁 훅이 있어요: $($broken -join ', ') — $hookAdvice. 손으로 넣은 줄이면 settings.json 에서 지우세요" }
+            if ($lack.Count -gt 0) { Add-GyeotCheck 'Claude 훅' 'fail' "이 설치의 gyeot-hook 를 부르지 않는 이벤트: $($lack -join ', ') — $hookAdvice" }
+            if ($other.Count -gt 0) { Add-GyeotCheck 'Claude 훅' 'warn' "다른 설치의 gyeot-hook 도 불러요(이벤트가 두 번 갈 수 있어요): $($other -join ', ')" }
+            if ($broken.Count -eq 0 -and $lack.Count -eq 0) { Add-GyeotCheck 'Claude 훅' 'ok' "$expected 개 이벤트가 $hook 를 불러요" }
         }
     }
 

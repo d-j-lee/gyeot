@@ -21,14 +21,14 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
 업무 PC의 Claude Code에 이 한 줄을 붙여 넣는다. 처음이면 설치하고, 이미 있으면 최신 릴리스로 바꾼다.
 
 ```
-d-j-lee/gyeot 최신 릴리스로 곁을 설치(이미 있으면 업데이트)해 줘. 순서는 `gh api repos/d-j-lee/gyeot/contents/INSTALL-WITH-CLAUDE.md -H "Accept: application/vnd.github.raw"` 로 읽은 문서를 그대로 따르고, 내 설정을 바꾸기 전에는 미리보기를 보여 주고 확인을 받아.
+곁(d-j-lee/gyeot)을 설치해 줘(이미 있으면 업데이트). curl.exe -fsSL https://github.com/d-j-lee/gyeot/releases/latest/download/INSTALL-WITH-CLAUDE.md 로 받은 설치 문서 전문을 읽고 그 순서를 그대로 따르고, 내 설정을 바꾸기 전에는 미리보기를 보여 주고 확인을 받아.
 ```
 
-전제는 `gh`가 이 저장소를 볼 수 있는 계정으로 로그인돼 있는 것이다. Claude Code가 따르는 순서와 되돌리는 법은 [INSTALL-WITH-CLAUDE.md](INSTALL-WITH-CLAUDE.md)에 있다. 릴리스의 `bootstrap.ps1`이 zip의 SHA-256을 확인한 뒤 설치하고, `doctor.ps1`로 점검까지 한다.
+로그인은 필요 없다(공개 저장소). Claude Code가 따르는 순서와 되돌리는 법은 [INSTALL-WITH-CLAUDE.md](INSTALL-WITH-CLAUDE.md)에 있다. 릴리스의 `bootstrap.ps1`이 zip의 SHA-256을 확인하고, `gh`가 github.com에 로그인돼 있으면 출처 증명(이 저장소의 GitHub Actions가 만든 파일인지)까지 확인한 뒤 설치하고, `doctor.ps1`로 점검까지 한다.
 
 ### 손으로
 
-1. **받기**: [Releases](https://github.com/d-j-lee/gyeot/releases)에서 `gyeot-windows-x64.zip`과 `SHA256SUMS.txt`를 받는다. 셸 설치본(`gyeot-shell-setup-x64.exe`)도 같은 곳에 있지만 zip에 셸이 들어 있어 따로 필요하지 않다. 직접 빌드하려면 아래 [개발](#개발)을 본다.
+1. **받기**: [Releases](https://github.com/d-j-lee/gyeot/releases)에서 `gyeot-windows-x64.zip`과 `SHA256SUMS.txt`를 받는다. 무결성은 `Get-FileHash`로 SHA256SUMS와 맞춰 보고, 출처는 `gh attestation verify gyeot-windows-x64.zip --repo d-j-lee/gyeot`로 본다. 셸 설치본(`gyeot-shell-setup-x64.exe`)도 같은 곳에 있지만 zip에 셸이 들어 있어 따로 필요하지 않다. 직접 빌드하려면 아래 [개발](#개발)을 본다.
 2. **설치**: 압축을 푼 폴더에서 아래 명령을 실행한다. 관리자 권한은 필요 없다.
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DryRun   # 무엇을 할지 먼저 본다
@@ -67,9 +67,10 @@ d-j-lee/gyeot 최신 릴리스로 곁을 설치(이미 있으면 업데이트)�
 | 얼굴 | Linux, vitest | 351 통과. 세션 열쇠·보내기 전 상대 확인·fetch SSE 해석기·401 처리, 결정 카드 안내, 색 대비 WCAG AA, 가짜 데몬(mock)의 보안 규칙 포함 |
 | channel | Linux, vitest(묶은 파일을 실제로 띄움) | 53 통과. 데몬 확인(hello) 포함. Node 22 |
 | 셸 | Linux(WebKitGTK), cargo test | 82 통과. IPC 권한(ACL)·데몬 확인·부트 흐름·데몬이 멈추면 바로 닫기 시험 포함. Windows 대상 clippy 0건 |
-| 설치 스크립트 | pwsh 7.4 | 128 통과, Windows 전용 폴더 권한 시험 1개는 CI(Windows)에서 |
+| 설치 스크립트 | pwsh 7.4 | `test-install` 134 통과(Windows 전용 폴더 권한 시험은 CI Windows에서), `test-bootstrap` 64 통과(실제 데몬·훅 심으로 설치·업데이트·점검·지우기, 포트를 잡은 다른 서버·옛 경로 훅·훅 없는 설치 포함) |
 | **끝-끝(가짜 없음)** | Linux, `tests/e2e/e2e.mjs` | 64/64. 실제 데몬·훅 심·channel·얼굴(Chrome)을 이음. 세션 열쇠·데몬 확인·포트를 가로챈 가짜 서버(훅·`--open`·열린 얼굴 모두 열쇠 0건)·스풀 줄이기 포함 |
 | Windows 빌드·시험·끝-끝·설치본 | GitHub Actions(windows-latest) | 이 판의 결과는 `docs/field-notes.md` |
+| 올린 릴리스로 설치 | GitHub Actions(windows-latest), `release-check` | 릴리스를 HTTPS로 받아 5.1로 설치, gh 로그인·출처 증명으로 7에서 업데이트, 점검·지우기. 결과는 `docs/field-notes.md` |
 | 독립 적대 검증 | 작업 맥락을 모르는 에이전트 | 여러 라운드(새 눈 3번·회귀 재검증 3번). 기록은 `docs/field-notes.md` |
 | 실제 Claude Code 훅·channel, WebView2·음성, 클릭 통과 체감 | 사용자 Windows | **실측 전** — `docs/roadmap.md` F1–F12 |
 
@@ -113,6 +114,11 @@ pwsh scripts/test-install.ps1 -SourceDir <배포 폴더> -SkipInit
 pwsh scripts/test-bootstrap.ps1 -GyeotdPath target/debug/gyeotd -HookPath target/debug/gyeot-hook   # 설치 흐름 끝-끝
 ```
 
-배포는 `Cargo.toml`의 판과 같은 `v*` 태그를 올리면 CI가 Windows에서 빌드·시험(진짜 zip으로 bootstrap 끝-끝 포함)한 뒤 GitHub Release를 만든다. 릴리스 노트는 `CHANGELOG.md`의 그 판 절이다.
+배포는 `Cargo.toml`의 판과 같은 태그를 올리면 CI가 Windows에서 빌드·시험(진짜 zip으로 bootstrap 끝-끝 포함)한 뒤 GitHub Release를 만든다. 자산마다 출처 증명(artifact attestation)을 붙이고, 올린 릴리스를 Windows에서 받아 설치·업데이트·점검·지우기까지 해 본다(`release-check`).
+
+1. `vX.Y.Z-rc.N`을 먼저 올린다. 미리 보기 릴리스(prerelease)라 `releases/latest`에 잡히지 않는다. `release-check`까지 통과하는지 본다.
+2. 통과하면 같은 커밋에 `vX.Y.Z`를 올린다. 릴리스 노트는 두 경우 모두 `CHANGELOG.md`의 `## vX.Y.Z` 절이다.
+
+태그는 되돌리기 어렵다(지우기는 저장소 주인이 한다). 그래서 rc로 먼저 거른다.
 
 작업 규칙은 [CLAUDE.md](CLAUDE.md)에 있다.
