@@ -197,6 +197,13 @@ function Invoke-BootDownload([string]$Url, [string]$OutFile) {
     Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -Headers @{ 'User-Agent' = 'gyeot-bootstrap' }
 }
 
+# 두 스크립트가 줄 끝을 빼고 같은지.
+function Test-BootSameScript([string]$A, [string]$B) {
+    $ta = ([System.IO.File]::ReadAllText($A)) -replace "`r`n", "`n"
+    $tb = ([System.IO.File]::ReadAllText($B)) -replace "`r`n", "`n"
+    return ($ta -ceq $tb)
+}
+
 # BUILD.txt 의 "version: x.y.z" 줄.
 function Get-BootBuildVersion([string]$BuildText) {
     if ($BuildText -match '(?m)^version:\s*(\S+)') { return $Matches[1] }
@@ -368,9 +375,10 @@ function Invoke-Bootstrap {
     # ── 3b. 받은 판의 bootstrap 이 이 파일과 다르면 그쪽으로 넘긴다 ──
     # 설치된 옛 bootstrap 으로 업데이트할 때, 옛 코드가 새 판의 스크립트와 섞여 돌지 않게 한다.
     # 넘기는 zip 은 여기서 SHA-256(과 출처 증명)을 마친 것이다.
+    # 줄 끝(CRLF·LF)만 다른 것은 같은 판으로 본다.
     $newBoot = Join-Path (Join-Path $stage 'scripts') 'bootstrap.ps1'
     if (-not $HandoffVia -and $script:BootSelf -and (Test-Path -LiteralPath $newBoot) -and (Test-Path -LiteralPath $script:BootSelf) -and
-        ((Get-BootSha256 $newBoot) -ne (Get-BootSha256 $script:BootSelf))) {
+        -not (Test-BootSameScript $newBoot $script:BootSelf)) {
         Write-BootStep '받은 판의 bootstrap 으로 넘겨요(이 파일과 내용이 달라요)'
         $fw = @('-Repo', $Repo, '-ZipPath', $zip, '-SumsPath', $sums, '-WorkDir', (Join-Path $base 'handoff'), '-HandoffVia', $via, '-HandoffLabel', $label)
         foreach ($sw in @('Install', 'ApplyClaudeHooks', 'NoActivityHook', 'RegisterStartup', 'RegisterChannel', 'StartShell', 'AllowNonWindows')) {

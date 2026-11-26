@@ -235,6 +235,9 @@ try {
     Assert-Boot ((Get-BootReleaseUrl 'd-j-lee/gyeot' '' 'a.zip') -eq 'https://github.com/d-j-lee/gyeot/releases/latest/download/a.zip') '받기 주소: 가장 최근'
     Assert-Boot ((Get-BootReleaseUrl 'd-j-lee/gyeot' 'v0.2.0' 'a.zip') -eq 'https://github.com/d-j-lee/gyeot/releases/download/v0.2.0/a.zip') '받기 주소: 태그'
     Assert-Boot ((Get-BootBuildVersion "곁(gyeot)`r`nversion: 0.2.0`r`nref: x") -eq '0.2.0' -and $null -eq (Get-BootBuildVersion 'commit: x')) 'BUILD.txt 판 읽기'
+    $sa = Join-Path $tmpRoot 'same-a.ps1'; $sb = Join-Path $tmpRoot 'same-b.ps1'; $sc = Join-Path $tmpRoot 'same-c.ps1'
+    [System.IO.File]::WriteAllText($sa, "a`nb`n"); [System.IO.File]::WriteAllText($sb, "a`r`nb`r`n"); [System.IO.File]::WriteAllText($sc, "a`nB`n")
+    Assert-Boot ((Test-BootSameScript $sa $sb) -and -not (Test-BootSameScript $sa $sc)) '같은 판 bootstrap 비교: 줄 끝만 다르면 같다, 글자가 다르면 다르다'
 
     Assert-Boot ((Test-GyeotSamePath 'C:\A\gyeot-hook.exe' 'c:\a\GYEOT-HOOK.EXE') -and -not (Test-GyeotSamePath 'C:\a\x.exe' 'C:\b\x.exe') -and -not (Test-GyeotSamePath '' 'x')) '경로 비교(대소문자 무시, 해석 못 하는 경로도 예외 없이)'
     $hx = New-GyeotDict; $hx['type'] = 'command'; $hx['command'] = 'C:\g\gyeot-hook.exe'; $hx['args'] = (New-GyeotList @('claude-code'))
@@ -405,6 +408,20 @@ try {
         Assert-Boot ($r.Code -eq 0 -and $r.Text -match '받은 판의 bootstrap 으로 넘겨요' -and $r.Text -match '앞선 bootstrap 이 마쳤어요\(local\)' -and $r.Text -match '미리보기만 했어요') "다른 bootstrap 으로 넘겨 이어서 한다(받은 값 $($r.Code))"
         Assert-Boot (([regex]::Matches($r.Text, '받은 판의 bootstrap 으로 넘겨요')).Count -eq 1) '넘긴 쪽은 다시 넘기지 않는다(한 번만)'
         Assert-Boot (-not (Test-Path -LiteralPath (Join-Path $root 'bin'))) '넘긴 미리보기도 설치하지 않는다'
+        # 줄 끝만 CRLF 로 바뀐 같은 판(Windows checkout)이면 넘기지 않는다.
+        $crStage = Join-Path $tmpRoot 'crlf-stage'
+        Expand-Archive -LiteralPath $zip -DestinationPath $crStage -Force
+        $cb = Join-Path $crStage 'scripts/bootstrap.ps1'
+        $ct = ([System.IO.File]::ReadAllText($cb)) -replace "`r`n", "`n" -replace "`n", "`r`n"
+        [System.IO.File]::WriteAllText($cb, $ct, (New-Object System.Text.UTF8Encoding($true)))
+        $crRel = Join-Path $tmpRoot 'crlf-rel'
+        New-Item -ItemType Directory -Path $crRel -Force | Out-Null
+        $crZip = Join-Path $crRel 'gyeot-windows-x64.zip'
+        Compress-Archive -Path (Join-Path $crStage '*') -DestinationPath $crZip -Force
+        "$(Get-BootSha256 $crZip)  gyeot-windows-x64.zip" | Set-Content -LiteralPath (Join-Path $crRel 'SHA256SUMS.txt') -Encoding ASCII
+        $crArgs = @($common); $crArgs[1] = $crZip
+        $r = Invoke-BootTest ($crArgs + @('-ApplyClaudeHooks'))
+        Assert-Boot ($r.Code -eq 0 -and $r.Text -notmatch '받은 판의 bootstrap 으로 넘겨요' -and $r.Text -match '미리보기만 했어요') "줄 끝만 다른 같은 판이면 넘기지 않는다(받은 값 $($r.Code))"
 
         Write-Host '== 4. 바뀐 zip 은 거절한다' -ForegroundColor White
         $bad = Join-Path $tmpRoot 'bad'
