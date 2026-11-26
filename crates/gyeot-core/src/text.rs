@@ -11,10 +11,19 @@ struct Masker {
     url_cred: Regex,
     bearer: Regex,
     tokens: Regex,
+    slack_hook: Regex,
+    auth_header: Regex,
+    cookie_header: Regex,
+    secret_flag: Regex,
+    mysql_p: Regex,
+    user_secret: Regex,
     secret_kv: Regex,
     secret_word: Regex,
     not_secret: Regex,
 }
+
+/// 값 한 낱말: 따옴표 묶음(닫는 따옴표가 잘려 없으면 끝까지) 또는 공백·따옴표 전까지(닫는 따옴표는 남긴다).
+const VALUE: &str = r#"(?P<v>"(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|[^\s"']+)"#;
 
 fn masker() -> &'static Masker {
     static M: OnceLock<Masker> = OnceLock::new();
@@ -35,18 +44,46 @@ fn masker() -> &'static Masker {
             r"|\bxox[abpr]-[A-Za-z0-9\-]{10,}",
             r"|\bAKIA[0-9A-Z]{16}\b",
             r"|\bAIza[0-9A-Za-z_\-]{20,}",
+            // §14.5 접두어: npm·Docker·GitLab·Stripe, JWT
+            r"|\bnpm_[A-Za-z0-9]{20,}",
+            r"|\bdckr_pat_[A-Za-z0-9_\-]{20,}",
+            r"|\bglpat-[A-Za-z0-9_\-]{20,}",
+            r"|\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}",
+            r"|\beyJ[A-Za-z0-9_\-]{5,}\.eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]*",
         ))
         .expect("token regex"),
-        // 계약 §13.4: 키 이름에 비밀 낱말이 든 `키=값`·`키: 값`. 공백은 모두 `\s`로 본다(공백 접기 전후가 같게).
-        // 값은 따옴표 묶음(닫는 따옴표가 잘려 없으면 끝까지) 또는 공백 전까지.
-        secret_kv: Regex::new(concat!(
-            r"(?i)(?P<k>[A-Za-z0-9_\-]*(?:pass|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key)[A-Za-z0-9_\-]*)",
-            r#"(?P<sep>["']?\s*[:=]\s*)"#,
-            r#"(?P<v>"(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|\S+)"#,
+        slack_hook: Regex::new(r"(?i)(?P<h>\bhooks\.slack\.com/services/)[A-Za-z0-9/_\-]+")
+            .expect("slack webhook regex"),
+        // `Authorization: [방식] <값>`(Basic·Bearer 등). 닫는 따옴표는 남긴다.
+        auth_header: Regex::new(&format!(
+            r#"(?i)(?P<h>\b(?:proxy-)?authorization["']?\s*:\s*["']?(?:(?:basic|bearer|digest|token|negotiate|ntlm)\s+)?){VALUE}"#
+        ))
+        .expect("authorization header regex"),
+        // `Cookie: …`·`Set-Cookie: …`: 값에 공백·`;`가 들어 있으므로 따옴표나 끝까지.
+        cookie_header: Regex::new(r#"(?i)(?P<h>\b(?:set-)?cookie["']?\s*:\s*["']?)(?P<v>[^\s"'][^"']*)"#)
+            .expect("cookie header regex"),
+        // 값을 공백 뒤에 받는 플래그(`--password SECRET`).
+        secret_flag: Regex::new(&format!(
+            r"(?i)(?P<h>(?:^|\s)--(?:password|passwd|token|secret|api-key|access-token|auth)\s+){VALUE}"
+        ))
+        .expect("secret flag regex"),
+        // mysql·mysqldump·mysqladmin의 붙여 쓴 `-p<값>`(`-P`는 포트라 대소문자를 가린다).
+        mysql_p: Regex::new(&format!(
+            r"(?P<h>(?i:\bmysql(?:dump|admin)?\b)[^;&|]*?\s-p){VALUE}"
+        ))
+        .expect("mysql password regex"),
+        // `-u`·`--user` 다음 `이름:비밀`.
+        user_secret: Regex::new(
+            r#"(?P<h>(?:^|\s)(?:-u|--user)(?:\s+|=)["']?(?P<n>[^\s:"']+):)(?P<v>[^\s"']+)"#,
+        )
+        .expect("user secret regex"),
+        // 계약 §13.4·§14.5: 키 이름에 비밀 낱말이 든 `키=값`·`키: 값`. 공백은 모두 `\s`로 본다(공백 접기 전후가 같게).
+        secret_kv: Regex::new(&format!(
+            r#"(?i)(?P<k>[A-Za-z0-9_\-]*(?:pass|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|auth[_\-]?key|credential|pw)[A-Za-z0-9_\-]*)(?P<sep>["']?\s*[:=]\s*){VALUE}"#
         ))
         .expect("secret key-value regex"),
         secret_word: Regex::new(
-            r"(?i)pass|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key",
+            r"(?i)pass|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|auth[_\-]?key|credential",
         )
         .expect("secret word regex"),
         // 비밀 낱말을 품었지만 비밀이 아닌 흔한 이름(셈·한도·우회 등).
@@ -60,18 +97,49 @@ fn masker() -> &'static Masker {
     })
 }
 
-/// 비밀처럼 보이는 것을 [`MASK`]로 바꾼다(계약 §2.4, §13.4). 두 번 가려도 같다.
+/// 비밀처럼 보이는 것을 [`MASK`]로 바꾼다(계약 §2.4, §13.4, §14.5). 두 번 가려도 같다.
 pub fn mask(s: &str) -> String {
     let m = masker();
     let s = m.private_key.replace_all(s, MASK);
     let s = m.url_cred.replace_all(&s, "${scheme}[가림]@");
     let s = m.bearer.replace_all(&s, "${b}[가림]");
     let s = m.tokens.replace_all(&s, MASK);
+    let s = m.slack_hook.replace_all(&s, "${h}[가림]");
+    let s = m.auth_header.replace_all(&s, mask_value);
+    let s = m.cookie_header.replace_all(&s, "${h}[가림]");
+    let s = m.secret_flag.replace_all(&s, mask_value);
+    let s = m.mysql_p.replace_all(&s, mask_value);
+    let s = m.user_secret.replace_all(&s, |c: &regex::Captures<'_>| {
+        let (n, v) = (&c["n"], &c["v"]);
+        // `-u 1000:1000`(uid:gid)은 비밀이 아니다.
+        if n.bytes().all(|b| b.is_ascii_digit()) && v.bytes().all(|b| b.is_ascii_digit()) {
+            c[0].to_owned()
+        } else {
+            format!("{}{MASK}", &c["h"])
+        }
+    });
     mask_secret_kv(m, &s)
 }
 
-/// 키 이름이 비밀 낱말을 품었는가(흔한 거짓 양성 이름을 지운 뒤에도 남는가).
+/// `h`는 두고 값 `v`만 가린다. 따옴표 묶음은 따옴표째 남긴다.
+fn mask_value(c: &regex::Captures<'_>) -> String {
+    format!("{}{}", &c["h"], masked_value(&c["v"]))
+}
+
+fn masked_value(v: &str) -> &'static str {
+    match v.chars().next() {
+        Some('"') => "\"[가림]\"",
+        Some('\'') => "'[가림]'",
+        _ => MASK,
+    }
+}
+
+/// 키 이름이 비밀 낱말을 품었는가(흔한 거짓 양성 이름을 지운 뒤에도 남는가). `pw`·`pwd`는 키가 정확히 그것일 때만.
 fn is_secret_key(m: &Masker, key: &str) -> bool {
+    let bare = key.trim_start_matches('-').to_ascii_lowercase();
+    if bare == "pw" || bare == "pwd" {
+        return true;
+    }
     m.secret_word
         .is_match(&m.not_secret.replace_all(key, "\u{1f}"))
 }
@@ -95,11 +163,7 @@ fn mask_secret_kv(m: &Masker, s: &str) -> String {
             continue;
         }
         out.push_str(&s[copied..v.start()]);
-        out.push_str(match v.as_str().chars().next() {
-            Some('"') => "\"[가림]\"",
-            Some('\'') => "'[가림]'",
-            _ => MASK,
-        });
+        out.push_str(masked_value(v.as_str()));
         copied = v.end();
         at = v.end();
     }
@@ -386,6 +450,156 @@ mod tests {
         // 거짓 양성으로 넘긴 값 안의 진짜 키=값은 다시 본다
         assert_eq!(mask("bypass: token=abc"), "bypass: token=[가림]");
         assert_eq!(mask("passed_token=abc"), "passed_token=[가림]");
+    }
+
+    /// R3 회귀 N5·R5 L2(계약 §14.5): 남아 있던 비밀 꼴.
+    #[test]
+    fn masks_r5_secret_forms() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        let cases = [
+            // 공백 뒤에 값을 받는 플래그
+            (
+                "psql --password SECRET -h db",
+                "psql --password [가림] -h db",
+            ),
+            ("vercel deploy --token Xy9", "vercel deploy --token [가림]"),
+            (
+                "az login --password 'pw' -u me",
+                "az login --password '[가림]' -u me",
+            ),
+            (
+                "x --passwd p --secret s",
+                "x --passwd [가림] --secret [가림]",
+            ),
+            (
+                "gh --api-key k1 --access-token t1",
+                "gh --api-key [가림] --access-token [가림]",
+            ),
+            ("tool --auth user:pw", "tool --auth [가림]"),
+            // mysql 계열의 붙여 쓴 -p
+            ("mysql -u root -pS3cret db", "mysql -u root -p[가림] db"),
+            ("mysqldump -pS3cret --all", "mysqldump -p[가림] --all"),
+            (
+                "MYSQLADMIN -h x -pabc status",
+                "MYSQLADMIN -h x -p[가림] status",
+            ),
+            // -u·--user 다음 이름:비밀
+            (
+                "curl -u admin:Hunter2 https://x",
+                "curl -u admin:[가림] https://x",
+            ),
+            ("curl --user admin:Hunter2", "curl --user admin:[가림]"),
+            ("curl --user=admin:Hunter2", "curl --user=admin:[가림]"),
+            ("curl -u 'admin:Hunter2' x", "curl -u 'admin:[가림]' x"),
+            // 머리 값(닫는 따옴표는 남긴다)
+            (
+                "curl -H 'Authorization: Basic dXNlcjpwYXNz' x",
+                "curl -H 'Authorization: Basic [가림]' x",
+            ),
+            ("Authorization: abc123", "Authorization: [가림]"),
+            (
+                "curl -H 'Cookie: session=abc; theme=dark' x",
+                "curl -H 'Cookie: [가림]' x",
+            ),
+            ("Set-Cookie: sid=1; HttpOnly", "Set-Cookie: [가림]"),
+            (r#"{"cookie":"a=b","n":1}"#, r#"{"cookie":"[가림]","n":1}"#),
+            (
+                "curl -H 'X-Api-Key: abc' x",
+                "curl -H 'X-Api-Key: [가림]' x",
+            ),
+            (
+                "curl -H \"X-Api-Key: abc\" x",
+                "curl -H \"X-Api-Key: [가림]\" x",
+            ),
+            // 접두어
+            ("npm_abcdefghijklmnopqrstuvwxyz0123456789", MASK),
+            ("t dckr_pat_abcdefghijklmnopqrstuvwx", "t [가림]"),
+            ("glpat-abcdefghijklmnopqrst", MASK),
+            ("sk_live_abcdefghij0123 x", "[가림] x"),
+            ("rk_live_abcdefghij0123", MASK),
+            ("xoxb-1234567890-abcdefghij", MASK),
+            (
+                "curl https://hooks.slack.com/services/T000/B000/XXXXyyyy -d x",
+                "curl https://hooks.slack.com/services/[가림] -d x",
+            ),
+            // 키 이름 규칙: pw·pwd(정확히), auth_key, credential(s)
+            ("PW=hunter2 run", "PW=[가림] run"),
+            ("pwd=hunter2", "pwd=[가림]"),
+            ("--pw=hunter2", "--pw=[가림]"),
+            ("auth_key=abc", "auth_key=[가림]"),
+            ("credentials=abc", "credentials=[가림]"),
+            ("aws_credential: abc", "aws_credential: [가림]"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(mask(input), want, "input: {input}");
+            assert_eq!(mask(want), want, "idempotent: {want}");
+        }
+        let jwt_line = format!("Bearer? no: token {jwt} end");
+        assert_eq!(mask(&jwt_line), "Bearer? no: token [가림] end");
+        assert_eq!(mask(jwt), MASK);
+    }
+
+    /// §14.5의 평범한 글은 그대로다.
+    #[test]
+    fn r5_rules_keep_ordinary_text() {
+        for s in [
+            "mkdir -p dir",
+            "cp -pr a b",
+            "npm test --token-limit 5",
+            "git commit --author \"Me <me@x>\"",
+            "mysql -p",
+            "mysql -P 3306 db",
+            "ssh -p 2222 host",
+            "curl -u admin https://x",
+            "docker run -u 1000:1000 img",
+            "npm_config_registry=https://r",
+            "the pwd command prints",
+            "upward=3",
+            "cookies: 3",
+            "Authorization:",
+            "eyJ only",
+        ] {
+            assert_eq!(mask(s), s, "should stay: {s}");
+        }
+    }
+
+    /// §14.5 규칙도 두 번 가려도 같고 공백 접기 전후에 같다.
+    #[test]
+    fn r5_rules_are_idempotent_and_whitespace_stable() {
+        let parts = [
+            "--password",
+            "--token",
+            " ",
+            "\n",
+            "x",
+            "'",
+            "\"",
+            "mysql",
+            "-pS",
+            "-u",
+            "a:b",
+            "Cookie: ",
+            "Authorization: Basic ",
+            "eyJabcdef.eyJabcdef.zz",
+            "pw=",
+            ";",
+        ];
+        for a in parts {
+            for b in parts {
+                for c in parts {
+                    for d in parts {
+                        let s = format!("{a}{b}{c}{d}");
+                        let once = mask(&s);
+                        assert_eq!(mask(&once), once, "idempotent: {s:?}");
+                        assert_eq!(
+                            collapse_ws(&mask(&collapse_ws(&s))),
+                            collapse_ws(&once),
+                            "collapse-stable: {s:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// 조각을 이어 붙인 글 모두에서: 두 번 가려도 같고, 공백 접기 전후에 가린 결과가 같다

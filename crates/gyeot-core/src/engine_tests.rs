@@ -261,12 +261,13 @@ fn permission_request_enriches_within_ten_seconds() {
     assert_eq!(it.title, "권한 승인 대기 · Bash");
     assert_eq!(it.body, "npm install --save-dev vitest");
 
-    // 10초를 넘기면 보강하지 않는다
+    // 10초를 넘겨도, 10초 안의 요청이 없으면 가장 최근에 열린 요청에 붙는다(§14.2)
     let mut h = H::new();
     h.apply(perm_request(T0, "Bash", "npm install"));
     h.apply(perm_prompt(T0 + 11 * SEC));
     let it = h.get(ItemKind::Approval, T0 + 11 * SEC).unwrap();
-    assert_eq!(it.title, "권한 승인 대기");
+    assert_eq!(it.title, "권한 승인 대기 · Bash");
+    assert_eq!(it.body, "npm install");
 
     // 알림이 먼저 와도 10초 안의 요청으로 보강한다(같은 서명, 새 전달 없음)
     let mut h = H::new();
@@ -962,32 +963,95 @@ fn approval_without_activity_never_interrupts() {
     assert!(d[0].reasons.iter().all(|r| r != NO_ACTIVITY_LINE));
 }
 
+const QUIET_MERGE_LINE: &str =
+    "승인 알림 없이 끝난 병합 요청이에요. 이미 답하신 것 같아 표정으로만 알려요";
+
+/// R5 M2(계약 §14.3, G-038): 알림 없이 끝난 병합 보류는 말풍선 없이 연다(작업 신호·소리 설정과 상관없이).
 #[test]
-fn merge_without_activity_never_interrupts() {
+fn merge_hold_without_prompt_is_ambient() {
     let five_hours = 5 * 3_600_000;
-    let run = |with_activity: bool| {
-        let mut h = loud();
+    for (policy, with_activity) in [
+        (Policy::default(), false),
+        (Policy::default(), true),
+        (loud_policy(), true),
+    ] {
+        let mut h = H::with(policy);
         if with_activity {
             h.apply(tool(T0 - 10 * SEC, "Read"));
         }
         h.apply(perm_request(T0, "Bash", "git -C . push origin main"));
         let mut all = deliveries(&h.tick(T0 + 11 * SEC));
         assert_eq!(h.kinds(T0 + 11 * SEC), vec![ItemKind::Merge]);
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].reasons.iter().any(|r| r == QUIET_MERGE_LINE),
+            "{all:?}"
+        );
         let mut t = T0 + 11 * SEC;
         while t < T0 + five_hours {
             t += MIN;
             all.extend(deliveries(&h.tick(t)));
         }
-        all
-    };
-    let quiet = run(false);
-    assert!(!quiet.is_empty());
-    assert!(
-        quiet.iter().all(|d| d.level != Level::Interrupt),
-        "{quiet:?}"
-    );
-    let loud = run(true);
-    assert!(loud.iter().any(|d| d.level == Level::Interrupt), "{loud:?}");
+        assert!(all.iter().all(|d| d.level == Level::Ambient), "{all:?}");
+    }
+
+    // 실측 순서: PreToolUse → PermissionRequest(gh pr merge), 알림 없이 12초 뒤 PostToolUse
+    let mut h = H::new();
+    h.apply(hook(T0, "PreToolUse", json!({"tool_name": "Bash"})));
+    h.apply(perm_request(T0 + SEC, "Bash", "gh pr merge 12 --squash"));
+    let d = deliveries(&h.tick(T0 + 12 * SEC));
+    assert_eq!(h.kinds(T0 + 12 * SEC), vec![ItemKind::Merge]);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].level, Level::Ambient);
+    assert!(!d[0].speak);
+    let fx = h.apply(hook(
+        T0 + 13 * SEC,
+        "PostToolUse",
+        json!({"tool_name": "Bash"}),
+    ));
+    assert_eq!(removed(&fx), vec![item_id(S, ItemKind::Merge)]);
+    assert!(h.open(T0 + 13 * SEC).is_empty());
+
+    // 알림이 오면 지금처럼 승인으로 보강된다(말풍선)
+    let mut h = H::new();
+    h.apply(perm_request(T0, "Bash", "gh pr merge 12 --squash"));
+    let d = deliveries(&h.apply(perm_prompt(T0 + 6 * SEC)));
+    assert_eq!(h.kinds(T0 + 6 * SEC), vec![ItemKind::Approval]);
+    assert_eq!(d[0].level, Level::Nudge);
+    h.tick(T0 + 20 * SEC);
+    assert_eq!(h.kinds(T0 + 20 * SEC), vec![ItemKind::Approval]);
+}
+
+/// R5 M3(계약 §14.4, G-039): 소리는 대기 시간으로 생기지 않는다. 10시간 전의 질문도 말풍선까지.
+#[test]
+fn waiting_bonus_never_makes_sound() {
+    for p in [Policy::default(), loud_policy()] {
+        let mut h = H::with(p);
+        h.apply(hook_in(
+            T0 + 10 * 3_600_000,
+            "other",
+            "/w/o",
+            9,
+            "Stop",
+            json!({}),
+        ));
+        let fx = h.apply(stop(T0, "다 했어요. 다른 것도 도와드릴까요?"));
+        let d = deliveries(&fx);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            h.get(ItemKind::Decision, T0 + 10 * 3_600_000)
+                .unwrap()
+                .score
+                >= 95.0
+        );
+        assert_eq!(d[0].level, Level::Nudge, "{d:?}");
+        assert!(!d[0].speak);
+        let later = deliveries(&h.tick(T0 + 40 * 3_600_000));
+        assert!(
+            later.iter().all(|x| x.level != Level::Interrupt),
+            "{later:?}"
+        );
+    }
 }
 
 /// `PostToolBatch`는 도구 이름이 없으니 그 세션의 승인·병합(도구를 아는 것도)을 닫는다(§12.3).
@@ -1130,7 +1194,7 @@ fn agentless_notification_keeps_approval_agent() {
     h.apply(batch(Some("a1"), T0 + 4 * SEC, &["Bash"]));
     assert!(h.open(T0 + 4 * SEC).is_empty());
 
-    // 열린 승인(a1)에 다른 에이전트(a2)의 요청은 섞지 않는다: 보강하지 않고 보류로 둔다
+    // 다른 에이전트(a2)의 요청은 a1의 요청을 채우지 않고 따로 센다(§14.2). 항목은 가장 최근 요청을 보인다
     let mut h = H::new();
     h.apply(by(
         Some("a1"),
@@ -1140,61 +1204,269 @@ fn agentless_notification_keeps_approval_agent() {
     ));
     h.apply(sub_perm_request(Some("a2"), T0 + 2 * SEC, "Edit", "x"));
     let it = h.get(ItemKind::Approval, T0).unwrap();
-    assert_eq!(it.title, "권한 승인 대기");
-    // 그 뒤 agent_id 없는 알림도 a1의 승인에 붙으므로 a2의 요청으로 보강하지 않는다
+    assert_eq!(it.title, "권한 승인 대기 · Edit");
+    assert_eq!(it.body, "x 외 1건");
+    // agent_id 없는 알림은 10초 안의 가장 최근 요청(a2)에 붙는다
     h.apply(perm_prompt(T0 + 3 * SEC));
-    let it = h.get(ItemKind::Approval, T0 + 3 * SEC).unwrap();
-    assert_eq!(it.title, "권한 승인 대기");
+    // a1의 묶음은 a1의 요청(도구 모름)만 지운다. a2가 남아 있어 닫히지 않는다
     h.apply(batch(Some("a1"), T0 + 4 * SEC, &["Read"]));
-    assert!(
-        h.open(T0 + 4 * SEC).is_empty(),
-        "a1 승인은 도구 모름 → 닫힘"
-    );
+    let it = h.get(ItemKind::Approval, T0 + 4 * SEC).unwrap();
+    assert_eq!(it.state, ItemState::Open);
+    assert_eq!(it.body, "x");
+    h.apply(batch(Some("a2"), T0 + 5 * SEC, &["Edit"]));
+    assert!(h.open(T0 + 5 * SEC).is_empty());
 }
 
-/// R3 L1(계약 §13.2): 같은 세션·같은 에이전트·같은 도구의 `PostToolUseFailure`도 승인 대기를 닫는다.
+fn fail_in(agent: Option<&str>, ts: i64, tool: &str, input: Value) -> Event {
+    by(
+        agent,
+        ts,
+        "PostToolUseFailure",
+        json!({"tool_name": tool, "error": "exit 1", "tool_input": input}),
+    )
+}
+
+/// R3 L1·R5 M1a·R3 회귀 N2(계약 §14.2): `PostToolUseFailure`는 같은 에이전트·같은 도구이고
+/// **미리보기가 같은** 요청만 지운다. 같은 도구의 다른 호출이 실패해도 진짜 대기는 남는다.
 #[test]
-fn tool_failure_closes_same_agent_same_tool() {
-    let fail = |agent: Option<&str>, ts: i64, tool: &str| {
-        by(
-            agent,
-            ts,
-            "PostToolUseFailure",
-            json!({"tool_name": tool, "error": "denied"}),
-        )
-    };
+fn tool_failure_removes_only_the_same_call() {
+    let cmd = |c: &str| json!({ "command": c });
+    // R5 M1a: Bash(cat /etc/outside.conf) 대기 중 다른 Bash(grep … missing.txt)의 실패
     let mut h = H::new();
-    h.apply(sub_perm_request(Some("a1"), T0, "Bash", "npm install"));
+    h.apply(perm_request(T0, "Bash", "cat /etc/outside.conf"));
     h.apply(perm_prompt(T0 + SEC));
-    h.apply(fail(Some("a2"), T0 + 2 * SEC, "Bash"));
-    h.apply(fail(None, T0 + 2 * SEC, "Bash"));
-    h.apply(fail(Some("a1"), T0 + 2 * SEC, "Read"));
+    for ev in [
+        fail_in(None, T0 + 2 * SEC, "Bash", cmd("grep foo missing.txt")),
+        fail_in(
+            Some("a2"),
+            T0 + 2 * SEC,
+            "Bash",
+            cmd("cat /etc/outside.conf"),
+        ),
+        fail_in(None, T0 + 2 * SEC, "Read", cmd("cat /etc/outside.conf")),
+        fail_in(None, T0 + 2 * SEC, "Bash", json!({})),
+        by(
+            None,
+            T0 + 2 * SEC,
+            "PostToolUseFailure",
+            json!({"tool_name": "Bash"}),
+        ),
+    ] {
+        let fx = h.apply(ev);
+        assert!(removed(&fx).is_empty(), "{fx:?}");
+    }
     assert_eq!(h.kinds(T0 + 2 * SEC), vec![ItemKind::Approval]);
-    let fx = h.apply(fail(Some("a1"), T0 + 3 * SEC, "Bash"));
+    let fx = h.apply(fail_in(
+        None,
+        T0 + 3 * SEC,
+        "Bash",
+        cmd("cat /etc/outside.conf"),
+    ));
     assert_eq!(removed(&fx), vec![item_id(S, ItemKind::Approval)]);
+
+    // R3 회귀 N2: WebFetch(a) 대기 중 WebFetch(b) 실패
+    let mut h = H::new();
+    h.apply(by(
+        None,
+        T0,
+        "PermissionRequest",
+        json!({"tool_name": "WebFetch", "tool_input": {"url": "https://a.example/", "prompt": "p"}}),
+    ));
+    h.apply(perm_prompt(T0 + SEC));
+    h.apply(fail_in(
+        None,
+        T0 + 2 * SEC,
+        "WebFetch",
+        json!({"url": "https://b.example/", "prompt": "p"}),
+    ));
+    assert_eq!(h.kinds(T0 + 2 * SEC), vec![ItemKind::Approval]);
+    h.apply(fail_in(
+        None,
+        T0 + 3 * SEC,
+        "WebFetch",
+        json!({"url": "https://a.example/", "prompt": "q"}),
+    ));
     assert!(h.open(T0 + 3 * SEC).is_empty());
 
-    // 주 에이전트도 같다(옛 설치: agent_id 없음)
-    let mut h = H::new();
-    h.apply(perm_request(T0, "Bash", "npm install"));
-    h.apply(perm_prompt(T0 + SEC));
-    h.apply(fail(None, T0 + 2 * SEC, "Bash"));
-    assert!(h.open(T0 + 2 * SEC).is_empty());
-
-    // 열린 병합 항목과 보류 중인 병합 요청도
+    // 하위 에이전트, 보류 중인 병합 요청과 열린 병합 항목도 같은 규칙
     let mut h = H::new();
     h.apply(sub_perm_request(Some("a1"), T0, "Bash", "gh pr merge 3"));
     h.tick(T0 + 11 * SEC);
     assert_eq!(h.kinds(T0 + 11 * SEC), vec![ItemKind::Merge]);
-    h.apply(fail(Some("a2"), T0 + 12 * SEC, "Bash"));
+    h.apply(fail_in(
+        Some("a2"),
+        T0 + 12 * SEC,
+        "Bash",
+        cmd("gh pr merge 3"),
+    ));
+    h.apply(fail_in(
+        Some("a1"),
+        T0 + 12 * SEC,
+        "Bash",
+        cmd("gh pr merge 4"),
+    ));
     assert_eq!(h.kinds(T0 + 12 * SEC), vec![ItemKind::Merge]);
-    h.apply(fail(Some("a1"), T0 + 13 * SEC, "Bash"));
+    h.apply(fail_in(
+        Some("a1"),
+        T0 + 13 * SEC,
+        "Bash",
+        cmd("gh pr merge 3"),
+    ));
     assert!(h.open(T0 + 13 * SEC).is_empty());
     let mut h = H::new();
     h.apply(sub_perm_request(Some("a1"), T0, "Bash", "git merge topic"));
-    h.apply(fail(Some("a1"), T0 + 2 * SEC, "Bash"));
+    h.apply(fail_in(
+        Some("a1"),
+        T0 + 2 * SEC,
+        "Bash",
+        cmd("git merge topic"),
+    ));
     h.tick(T0 + 20 * SEC);
     assert!(h.open(T0 + 20 * SEC).is_empty());
+}
+
+/// R3 회귀 N1(계약 §14.2, G-037): 겹친 승인 가운데 하나가 끝나도 남은 대기는 열려 있다.
+#[test]
+fn overlapping_requests_keep_approval_until_all_done() {
+    let mut h = H::new();
+    h.apply(sub_perm_request(Some("a1"), T0, "Bash", "npm run build"));
+    h.apply(perm_prompt(T0 + SEC));
+    // 사람이 승인하고 a1의 빌드가 도는 동안 a2가 Edit를 요청, 알림(agent_id 없음)은 그 뒤
+    let fx = h.apply(sub_perm_request(
+        Some("a2"),
+        T0 + 9 * SEC,
+        "Edit",
+        "src/a.rs",
+    ));
+    assert!(deliveries(&fx).is_empty());
+    let it = h.get(ItemKind::Approval, T0 + 9 * SEC).unwrap();
+    assert_eq!(it.title, "권한 승인 대기 · Edit");
+    assert_eq!(it.body, "src/a.rs 외 1건");
+    let fx = h.apply(perm_prompt(T0 + 15 * SEC));
+    assert_eq!(deliveries(&fx).len(), 1);
+    // a1의 묶음이 끝나도 a2가 아직 기다린다
+    let fx = h.apply(batch(Some("a1"), T0 + 60 * SEC, &["Bash"]));
+    assert!(removed(&fx).is_empty(), "{fx:?}");
+    let it = h.get(ItemKind::Approval, T0 + 60 * SEC).unwrap();
+    assert_eq!(it.state, ItemState::Open);
+    assert_eq!(it.title, "권한 승인 대기 · Edit");
+    assert_eq!(it.body, "src/a.rs");
+    assert!(upserts(&fx).iter().any(|i| i.body == "src/a.rs"), "{fx:?}");
+    let fx = h.apply(batch(Some("a2"), T0 + 70 * SEC, &["Edit"]));
+    assert_eq!(removed(&fx), vec![item_id(S, ItemKind::Approval)]);
+
+    // 같은 에이전트의 병렬 호출: 묶음은 이름마다 하나씩 지운다
+    let mut h = H::new();
+    h.apply(perm_request(T0, "Bash", "npm test"));
+    h.apply(perm_request(T0 + SEC, "Bash", "npm run lint"));
+    h.apply(perm_request(T0 + 2 * SEC, "Bash", "npm run build"));
+    h.apply(perm_prompt(T0 + 3 * SEC));
+    assert_eq!(
+        h.get(ItemKind::Approval, T0).unwrap().body,
+        "npm run build 외 2건"
+    );
+    h.apply(batch(None, T0 + 4 * SEC, &["Bash", "Bash"]));
+    assert_eq!(h.kinds(T0 + 4 * SEC), vec![ItemKind::Approval]);
+    // 도구 이름 하나짜리 작업 신호는 하나만 지운다
+    h.apply(tool(T0 + 5 * SEC, "Bash"));
+    assert!(h.open(T0 + 5 * SEC).is_empty());
+
+    // 도구 목록이 없는 묶음은 그 에이전트의 요청을 모두 지운다
+    let mut h = H::new();
+    h.apply(perm_request(T0, "Bash", "a"));
+    h.apply(perm_request(T0 + SEC, "Edit", "b"));
+    h.apply(perm_prompt(T0 + 2 * SEC));
+    h.apply(batch(None, T0 + 3 * SEC, &[]));
+    assert!(h.open(T0 + 3 * SEC).is_empty());
+}
+
+/// R5 M1b(계약 §14.2): 하위 에이전트의 묶음이 주 에이전트의 대기를 닫지 않는다.
+#[test]
+fn subagent_batch_keeps_main_agent_wait() {
+    let mut h = H::new();
+    h.apply(sub_perm_request(Some("sub1"), T0, "Bash", "make"));
+    h.apply(perm_prompt(T0 + SEC));
+    h.apply(perm_request(T0 + 20 * SEC, "Edit", "README.md"));
+    h.apply(perm_prompt(T0 + 21 * SEC));
+    h.apply(batch(Some("sub1"), T0 + 30 * SEC, &["Bash"]));
+    let it = h.get(ItemKind::Approval, T0 + 30 * SEC).unwrap();
+    assert_eq!(it.state, ItemState::Open);
+    assert_eq!(it.title, "권한 승인 대기 · Edit");
+    h.apply(batch(None, T0 + 40 * SEC, &["Edit"]));
+    assert!(h.open(T0 + 40 * SEC).is_empty());
+}
+
+/// R5 L1·R3 회귀 N3(계약 §14.2): 턴 끝(`stop`)·`prompt`는 주 에이전트 요청만 지운다.
+/// 하위 에이전트의 요청은 그 에이전트의 `SubagentStop`이 지운다.
+#[test]
+fn turn_end_and_subagent_stop_remove_their_own_requests() {
+    // 백그라운드 하위 에이전트의 승인은 주 에이전트의 턴 끝·입력으로 닫히지 않는다
+    let mut h = H::new();
+    h.apply(sub_perm_request(Some("bg1"), T0, "Bash", "sleep 100"));
+    h.apply(perm_prompt(T0 + SEC));
+    h.apply(stop(T0 + 2 * SEC, "백그라운드로 돌려 두었어요."));
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Open));
+    h.apply(prompt(T0 + 3 * SEC));
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Open));
+    // 다른 에이전트의 SubagentStop은 지우지 않는다
+    h.apply(by(Some("bg2"), T0 + 4 * SEC, "SubagentStop", json!({})));
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Open));
+    let fx = h.apply(by(
+        Some("bg1"),
+        T0 + 5 * SEC,
+        "SubagentStop",
+        json!({"agent_type": "x"}),
+    ));
+    assert_eq!(removed(&fx), vec![item_id(S, ItemKind::Approval)]);
+
+    // 주 에이전트의 요청은 턴 끝에 지운다(하위 에이전트의 것은 남는다)
+    let mut h = H::new();
+    h.apply(perm_request(T0, "Bash", "ls"));
+    h.apply(sub_perm_request(Some("a1"), T0 + SEC, "Edit", "x"));
+    h.apply(perm_prompt(T0 + 2 * SEC));
+    h.apply(stop(T0 + 3 * SEC, "멈췄어요."));
+    let it = h.get(ItemKind::Approval, T0 + 3 * SEC).unwrap();
+    assert_eq!(it.state, ItemState::Open);
+    assert_eq!(it.title, "권한 승인 대기 · Edit");
+    assert_eq!(it.body, "x");
+    // agent_id 없는 SubagentStop은 아무것도 지우지 않는다
+    h.apply(by(None, T0 + 4 * SEC, "SubagentStop", json!({})));
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Open));
+    h.apply(by(Some("a1"), T0 + 5 * SEC, "SubagentStop", json!({})));
+    assert_eq!(h.state(ItemKind::Approval), Some(ItemState::Closed));
+}
+
+/// R3 회귀 N4(계약 §14.2): 잘린 입력에서 건진 묶음(`gyeot_partial`)은 요청을 지우지 않고 작업 신호로만 센다.
+#[test]
+fn partial_batch_only_counts_as_work() {
+    let mut h = loud();
+    h.apply(perm_request(T0, "Bash", "npm i"));
+    h.apply(perm_prompt(T0 + SEC));
+    let fx = h.apply(hook(
+        T0 + 2 * SEC,
+        "PostToolBatch",
+        json!({"gyeot_partial": true}),
+    ));
+    assert!(removed(&fx).is_empty(), "{fx:?}");
+    assert_eq!(h.kinds(T0 + 2 * SEC), vec![ItemKind::Approval]);
+    // 작업 신호로는 센다: 그 세션은 이제 소리 후보(§12.3 안전장치가 풀림)
+    let d = deliveries(&h.tick(T0 + SEC + 2 * MIN + 1));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].level, Level::Interrupt);
+}
+
+/// 요청 목록은 세션마다 64개까지만 기억한다(오래된 것부터 버린다).
+#[test]
+fn request_list_is_capped() {
+    let mut h = H::new();
+    for i in 0..70 {
+        h.apply(perm_request(T0 + i * SEC, "Bash", &format!("cmd {i}")));
+    }
+    h.apply(perm_prompt(T0 + 70 * SEC));
+    assert_eq!(
+        h.get(ItemKind::Approval, T0).unwrap().body,
+        "cmd 69 외 63건"
+    );
 }
 
 /// 병합: 보류 창이 지나 열린 병합은 요청한 에이전트를 기억한다. 다른 에이전트의 신호는 보류도 지우지 않는다.

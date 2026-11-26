@@ -38,16 +38,19 @@ pub fn batch_tool_names(o: &Map<String, Value>) -> Vec<&str> {
     }
 }
 
-/// 도구 이름 목록: 비지 않은 이름 앞 64개를 미리보기(80자)로 바꾸고 겹친 것은 뺀다(처음 순서).
+/// 도구 이름 목록: 비지 않은 이름 앞 64개를 미리보기(80자)로 바꾼다. 이름마다 요청 하나를 지우므로(§14.2)
+/// 겹친 이름도 그대로 둔다(처음 순서).
 pub fn tool_list<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for n in names.filter(|n| !n.trim().is_empty()).take(TOOL_CALLS_MAX) {
-        let p = preview(n, TOOL_NAME_MAX);
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    }
-    out
+    names
+        .filter(|n| !n.trim().is_empty())
+        .take(TOOL_CALLS_MAX)
+        .map(|n| preview(n, TOOL_NAME_MAX))
+        .collect()
+}
+
+/// 심이 잘린 입력에서 건진 페이로드인가(`"gyeot_partial": true`, §14.2).
+pub fn is_partial(o: &Map<String, Value>) -> bool {
+    o.get("gyeot_partial").and_then(Value::as_bool) == Some(true)
 }
 
 /// 원본 페이로드를 정규화한다. 버릴 것이면 빈 목록이다.
@@ -263,15 +266,19 @@ fn hook_event(raw: &Value, source: Source, agent: Agent) -> Option<Event> {
                 &o.get("error").and_then(text_of).unwrap_or_default(),
                 SHORT_MAX,
             ),
+            // 승인 요청과 같은 식의 미리보기(같은 호출인지 맞춰 본다, §14.2).
+            preview: tool_preview(o.get("tool_input")),
         },
         "PreToolUse" | "PostToolUse" | "UserPromptExpansion" => EventBody::Activity {
             tool: s(o, "tool_name").map(|t| preview(t, TOOL_NAME_MAX)),
             tools: Vec::new(),
+            partial: is_partial(o),
         },
         // 묶음의 도구 이름들(§13.2). 목록이 없으면 '모르는 도구'다(G-016).
         "PostToolBatch" => EventBody::Activity {
             tool: s(o, "tool_name").map(|t| preview(t, TOOL_NAME_MAX)),
             tools: tool_list(batch_tool_names(o).into_iter()),
+            partial: is_partial(o),
         },
         "TaskCompleted" => EventBody::TaskDone {
             subject: preview(
@@ -694,11 +701,59 @@ mod tests {
             "PostToolUseFailure",
             json!({"tool_name": "Bash", "error": err, "tool_input": {"command": "x"}}),
         ));
-        let EventBody::ToolFailed { tool, error } = ev.body else {
+        let EventBody::ToolFailed {
+            tool,
+            error,
+            preview,
+        } = ev.body
+        else {
             panic!()
         };
         assert_eq!(tool, "Bash");
         assert_eq!(error.chars().count(), 120);
+        // §14.2: 실패한 호출의 미리보기(승인 요청과 맞춰 본다)
+        assert_eq!(preview, "x");
+        let ev = one(hook(
+            "PostToolUseFailure",
+            json!({"tool_name": "WebFetch", "error": "e", "tool_input": {"url": "https://b.example/x", "prompt": "p"}}),
+        ));
+        assert!(
+            matches!(ev.body, EventBody::ToolFailed { ref preview, .. } if preview == "https://b.example/x")
+        );
+        // 미리보기가 없으면 JSON에 키가 없다(옛 로그와 같은 모양)
+        let ev = one(hook("PostToolUseFailure", json!({"tool_name": "Bash"})));
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["detail"], json!({"tool": "Bash", "error": ""}));
+    }
+
+    /// §14.2: 심이 잘린 입력에서 건진 페이로드(`gyeot_partial`)의 activity는 `partial`이다.
+    #[test]
+    fn partial_payload_marks_activity() {
+        let ev = one(hook(
+            "PostToolBatch",
+            json!({"gyeot_partial": true, "tool_name": "Bash"}),
+        ));
+        assert_eq!(
+            ev.body,
+            EventBody::Activity {
+                tool: Some("Bash".into()),
+                tools: vec![],
+                partial: true
+            }
+        );
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["detail"], json!({"tool": "Bash", "partial": true}));
+        for extra in [
+            json!({}),
+            json!({"gyeot_partial": false}),
+            json!({"gyeot_partial": "true"}),
+        ] {
+            let ev = one(hook("PostToolBatch", extra));
+            assert!(matches!(
+                ev.body,
+                EventBody::Activity { partial: false, .. }
+            ));
+        }
     }
 
     #[test]
@@ -714,7 +769,8 @@ mod tests {
                 ev.body,
                 EventBody::Activity {
                     tool: Some("Read".into()),
-                    tools: vec![]
+                    tools: vec![],
+                    partial: false,
                 },
                 "{name}"
             );
@@ -724,7 +780,8 @@ mod tests {
             ev.body,
             EventBody::Activity {
                 tool: None,
-                tools: vec![]
+                tools: vec![],
+                partial: false,
             }
         );
     }
@@ -799,11 +856,13 @@ mod tests {
             ev.body,
             EventBody::Activity {
                 tool: None,
-                tools: vec!["Read".into(), "Bash".into()]
+                tools: vec!["Read".into(), "Bash".into(), "Read".into()],
+                partial: false,
             }
         );
+        // 이름마다 요청 하나를 지우므로 겹친 이름도 그대로 센다(§14.2)
         let v = serde_json::to_value(&ev).unwrap();
-        assert_eq!(v["detail"], json!({"tools": ["Read", "Bash"]}));
+        assert_eq!(v["detail"], json!({"tools": ["Read", "Bash", "Read"]}));
         // 64개까지만 본다
         let calls: Vec<Value> = (0..100)
             .map(|i| json!({"tool_name": format!("T{i}")}))
@@ -823,7 +882,8 @@ mod tests {
             ev.body,
             EventBody::Activity {
                 tool: Some("Read".into()),
-                tools: vec![]
+                tools: vec![],
+                partial: false,
             }
         );
     }

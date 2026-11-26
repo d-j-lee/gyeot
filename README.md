@@ -50,14 +50,14 @@ Claude Code·Codex 생태계 위에 얹는 **AI 동료 아바타**다. 여러 AI
 
 | 무엇 | 어디서 | 결과 |
 |---|---|---|
-| 코어·서버·데몬·훅 심 | Linux, `cargo test --workspace` | 239 통과. clippy `-D warnings` 0건(Linux·Windows 대상), wasm32 빌드 확인 |
-| 얼굴 | Linux, vitest | 313 통과. 세션 열쇠·fetch SSE 해석기·401 처리, 결정 카드 안내, 색 대비 WCAG AA, 가짜 데몬(mock)의 보안 규칙 포함 |
+| 코어·서버·데몬·훅 심 | Linux, `cargo test --workspace` | 256 통과. clippy `-D warnings` 0건(Linux·Windows 대상), wasm32 빌드 확인 |
+| 얼굴 | Linux, vitest | 339 통과. 세션 열쇠·보내기 전 상대 확인·fetch SSE 해석기·401 처리, 결정 카드 안내, 색 대비 WCAG AA, 가짜 데몬(mock)의 보안 규칙 포함 |
 | channel | Linux, vitest(묶은 파일을 실제로 띄움) | 53 통과. 데몬 확인(hello) 포함. Node 22 |
-| 셸 | Linux(WebKitGTK), cargo test | 72 통과. IPC 권한(ACL)·데몬 확인·부트 흐름 시험 포함. Windows 대상 clippy 0건 |
+| 셸 | Linux(WebKitGTK), cargo test | 82 통과. IPC 권한(ACL)·데몬 확인·부트 흐름·데몬이 멈추면 바로 닫기 시험 포함. Windows 대상 clippy 0건 |
 | 설치 스크립트 | pwsh 7.4 | 128 통과, Windows 전용 폴더 권한 시험 1개는 CI(Windows)에서 |
-| **끝-끝(가짜 없음)** | Linux, `tests/e2e/e2e.mjs` | 62/62. 실제 데몬·훅 심·channel·얼굴(Chrome)을 이음. 세션 열쇠·데몬 확인·포트를 가로챈 가짜 서버·스풀 줄이기 포함 |
+| **끝-끝(가짜 없음)** | Linux, `tests/e2e/e2e.mjs` | 64/64. 실제 데몬·훅 심·channel·얼굴(Chrome)을 이음. 세션 열쇠·데몬 확인·포트를 가로챈 가짜 서버(훅·`--open`·열린 얼굴 모두 열쇠 0건)·스풀 줄이기 포함 |
 | Windows 빌드·시험·끝-끝·설치본 | GitHub Actions(windows-latest) | 이 판의 결과는 `docs/field-notes.md` |
-| 독립 적대 검증 | 작업 맥락을 모르는 에이전트 | 네 라운드(R1·R2·R3, 고친 뒤 재검증). 기록은 `docs/field-notes.md` |
+| 독립 적대 검증 | 작업 맥락을 모르는 에이전트 | 여러 라운드(새 눈 3번·회귀 재검증 3번). 기록은 `docs/field-notes.md` |
 | 실제 Claude Code 훅·channel, WebView2·음성, 클릭 통과 체감 | 사용자 Windows | **실측 전** — `docs/roadmap.md` F1–F12 |
 
 변이 시험(고친 동작을 되돌리면 시험이 실패하는지)을 부품마다 돌렸다. 기록은 `docs/field-notes.md`에 있다.

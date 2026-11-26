@@ -171,16 +171,24 @@ pub enum EventBody {
         /// 오류(120자).
         #[serde(default)]
         error: String,
+        /// 실패한 호출의 미리보기(`tool_input`, 마스킹·300자, §14.2). 승인 요청과 맞춰 볼 때만 쓴다.
+        /// 비었으면 JSON에 쓰지 않는다(옛 로그와 같은 모양).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        preview: String,
     },
     /// 작업 중 신호.
     Activity {
         /// 도구 이름.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<String>,
-        /// `PostToolBatch`의 도구 이름 목록(`tool_calls[].tool_name`, 겹침 없이 64개까지, §13.2).
-        /// 비었으면 JSON에 쓰지 않는다(옛 로그와 같은 모양).
+        /// `PostToolBatch`의 도구 이름 목록(`tool_calls[].tool_name`, 앞 64개, §13.2). 이름마다 요청 하나를
+        /// 지우므로 겹친 이름도 그대로 둔다(§14.2). 비었으면 JSON에 쓰지 않는다(옛 로그와 같은 모양).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tools: Vec<String>,
+        /// 심이 잘린 입력에서 건진 페이로드인가(`gyeot_partial`, §14.2). 그렇다면 요청을 지우지 않고
+        /// 작업 신호로만 센다. 거짓이면 JSON에 쓰지 않는다.
+        #[serde(default, skip_serializing_if = "is_false")]
+        partial: bool,
     },
     /// 하위 에이전트 시작.
     SubagentStart {
@@ -375,11 +383,16 @@ impl EventBody {
             }
             EventBody::TurnDone { last_message, .. } => p(last_message, 280),
             EventBody::TurnFailed { error_type } => p(error_type, 120),
-            EventBody::ToolFailed { tool, error } => {
+            EventBody::ToolFailed {
+                tool,
+                error,
+                preview: pv,
+            } => {
                 p(tool, 80);
                 p(error, 120);
+                p(pv, 300);
             }
-            EventBody::Activity { tool, tools } => {
+            EventBody::Activity { tool, tools, .. } => {
                 po(tool, 80);
                 *tools = crate::normalize::tool_list(tools.iter().map(String::as_str));
             }
@@ -473,6 +486,12 @@ struct EventWire {
     raw_event: Option<String>,
     #[serde(default)]
     detail: Value,
+}
+
+// serde의 `skip_serializing_if`가 `&bool`을 넘긴다.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// `kind`와 `detail` 값으로 [`EventBody`]를 만든다. `detail`이 없거나 `null`이면 빈 객체로 본다.
@@ -570,7 +589,8 @@ mod tests {
             ev.body,
             EventBody::Activity {
                 tool: None,
-                tools: vec![]
+                tools: vec![],
+                partial: false,
             }
         );
         let v = serde_json::to_value(&ev).unwrap();
@@ -589,7 +609,8 @@ mod tests {
             ev.body,
             EventBody::Activity {
                 tool: None,
-                tools: vec![]
+                tools: vec![],
+                partial: false,
             }
         );
         // 옛 줄은 다시 써도 같은 모양(새 필드는 값이 있을 때만 쓴다)
@@ -604,7 +625,8 @@ mod tests {
             ev.body,
             EventBody::Activity {
                 tool: None,
-                tools: vec!["Read".into(), "Bash".into()]
+                tools: vec!["Read".into(), "Bash".into()],
+                partial: false,
             }
         );
         assert_eq!(
@@ -667,14 +689,22 @@ mod tests {
             EventBody::ToolFailed {
                 tool: "Bash".into(),
                 error: "e".into(),
+                preview: String::new(),
+            },
+            EventBody::ToolFailed {
+                tool: "Bash".into(),
+                error: "e".into(),
+                preview: "ls".into(),
             },
             EventBody::Activity {
                 tool: Some("Read".into()),
                 tools: vec![],
+                partial: false,
             },
             EventBody::Activity {
                 tool: None,
-                tools: vec!["Read".into(), "Bash".into()],
+                tools: vec!["Read".into(), "Bash".into(), "Read".into()],
+                partial: true,
             },
             EventBody::SubagentStart { agent_type: None },
             EventBody::SubagentStop {

@@ -37,6 +37,8 @@ struct Seen {
     /// `Authorization` 머리가 있었나.
     auth: bool,
     body: String,
+    /// 몇 번째로 받은 연결인가(같은 연결을 다시 썼는지 본다).
+    conn: usize,
 }
 
 struct FakeDaemon {
@@ -102,58 +104,67 @@ fn read_request(s: &mut TcpStream) -> Option<(String, Vec<String>, Vec<u8>)> {
     }
 }
 
+/// 답한다. 연결은 닫지 않는다(keep-alive, 진짜 데몬과 같이).
 fn respond(s: &mut TcpStream, status: &str, body: &str) {
     let _ = write!(
         s,
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
 }
 
-/// 진짜 `TcpListener`로 만든 작은 가짜 데몬. 연결마다 실을 하나 띄운다(시험이 끝나면 프로세스와 함께 사라진다).
+/// 진짜 `TcpListener`로 만든 작은 가짜 데몬. 연결마다 실을 하나 띄우고, 한 연결에서 요청을 여러 개 받는다
+/// (keep-alive). 시험이 끝나면 프로세스와 함께 사라진다.
 fn fake_daemon(token: &str, mode: Hello) -> FakeDaemon {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let (token, log) = (token.to_owned(), seen.clone());
     std::thread::spawn(move || {
-        for s in l.incoming() {
+        for (conn, s) in l.incoming().enumerate() {
             let Ok(mut s) = s else { continue };
             let (token, log) = (token.clone(), log.clone());
             std::thread::spawn(move || {
-                let Some((line, headers, body)) = read_request(&mut s) else {
-                    return;
-                };
-                let auth = headers.iter().any(|h| {
-                    h.split_once(':')
-                        .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
-                });
-                log.lock().unwrap().push(Seen {
-                    line: line.clone(),
-                    auth,
-                    body: String::from_utf8_lossy(&body).into_owned(),
-                });
-                if let Some(rest) = line.strip_prefix("GET /v1/hello?n=") {
-                    let n = rest.split(' ').next().unwrap_or("");
-                    let ok = |p: String| json!({"v": 1, "proof": p}).to_string();
-                    match mode {
-                        Hello::Good => respond(&mut s, "200 OK", &ok(hello_proof(&token, port, n))),
-                        Hello::WrongToken => {
-                            respond(&mut s, "200 OK", &ok(hello_proof(&"f".repeat(64), port, n)))
+                while let Some((line, headers, body)) = read_request(&mut s) {
+                    let auth = headers.iter().any(|h| {
+                        h.split_once(':')
+                            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
+                    });
+                    log.lock().unwrap().push(Seen {
+                        line: line.clone(),
+                        auth,
+                        body: String::from_utf8_lossy(&body).into_owned(),
+                        conn,
+                    });
+                    if let Some(rest) = line.strip_prefix("GET /v1/hello?n=") {
+                        let n = rest.split(' ').next().unwrap_or("");
+                        let ok = |p: String| json!({"v": 1, "proof": p}).to_string();
+                        match mode {
+                            Hello::Good => {
+                                respond(&mut s, "200 OK", &ok(hello_proof(&token, port, n)))
+                            }
+                            Hello::WrongToken => respond(
+                                &mut s,
+                                "200 OK",
+                                &ok(hello_proof(&"f".repeat(64), port, n)),
+                            ),
+                            Hello::OtherPort => respond(
+                                &mut s,
+                                "200 OK",
+                                &ok(hello_proof(&token, port.wrapping_add(1), n)),
+                            ),
+                            Hello::NotFound => respond(&mut s, "404 Not Found", "{}"),
+                            Hello::Garbage => respond(&mut s, "200 OK", "hello"),
+                            Hello::Stall => {
+                                std::thread::sleep(Duration::from_secs(3));
+                                return;
+                            }
                         }
-                        Hello::OtherPort => respond(
-                            &mut s,
-                            "200 OK",
-                            &ok(hello_proof(&token, port.wrapping_add(1), n)),
-                        ),
-                        Hello::NotFound => respond(&mut s, "404 Not Found", "{}"),
-                        Hello::Garbage => respond(&mut s, "200 OK", "hello"),
-                        Hello::Stall => std::thread::sleep(Duration::from_secs(3)),
+                    } else if line.starts_with("POST /v1/ingest/") {
+                        respond(&mut s, "202 Accepted", r#"{"accepted":1}"#);
+                    } else {
+                        respond(&mut s, "404 Not Found", "{}");
                     }
-                } else if line.starts_with("POST /v1/ingest/") {
-                    respond(&mut s, "202 Accepted", r#"{"accepted":1}"#);
-                } else {
-                    respond(&mut s, "404 Not Found", "{}");
                 }
             });
         }
@@ -480,6 +491,11 @@ fn proven_server_gets_payload_and_spool_is_drained() {
     assert!(posts.iter().all(|r| r.auth));
     assert!(posts[0].line.starts_with("POST /v1/ingest/claude-code "));
     assert!(posts[1].line.starts_with("POST /v1/ingest/codex-notify "));
+    // R5 L3: 확인한 연결로 보낸다(확인·전송·스풀 비우기가 한 연결)
+    assert!(
+        posts.iter().all(|r| r.conn == hellos[0].conn),
+        "다른 연결로 보냈다: {seen:?}"
+    );
     assert!(
         spool_files(d.path()).is_empty(),
         "{:?}",
@@ -495,6 +511,43 @@ fn proven_server_gets_payload_and_spool_is_drained() {
         .collect();
     assert_eq!(hellos.len(), 2);
     assert_ne!(hellos[0], hellos[1]);
+}
+
+/// R3 회귀 N4(계약 §14.2): 1 MiB가 넘는 `PostToolBatch`. 심은 최상위 필드만 건지고(중첩된
+/// `tool_calls[0].tool_name`을 최상위로 잡지 않는다) `gyeot_partial`을 붙인다. 잘린 뒤쪽의 `agent_id`는 잃는다.
+/// 보내든 스풀에 두든(큰 입력을 읽느라 통신 시간이 모자랄 수 있다) 줄인 페이로드는 같다.
+#[test]
+fn oversized_batch_is_salvaged_from_top_level_only() {
+    let d = tempfile::tempdir().unwrap();
+    let token = "a".repeat(64);
+    std::fs::write(d.path().join("token"), &token).unwrap();
+    let fake = fake_daemon(&token, Hello::Good);
+    let big = "y".repeat(1_200_000);
+    let input = format!(
+        r#"{{"session_id":"big","cwd":"/w","hook_event_name":"PostToolBatch","tool_calls":[{{"tool_name":"Bash","tool_use_id":"t1","tool_input":{{"command":"make"}},"tool_response":"{big}"}}],"agent_id":"a9"}}"#
+    );
+    let (out, took) = run_hook(d.path(), &fake.url(), &["claude-code"], input.as_bytes());
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+    let sent: Vec<Value> = fake
+        .seen()
+        .iter()
+        .filter(|r| r.line.starts_with("POST /v1/ingest/claude-code "))
+        .map(|r| serde_json::from_str::<Value>(&r.body).unwrap()["payload"].clone())
+        .collect();
+    let spooled: Vec<Value> = spool_files(d.path())
+        .iter()
+        .map(|f| {
+            serde_json::from_slice::<Value>(&std::fs::read(f).unwrap()).unwrap()["payload"].clone()
+        })
+        .collect();
+    let all: Vec<Value> = sent.into_iter().chain(spooled).collect();
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!(
+        all[0],
+        json!({"session_id": "big", "cwd": "/w", "hook_event_name": "PostToolBatch", "gyeot_partial": true})
+    );
 }
 
 /// 확인에 답하지 않는 서버: 기존 400ms 통신 한도 안에서 끝내고 스풀에 남긴다(토큰은 나가지 않는다).

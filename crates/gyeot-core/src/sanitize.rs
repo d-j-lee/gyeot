@@ -4,7 +4,7 @@
 //! 정규화 결과는 원본과 같아야 한다(시험이 지킨다).
 
 use crate::event::Source;
-use crate::normalize::{PREVIEW_MAX, agent_id_of, batch_tool_names};
+use crate::normalize::{PREVIEW_MAX, agent_id_of, batch_tool_names, is_partial};
 use crate::text::{collapse_ws, mask, truncate_chars};
 use serde_json::{Map, Value};
 
@@ -29,6 +29,8 @@ const TOOL_PREVIEW_KEYS: [&str; 9] = [
 /// - 식별자(`session_id`·`cwd`·`hook_event_name`·`type`·`thread-id` 등)는 그대로 둔다.
 ///   하위 에이전트 `agent_id`는 모든 훅 이벤트에서 128자까지 남긴다(§13.2).
 /// - `PostToolBatch`의 `tool_calls`는 도구 이름이 있는 앞 64개만 `[{"tool_name"}]`으로 남긴다(§13.2).
+/// - `PostToolUseFailure`도 `tool_input`의 미리보기 필드 하나를 남긴다(승인 요청과 맞춰 본다, §14.2).
+/// - 심이 붙인 `"gyeot_partial": true`(잘린 입력에서 건짐)는 그대로 둔다.
 /// - `prompt`는 글자 수가 같은 `x` 문자열로 바꾼다(정규화는 길이만 쓴다).
 /// - 미리보기로만 쓰는 글은 마스킹 → 공백 접기 → 4,000자 자르기. 미리보기(≤300자)는 원본과 같다.
 /// - 마지막 응답(`last_assistant_message`)은 줄 구조가 질문 판단에 쓰이므로 접지 않고 마스킹만 한다.
@@ -157,6 +159,10 @@ fn hook(o: &Map<String, Value>) -> Value {
     if let Some(a) = agent_id_of(o) {
         out.insert("agent_id".into(), Value::String(a));
     }
+    // 심이 잘린 입력에서 건졌다는 표시(§14.2). 정규화는 activity의 `partial`로 옮긴다.
+    if is_partial(o) {
+        out.insert("gyeot_partial".into(), Value::Bool(true));
+    }
     let name = o
         .get("hook_event_name")
         .and_then(Value::as_str)
@@ -212,6 +218,10 @@ fn hook(o: &Map<String, Value>) -> Value {
         "PostToolUseFailure" => {
             copy_clean(o, out_ref, "tool_name");
             copy_text_of(o, out_ref, "error");
+            // 실패한 호출을 승인 요청과 맞춰 보는 미리보기 필드 하나(§14.2).
+            if let Some(t) = o.get("tool_input").and_then(tool_input) {
+                out_ref.insert("tool_input".into(), t);
+            }
         }
         "PreToolUse" | "PostToolUse" | "UserPromptExpansion" => {
             copy_clean(o, out_ref, "tool_name");
@@ -695,6 +705,56 @@ mod tests {
             ),
             (cc, hook("PostToolBatch", json!({"tool_calls": "비밀"}))),
             (cc, hook("PostToolBatch", json!({"tool_calls": []}))),
+            // §14.2: 실패의 미리보기, 잘린 입력 표시, 겹친 묶음 이름
+            (
+                cc,
+                hook(
+                    "PostToolUseFailure",
+                    json!({"tool_name": "Bash", "error": "exit 2", "tool_input": {"command": "grep x missing.txt", "description": "d"}, "tool_response": "비밀"}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolUseFailure",
+                    json!({"tool_name": "WebFetch", "error": "404", "tool_input": {"url": "https://b.example/x?token=hunter2kv", "prompt": "비밀 질문"}}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolUseFailure",
+                    json!({"tool_name": "mcp__x__y", "error": "e", "tool_input": {"a": 1, "key": format!("{SECRET}")}}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolUseFailure",
+                    json!({"tool_name": "Write", "error": "e", "tool_input": {"file_path": "/w/a", "content": "비밀"}}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolBatch",
+                    json!({"gyeot_partial": true, "agent_id": "a1"}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolUse",
+                    json!({"gyeot_partial": "yes", "tool_name": "Read"}),
+                ),
+            ),
+            (
+                cc,
+                hook(
+                    "PostToolBatch",
+                    json!({"tool_calls": [{"tool_name": "Bash"}, {"tool_name": "Bash"}, {"tool_name": "Read"}]}),
+                ),
+            ),
             (
                 cc,
                 hook(

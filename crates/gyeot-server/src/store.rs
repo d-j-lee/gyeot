@@ -492,6 +492,7 @@ mod tests {
             body: EventBody::Activity {
                 tool: None,
                 tools: Vec::new(),
+                partial: false,
             },
         }
     }

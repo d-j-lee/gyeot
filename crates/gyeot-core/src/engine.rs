@@ -265,12 +265,6 @@ struct ItemRec {
     handled_sig: Option<String>,
     /// 게이트가 연 `failed`인가.
     from_gate: bool,
-    /// `permission_request`로 보강했는가.
-    enriched: bool,
-    /// 승인 대상 도구.
-    tool: Option<String>,
-    /// 승인·병합을 연 하위 에이전트(`agent_id`, 주 에이전트면 `None`, §13.2).
-    agent_id: Option<String>,
 }
 
 impl ItemRec {
@@ -312,37 +306,56 @@ struct ChannelRec {
     opened_ms: i64,
 }
 
+/// 열린 승인 요청 하나(계약 §14.2). 세션마다 목록으로 두고, 목록이 비어야 승인·병합 항목이 닫힌다.
 #[derive(Debug, Clone)]
-struct PendingPerm {
-    tool: String,
-    preview: String,
-    ts_ms: i64,
-    merge: bool,
-    /// 요청한 하위 에이전트(§13.2).
+struct Req {
+    /// 들어온 순서(같은 시각끼리 가른다).
+    seq: u64,
+    /// 요청한 하위 에이전트(주 에이전트면 `None`).
     agent_id: Option<String>,
+    /// 도구. 알림만 오고 요청을 못 본 대기는 `None`(모르는 도구).
+    tool: Option<String>,
+    /// `tool_input` 미리보기(마스킹·300자).
+    preview: String,
+    /// 붙은 알림의 문구(미리보기가 없을 때 본문으로 쓴다).
+    note: String,
+    /// 요청(또는 알림) 시각.
+    ts: i64,
+    /// 병합 명령으로 보이는가.
+    merge: bool,
+    /// 승인 알림이 붙었는가.
+    notified: bool,
+    /// 병합 보류(10초)가 끝났는가(알림이 붙었거나 창이 지났다). 병합이 아니면 처음부터 참.
+    held: bool,
 }
 
-/// 승인·병합 대기를 닫을 수 있는 작업 신호(activity·tool_failed)인가(계약 §13.2, G-016·G-034).
-///
-/// 같은 에이전트(둘 다 `None`이면 같다)이고, 대기의 도구를 모르거나 신호의 도구를 모르거나,
-/// 신호의 도구(`tool`·`tools`) 가운데 하나가 대기의 도구와 같아야 한다.
-fn closes_wait(
-    wait_agent: Option<&str>,
-    wait_tool: Option<&str>,
-    agent: Option<&str>,
-    tool: Option<&str>,
-    tools: &[String],
-) -> bool {
-    if wait_agent != agent {
-        return false;
+/// 세션마다 기억하는 열린 요청 수.
+const REQS_MAX: usize = 64;
+
+/// 목록에서 `pred`에 맞는 가장 오래된 요청 하나를 지운다.
+fn take_oldest(list: &mut Vec<Req>, pred: impl Fn(&Req) -> bool) -> bool {
+    let pos = list
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| pred(r))
+        .min_by_key(|(_, r)| (r.ts, r.seq))
+        .map(|(i, _)| i);
+    match pos {
+        Some(i) => {
+            list.remove(i);
+            true
+        }
+        None => false,
     }
-    let Some(want) = wait_tool else {
-        return true;
-    };
-    if tool.is_none() && tools.is_empty() {
-        return true;
-    }
-    tool == Some(want) || tools.iter().any(|t| t == want)
+}
+
+/// 가장 최근 요청(시각, 들어온 순서).
+fn latest(list: &[Req], pred: impl Fn(&Req) -> bool) -> Option<usize> {
+    list.iter()
+        .enumerate()
+        .filter(|(_, r)| pred(r))
+        .max_by_key(|(_, r)| (r.ts, r.seq))
+        .map(|(i, _)| i)
 }
 
 /// 항목을 여는 신호.
@@ -358,10 +371,6 @@ struct Signal {
     options: Option<Vec<String>>,
     decision_id: Option<String>,
     from_gate: bool,
-    enriched: bool,
-    tool: Option<String>,
-    /// 이 대기의 하위 에이전트(승인·병합에서만 쓴다).
-    agent_id: Option<String>,
 }
 
 impl Signal {
@@ -375,9 +384,6 @@ impl Signal {
             options: None,
             decision_id: None,
             from_gate: false,
-            enriched: false,
-            tool: None,
-            agent_id: None,
         }
     }
 }
@@ -409,7 +415,9 @@ pub struct Engine {
     sessions: BTreeMap<String, SessionRec>,
     items: BTreeMap<String, ItemRec>,
     channels: BTreeMap<String, ChannelRec>,
-    pending: BTreeMap<String, PendingPerm>,
+    /// 세션마다 열린 승인 요청(§14.2).
+    reqs: BTreeMap<String, Vec<Req>>,
+    req_seq: u64,
     focus_until: Option<i64>,
     listening_until: Option<i64>,
     done_until: Option<i64>,
@@ -437,7 +445,8 @@ impl Engine {
             sessions: BTreeMap::new(),
             items: BTreeMap::new(),
             channels: BTreeMap::new(),
-            pending: BTreeMap::new(),
+            reqs: BTreeMap::new(),
+            req_seq: 0,
             focus_until: None,
             listening_until: None,
             done_until: None,
@@ -708,16 +717,13 @@ impl Engine {
         {
             consider(t);
         }
-        for p in self.pending.values() {
-            if p.merge {
-                consider(p.ts_ms + PERM_WINDOW_MS + 1);
+        for r in self.reqs.values().flatten() {
+            if !r.held {
+                consider(r.ts + PERM_WINDOW_MS + 1);
             }
         }
-        let thresholds = [
-            self.policy.nudge_min,
-            self.policy.interrupt_min,
-            QUIET_NUDGE_SCORE,
-        ];
+        // 소리는 기본 점수로만 정하므로(§14.4) 대기 가산이 닿는 문턱은 말풍선 기준들뿐이다.
+        let thresholds = [self.policy.nudge_min, QUIET_NUDGE_SCORE];
         for r in self.items.values() {
             let it = &r.item;
             match it.state {
@@ -788,24 +794,20 @@ impl Engine {
         self.refresh_presence(now);
     }
 
+    /// 병합처럼 보이는 요청의 10초 보류가 승인 알림 없이 끝나면 `merge`를 연다(§11, §14.3: 말풍선 없이).
     fn check_pending_merges(&mut self, now: i64, fx: &mut Fx) {
-        let due: Vec<(String, PendingPerm)> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| p.merge && now - p.ts_ms > PERM_WINDOW_MS)
-            .map(|(k, p)| (k.clone(), p.clone()))
-            .collect();
-        for (sid, p) in due {
-            self.pending.remove(&sid);
-            let mut sig = Signal::new(
-                ItemKind::Merge,
-                p.ts_ms,
-                format!("병합 승인 대기 · {}", p.tool),
-                p.preview.clone(),
-            );
-            sig.tool = Some(p.tool.clone());
-            sig.enriched = true;
-            sig.agent_id = p.agent_id.clone();
+        let mut due: Vec<(String, i64)> = Vec::new();
+        for (sid, list) in &mut self.reqs {
+            for r in list.iter_mut() {
+                if !r.held && now - r.ts > PERM_WINDOW_MS {
+                    r.held = true;
+                    due.push((sid.clone(), r.ts));
+                }
+            }
+        }
+        for (sid, ts) in due {
+            let (title, body) = self.wait_view(&sid, ItemKind::Merge);
+            let sig = Signal::new(ItemKind::Merge, ts, title, body);
             self.signal(&sid, sig, now, fx);
         }
     }
@@ -872,7 +874,7 @@ impl Engine {
         for sid in gone {
             self.sessions.remove(&sid);
             self.items.retain(|_, r| r.item.session != sid);
-            self.pending.remove(&sid);
+            self.reqs.remove(&sid);
             for ch in self.channels.values_mut() {
                 if ch.session.as_deref() == Some(sid.as_str()) {
                     ch.session = None;
@@ -975,76 +977,29 @@ impl Engine {
                 for id in ids {
                     self.close(&id, now, fx);
                 }
-                self.pending.remove(&sid);
+                self.reqs.remove(&sid);
                 self.detach_session_channel(&sid);
             }
             EventBody::Prompt { .. } => {
                 self.close_kinds(
                     &sid,
-                    &[
-                        ItemKind::Approval,
-                        ItemKind::Merge,
-                        ItemKind::Decision,
-                        ItemKind::Unread,
-                        ItemKind::Followup,
-                    ],
+                    &[ItemKind::Decision, ItemKind::Unread, ItemKind::Followup],
                     now,
                     fx,
                 );
-                self.pending.remove(&sid);
+                // 사람이 답한 것은 주 에이전트의 대기다. 하위 에이전트의 요청은 그 에이전트의 신호로만 지운다(§14.2).
+                self.drop_reqs(&sid, |r| r.agent_id.is_none() && r.ts <= ts);
+                self.sync_waits(&sid, now, fx);
             }
             EventBody::WaitingPermission { message, .. } => {
-                // 이 대기의 에이전트(§13.2): 알림의 agent_id. 없으면 열린 승인의 에이전트를 바꾸지 않고,
-                // 열린 승인도 없으면 보강하는 요청의 에이전트를 따른다.
-                let fixed: Option<Option<String>> = match &ev.agent_id {
-                    Some(a) => Some(Some(a.clone())),
-                    None => self
-                        .items
-                        .get(&item_id(&sid, ItemKind::Approval))
-                        .filter(|r| r.is_live())
-                        .map(|r| r.agent_id.clone()),
-                };
-                // 다른 에이전트의 요청은 섞지 않는다(보류로 남는다).
-                let perm = self
-                    .pending
-                    .get(&sid)
-                    .filter(|p| ts >= p.ts_ms && ts - p.ts_ms <= PERM_WINDOW_MS)
-                    .filter(|p| fixed.as_ref().is_none_or(|a| *a == p.agent_id))
-                    .cloned();
-                let agent_id = match fixed {
-                    Some(a) => a,
-                    None => perm.as_ref().and_then(|p| p.agent_id.clone()),
-                };
-                let mut sig = match &perm {
-                    Some(p) => {
-                        let mut s = Signal::new(
-                            ItemKind::Approval,
-                            ts,
-                            format!("권한 승인 대기 · {}", p.tool),
-                            p.preview.clone(),
-                        );
-                        s.enriched = true;
-                        s.tool = Some(p.tool.clone());
-                        s
-                    }
-                    None => Signal::new(
-                        ItemKind::Approval,
-                        ts,
-                        "권한 승인 대기".to_owned(),
-                        message.clone(),
-                    ),
-                };
-                if sig.body.is_empty() {
-                    sig.body = message.clone();
-                }
-                sig.agent_id = agent_id;
-                if perm.is_some() {
-                    self.pending.remove(&sid);
-                }
+                self.attach_prompt(&sid, ev.agent_id.as_deref(), ts, message);
+                let (title, body) = self.wait_view(&sid, ItemKind::Approval);
+                let sig = Signal::new(ItemKind::Approval, ts, title, body);
                 self.signal(&sid, sig, now, fx);
             }
             EventBody::PermissionRequest { tool, preview: pv } => {
-                self.on_permission_request(&sid, ev.agent_id.as_deref(), tool, pv, ts, now, fx);
+                self.add_request(&sid, ev.agent_id.as_deref(), tool, pv, ts);
+                self.sync_waits(&sid, now, fx);
             }
             EventBody::WaitingInput {
                 notification_type,
@@ -1089,17 +1044,43 @@ impl Engine {
                 );
                 self.signal(&sid, sig, now, fx);
             }
-            EventBody::Activity { tool, tools } => {
+            EventBody::Activity {
+                tool,
+                tools,
+                partial,
+            } => {
                 if let Some(s) = self.sessions.get_mut(&sid) {
                     s.seen_activity = true;
                 }
-                let agent = ev.agent_id.as_deref();
-                self.close_waits(&sid, agent, tool.as_deref(), tools, ts, now, fx);
+                // 잘린 입력에서 건진 것은 작업 신호로만 센다(누구의 어떤 도구인지 믿을 수 없다, §14.2).
+                if !partial {
+                    let batch = ev.raw_event.as_deref() == Some("PostToolBatch");
+                    let agent = ev.agent_id.as_deref();
+                    self.on_activity(&sid, agent, tool.as_deref(), tools, batch, ts);
+                    self.sync_waits(&sid, now, fx);
+                }
             }
-            // 같은 에이전트·같은 도구의 실패도 그 대기가 끝났다는 뜻이다(§13.2, R3 L1).
-            EventBody::ToolFailed { tool, .. } => {
+            // 같은 에이전트·같은 도구·같은 미리보기의 실패만 그 요청을 지운다(§14.2, R5 M1a).
+            EventBody::ToolFailed {
+                tool, preview: pv, ..
+            } => {
                 let agent = ev.agent_id.as_deref();
-                self.close_waits(&sid, agent, Some(tool), &[], ts, now, fx);
+                if !pv.is_empty() {
+                    self.take_req(&sid, |r| {
+                        r.agent_id.as_deref() == agent
+                            && r.ts <= ts
+                            && r.tool.as_deref() == Some(tool.as_str())
+                            && r.preview == *pv
+                    });
+                    self.sync_waits(&sid, now, fx);
+                }
+            }
+            // 하위 에이전트가 끝나면 그 에이전트의 요청은 더 기다리지 않는다(§14.2, R3 회귀 N3).
+            EventBody::SubagentStop { .. } => {
+                if let Some(a) = ev.agent_id.as_deref() {
+                    self.drop_reqs(&sid, |r| r.agent_id.as_deref() == Some(a) && r.ts <= ts);
+                    self.sync_waits(&sid, now, fx);
+                }
             }
             EventBody::TaskDone { .. } => {
                 self.done_until = Some(now + DONE_MS);
@@ -1140,7 +1121,6 @@ impl Engine {
             }
             EventBody::SessionStart { .. }
             | EventBody::SubagentStart { .. }
-            | EventBody::SubagentStop { .. }
             | EventBody::Notice { .. }
             | EventBody::UserAction { .. }
             | EventBody::ChannelOpen { .. }
@@ -1148,8 +1128,8 @@ impl Engine {
         }
     }
 
-    /// 턴이 끝났으면(성공·실패) 그 턴 안의 대기(승인·병합·결정)는 더 이상 기다리지 않는다.
-    /// channel 결정은 턴과 따로 살아 있으므로 닫지 않는다.
+    /// 턴이 끝났으면(성공·실패) 그 턴 안의 주 에이전트 대기(승인·병합 요청·결정)는 더 이상 기다리지 않는다.
+    /// 하위 에이전트의 요청은 그 에이전트의 신호로만 지운다(§14.2, R5 L1). channel 결정은 턴과 따로 살아 있다.
     fn close_turn_waits(&mut self, sid: &str, ts: i64, now: i64, fx: &mut Fx) {
         let ids: Vec<String> = self
             .items
@@ -1158,96 +1138,194 @@ impl Engine {
                 r.item.session == sid
                     && r.is_live()
                     && r.item.updated_ms <= ts
-                    && match r.item.kind {
-                        ItemKind::Approval | ItemKind::Merge => true,
-                        ItemKind::Decision => r.item.decision_id.is_none(),
-                        _ => false,
-                    }
+                    && r.item.kind == ItemKind::Decision
+                    && r.item.decision_id.is_none()
             })
             .map(|r| r.item.id.clone())
             .collect();
         for id in ids {
             self.close(&id, now, fx);
         }
-        self.pending.remove(sid);
+        self.drop_reqs(sid, |r| r.agent_id.is_none() && r.ts <= ts);
+        self.sync_waits(sid, now, fx);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn on_permission_request(
-        &mut self,
-        sid: &str,
-        agent_id: Option<&str>,
-        tool: &str,
-        pv: &str,
-        ts: i64,
-        now: i64,
-        fx: &mut Fx,
-    ) {
-        // 승인 대기 알림이 먼저 왔으면(10초 안) 그 항목을 보강한다. 에이전트를 모르는 승인(agent_id 없는
-        // 알림이 연 것)은 요청이 에이전트를 알려 준다. 다른 에이전트의 승인에는 섞지 않는다(§13.2).
-        let aid = item_id(sid, ItemKind::Approval);
-        if let Some(r) = self.items.get_mut(&aid)
-            && r.is_open()
-            && !r.enriched
-            && ts >= r.item.updated_ms
-            && ts - r.item.updated_ms <= PERM_WINDOW_MS
-            && (r.agent_id.is_none() || r.agent_id.as_deref() == agent_id)
-        {
-            r.item.title = format!("권한 승인 대기 · {tool}");
-            if !pv.is_empty() {
-                r.item.body = pv.to_owned();
-            }
-            r.enriched = true;
+    // ───────────────────────── 승인 요청 목록(§14.2) ─────────────────────────
+
+    fn next_seq(&mut self) -> u64 {
+        self.req_seq += 1;
+        self.req_seq
+    }
+
+    /// `permission_request`: 요청 하나를 더한다. 알림이 먼저 와서 도구를 모르는 요청(10초 안, 에이전트를 모르거나
+    /// 같음)이 있으면 그것을 채운다(같은 대기다).
+    fn add_request(&mut self, sid: &str, agent: Option<&str>, tool: &str, pv: &str, ts: i64) {
+        let merge = crate::text::is_merge_command(pv);
+        let seq = self.next_seq();
+        let list = self.reqs.entry(sid.to_owned()).or_default();
+        let unknown = latest(list, |r| {
+            r.tool.is_none()
+                && r.ts <= ts
+                && ts - r.ts <= PERM_WINDOW_MS
+                && (r.agent_id.is_none() || r.agent_id.as_deref() == agent)
+        });
+        if let Some(i) = unknown {
+            let r = &mut list[i];
             r.tool = Some(tool.to_owned());
-            r.agent_id = agent_id.map(str::to_owned);
-            self.emit_item(&aid, now, fx);
+            r.preview = pv.to_owned();
+            r.agent_id = agent.map(str::to_owned);
+            r.merge = merge;
             return;
         }
-        self.pending.insert(
-            sid.to_owned(),
-            PendingPerm {
-                tool: tool.to_owned(),
-                preview: pv.to_owned(),
-                ts_ms: ts,
-                merge: crate::text::is_merge_command(pv),
-                agent_id: agent_id.map(str::to_owned),
-            },
-        );
+        list.push(Req {
+            seq,
+            agent_id: agent.map(str::to_owned),
+            tool: Some(tool.to_owned()),
+            preview: pv.to_owned(),
+            note: String::new(),
+            ts,
+            merge,
+            notified: false,
+            held: !merge,
+        });
+        if list.len() > REQS_MAX {
+            take_oldest(list, |_| true);
+        }
     }
 
-    /// 승인·병합 대기는 같은 에이전트의, 그 도구(또는 모르는 도구)의 작업 신호·실패가 오면 닫는다
-    /// (승인됨·거절됨). 병렬로 돌던 다른 도구나 다른 하위 에이전트의 신호로 진짜 대기를 놓치지 않으려는
-    /// 것이다(§13.2, G-016·G-034).
-    #[allow(clippy::too_many_arguments)]
-    fn close_waits(
+    /// `waiting_permission`: 10초 안의 가장 최근 요청에, 없으면 가장 최근에 열린 요청에 붙는다. `agent_id`가 있으면
+    /// 그 에이전트의 요청에서만 고른다. 붙을 요청이 없으면 도구를 모르는 요청을 하나 연다.
+    fn attach_prompt(&mut self, sid: &str, agent: Option<&str>, ts: i64, message: &str) {
+        let seq = self.next_seq();
+        let list = self.reqs.entry(sid.to_owned()).or_default();
+        let mine = |r: &Req| agent.is_none() || r.agent_id.as_deref() == agent;
+        let target = latest(list, |r| {
+            mine(r) && r.ts <= ts && ts - r.ts <= PERM_WINDOW_MS
+        })
+        .or_else(|| latest(list, mine));
+        match target {
+            Some(i) => {
+                let r = &mut list[i];
+                r.notified = true;
+                r.held = true;
+                if !message.is_empty() {
+                    r.note = message.to_owned();
+                }
+            }
+            None => {
+                list.push(Req {
+                    seq,
+                    agent_id: agent.map(str::to_owned),
+                    tool: None,
+                    preview: String::new(),
+                    note: message.to_owned(),
+                    ts,
+                    merge: false,
+                    notified: true,
+                    held: true,
+                });
+                if list.len() > REQS_MAX {
+                    take_oldest(list, |_| true);
+                }
+            }
+        }
+    }
+
+    /// activity: 같은 에이전트이고 도구가 맞거나 모르는 가장 오래된 요청 하나를 지운다(이름마다, 도구가 맞는
+    /// 것을 먼저). 도구 목록이 없는 `PostToolBatch`는 그 에이전트의 요청을 모두 지운다.
+    fn on_activity(
         &mut self,
         sid: &str,
         agent: Option<&str>,
         tool: Option<&str>,
         tools: &[String],
+        batch: bool,
         ts: i64,
-        now: i64,
-        fx: &mut Fx,
     ) {
-        let ids: Vec<String> = self
-            .items
-            .values()
-            .filter(|r| {
-                r.item.session == sid
-                    && r.is_live()
-                    && matches!(r.item.kind, ItemKind::Approval | ItemKind::Merge)
-                    && r.item.updated_ms <= ts
-                    && closes_wait(r.agent_id.as_deref(), r.tool.as_deref(), agent, tool, tools)
-            })
-            .map(|r| r.item.id.clone())
-            .collect();
-        for id in ids {
-            self.close(&id, now, fx);
+        let Some(list) = self.reqs.get_mut(sid) else {
+            return;
+        };
+        let mine = |r: &Req| r.agent_id.as_deref() == agent && r.ts <= ts;
+        let names: Vec<&str> = if tools.is_empty() {
+            tool.into_iter().collect()
+        } else {
+            tools.iter().map(String::as_str).collect()
+        };
+        if names.is_empty() {
+            if batch {
+                list.retain(|r| !mine(r));
+            } else {
+                take_oldest(list, mine);
+            }
+            return;
         }
-        if self.pending.get(sid).is_some_and(|p| {
-            p.ts_ms <= ts && closes_wait(p.agent_id.as_deref(), Some(&p.tool), agent, tool, tools)
-        }) {
-            self.pending.remove(sid);
+        for n in names {
+            let _ = take_oldest(list, |r| mine(r) && r.tool.as_deref() == Some(n))
+                || take_oldest(list, |r| mine(r) && r.tool.is_none());
+        }
+    }
+
+    fn take_req(&mut self, sid: &str, pred: impl Fn(&Req) -> bool) {
+        if let Some(list) = self.reqs.get_mut(sid) {
+            take_oldest(list, pred);
+        }
+    }
+
+    fn drop_reqs(&mut self, sid: &str, pred: impl Fn(&Req) -> bool) {
+        if let Some(list) = self.reqs.get_mut(sid) {
+            list.retain(|r| !pred(r));
+        }
+    }
+
+    /// 승인·병합 항목의 제목·본문: 가장 최근 요청, 본문 끝에 "외 n건"(§14.2).
+    fn wait_view(&self, sid: &str, kind: ItemKind) -> (String, String) {
+        let prefix = if kind == ItemKind::Merge {
+            "병합 승인 대기"
+        } else {
+            "권한 승인 대기"
+        };
+        let list = self.reqs.get(sid).map(Vec::as_slice).unwrap_or_default();
+        let Some(i) = latest(list, |_| true) else {
+            return (prefix.to_owned(), String::new());
+        };
+        let r = &list[i];
+        let title = match &r.tool {
+            Some(t) => format!("{prefix} · {t}"),
+            None => prefix.to_owned(),
+        };
+        let base = if r.preview.is_empty() {
+            r.note.as_str()
+        } else {
+            r.preview.as_str()
+        };
+        let body = match (list.len() - 1, base.is_empty()) {
+            (0, _) => base.to_owned(),
+            (n, true) => format!("외 {n}건"),
+            (n, false) => format!("{base} 외 {n}건"),
+        };
+        (title, body)
+    }
+
+    /// 요청 목록이 바뀐 뒤: 비었으면 승인·병합 항목을 닫고, 아니면 보이는 제목·본문을 맞춘다(새 전달은 없다).
+    fn sync_waits(&mut self, sid: &str, now: i64, fx: &mut Fx) {
+        if self.reqs.get(sid).is_none_or(Vec::is_empty) {
+            self.reqs.remove(sid);
+            self.close_kinds(sid, &[ItemKind::Approval, ItemKind::Merge], now, fx);
+            return;
+        }
+        for kind in [ItemKind::Approval, ItemKind::Merge] {
+            let id = item_id(sid, kind);
+            if !self.items.get(&id).is_some_and(ItemRec::is_live) {
+                continue;
+            }
+            let (title, body) = self.wait_view(sid, kind);
+            if let Some(r) = self.items.get_mut(&id)
+                && (r.item.title != title || r.item.body != body)
+            {
+                r.item.title = title;
+                r.item.body = body;
+                self.emit_item(&id, now, fx);
+            }
         }
     }
 
@@ -1719,19 +1797,12 @@ impl Engine {
         };
         if let Outcome::Same = outcome {
             let mut changed = false;
-            if let Some(r) = self.items.get_mut(&id) {
-                if r.item.title != sig.title || r.item.body != sig.body {
-                    r.item.title = sig.title;
-                    r.item.body = sig.body;
-                    changed = true;
-                }
-                if sig.enriched {
-                    r.enriched = true;
-                    r.tool = sig.tool;
-                }
-                if matches!(kind, ItemKind::Approval | ItemKind::Merge) {
-                    r.agent_id = sig.agent_id;
-                }
+            if let Some(r) = self.items.get_mut(&id)
+                && (r.item.title != sig.title || r.item.body != sig.body)
+            {
+                r.item.title = sig.title;
+                r.item.body = sig.body;
+                changed = true;
             }
             if changed {
                 self.emit_item(&id, now, fx);
@@ -1792,9 +1863,6 @@ impl Engine {
                 delivered: None,
                 handled_sig: None,
                 from_gate: sig.from_gate,
-                enriched: sig.enriched,
-                tool: sig.tool,
-                agent_id: sig.agent_id,
             },
         );
         self.emit_item(&id, now, fx);
@@ -1870,6 +1938,15 @@ impl Engine {
             why.push(format!("‘{}’은 조용히 알리기로 하셨어요", it.kind.label()));
             return (Level::Ambient, why);
         }
+        // `merge`는 병합 보류가 승인 알림 없이 끝났을 때만 열린다(알림이 오면 `approval`이다). 사람이 이미 답한
+        // 것이므로 말풍선을 띄우지 않는다(§14.3, G-038).
+        if it.kind == ItemKind::Merge {
+            why.push(
+                "승인 알림 없이 끝난 병합 요청이에요. 이미 답하신 것 같아 표정으로만 알려요"
+                    .to_owned(),
+            );
+            return (Level::Ambient, why);
+        }
         if s < self.policy.nudge_min {
             why.push(format!(
                 "점수가 말풍선 기준 {}보다 낮아요",
@@ -1895,7 +1972,8 @@ impl Engine {
             why.push("급하게 막힌 일이 아니면 표정으로만 알려요".to_owned());
             return (Level::Ambient, why);
         }
-        if s >= self.policy.interrupt_min && it.blocking && wait > INTERRUPT_WAIT_MS {
+        // 소리는 기본 점수로만 정한다. 대기 가산은 순서와 말풍선에만 쓴다(§14.4, G-039).
+        if it.kind.base() >= self.policy.interrupt_min && it.blocking && wait > INTERRUPT_WAIT_MS {
             if matches!(it.kind, ItemKind::Approval | ItemKind::Merge) {
                 // 승인 순간을 알리는 훅이 없다. 켜지 않으면 말풍선까지만(§13.3, G-035).
                 if !self.policy.approval_interrupt {
@@ -1916,7 +1994,7 @@ impl Engine {
                 }
             }
             why.push(format!(
-                "{}점 넘는 막힌 일이 2분 넘게 기다려요",
+                "기본 점수 {}점 이상인 막힌 일이 2분 넘게 기다려요",
                 fmt_num(self.policy.interrupt_min)
             ));
             return (Level::Interrupt, why);

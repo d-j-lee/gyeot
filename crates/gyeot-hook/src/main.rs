@@ -246,45 +246,127 @@ const KEEP: [&str; 29] = [
     "result",
 ];
 /// 잘린 JSON에서 최상위 문자열 필드를 건진다. `hook_event_name`이나 `type`이 없으면 버린다.
+/// 건진 것에는 `"gyeot_partial": true`를 붙인다(정규화가 그 activity로 승인 요청을 지우지 않게, §14.2).
 fn salvage(bytes: &[u8]) -> Option<Value> {
     let text = String::from_utf8_lossy(bytes);
-    let mut m = Map::new();
-    for k in KEEP {
-        if let Some(v) = find_string_field(&text, k) {
-            m.insert(k.to_owned(), Value::String(v));
-        }
+    let mut m = top_level_strings(&text);
+    if !(m.contains_key("hook_event_name") || m.contains_key("type")) {
+        return None;
     }
-    (m.contains_key("hook_event_name") || m.contains_key("type")).then_some(Value::Object(m))
+    m.insert("gyeot_partial".into(), Value::Bool(true));
+    Some(Value::Object(m))
 }
 
-/// `"key": "value"`의 값을 찾는다(처음 나온 것, JSON 이스케이프 해석).
-fn find_string_field(text: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let mut from = 0;
-    while let Some(i) = text[from..].find(&pat) {
-        let after = from + i + pat.len();
-        let rest = text[after..].trim_start();
-        if let Some(rest) = rest.strip_prefix(':') {
-            let rest = rest.trim_start();
-            if let Some(body) = rest.strip_prefix('"') {
-                // 닫는 따옴표까지 잘라 JSON 문자열로 해석한다.
-                let mut esc = false;
-                for (j, c) in body.char_indices() {
-                    if esc {
-                        esc = false;
-                    } else if c == '\\' {
-                        esc = true;
-                    } else if c == '"' {
-                        let lit = format!("\"{}\"", &body[..j]);
-                        return serde_json::from_str(&lit).ok();
-                    }
-                }
-                return None;
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
+/// `b[i]`가 여는 따옴표인 JSON 문자열을 읽는다: (해석한 값, 닫는 따옴표 다음 자리). 닫히지 않았으면 `None`.
+fn read_string(text: &str, i: usize) -> Option<(String, usize)> {
+    let b = text.as_bytes();
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => {
+                // 따옴표는 ASCII라 UTF-8 글자 경계다.
+                let v = serde_json::from_str::<String>(&text[i..=j]).ok()?;
+                return Some((v, j + 1));
             }
+            _ => j += 1,
         }
-        from = after;
     }
     None
+}
+
+/// `b[i]`가 여는 `{`·`[`인 값을 건너뛴다(따옴표 안의 괄호는 세지 않는다). 닫히지 않았으면 `None`.
+fn skip_nested(b: &[u8], i: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut j = i;
+    let mut in_str = false;
+    while j < b.len() {
+        let c = b[j];
+        if in_str {
+            match c {
+                b'\\' => j += 1,
+                b'"' => in_str = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(j + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// 최상위 객체의 문자열 필드 가운데 [`KEEP`]에 든 것(처음 나온 것). 중첩된 객체·배열은 깊이를 세어 건너뛰므로
+/// `tool_calls[0].tool_name` 같은 안쪽 필드를 최상위로 잡지 않는다(R3 회귀 N4). 잘린 곳에서 멈춘다.
+fn top_level_strings(text: &str) -> Map<String, Value> {
+    let b = text.as_bytes();
+    let mut out = Map::new();
+    let mut i = skip_ws(b, 0);
+    if b.get(i) != Some(&b'{') {
+        return out;
+    }
+    i += 1;
+    loop {
+        i = skip_ws(b, i);
+        match b.get(i) {
+            Some(b',') => {
+                i += 1;
+                continue;
+            }
+            Some(b'"') => {}
+            _ => return out,
+        }
+        let Some((key, j)) = read_string(text, i) else {
+            return out;
+        };
+        i = skip_ws(b, j);
+        if b.get(i) != Some(&b':') {
+            return out;
+        }
+        i = skip_ws(b, i + 1);
+        match b.get(i) {
+            Some(b'"') => {
+                let Some((v, j)) = read_string(text, i) else {
+                    return out;
+                };
+                if KEEP.contains(&key.as_str()) && !out.contains_key(&key) {
+                    out.insert(key, Value::String(v));
+                }
+                i = j;
+            }
+            Some(b'{' | b'[') => match skip_nested(b, i) {
+                Some(j) => i = j,
+                None => return out,
+            },
+            Some(_) => {
+                // 숫자·true·false·null
+                while b
+                    .get(i)
+                    .is_some_and(|c| !matches!(c, b',' | b'}') && !c.is_ascii_whitespace())
+                {
+                    i += 1;
+                }
+            }
+            None => return out,
+        }
+    }
 }
 
 struct Ctx {
@@ -302,16 +384,31 @@ impl Ctx {
     }
 }
 
-/// 남은 시간 `left` 안에서만 기다리는 HTTP 손잡이. 연결 단계는 [`CONNECT_BUDGET`]까지만.
-fn agent_for(left: Duration) -> ureq::Agent {
+/// 남은 시간 `left`에서 (요청 전체, 연결 단계) 한도. 연결 단계는 [`CONNECT_BUDGET`]까지만.
+fn budget(left: Duration) -> (Duration, Duration) {
+    (left, left.min(CONNECT_BUDGET))
+}
+
+/// 프로세스에 하나 두는 HTTP 손잡이. 확인·전송·스풀 비우기가 같은 연결을 다시 쓴다(keep-alive, R5 L3).
+/// 시간 한도는 요청마다 남은 시간으로 건다([`timed`]).
+fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .timeout_global(Some(left))
-        .timeout_connect(Some(left.min(CONNECT_BUDGET)))
         .proxy(None)
         .http_status_as_error(false)
         .max_redirects(0)
+        .max_idle_connections(1)
+        .max_idle_connections_per_host(1)
         .build()
         .into()
+}
+
+/// 요청에 남은 시간 `left` 안의 한도를 건다.
+fn timed<B>(req: ureq::RequestBuilder<B>, left: Duration) -> ureq::RequestBuilder<B> {
+    let (global, connect) = budget(left);
+    req.config()
+        .timeout_global(Some(global))
+        .timeout_connect(Some(connect))
+        .build()
 }
 
 /// 데몬 확인(§13.1)을 통과한 연결 대상. 토큰을 보내는 함수는 이것만 받는다(확인 없이 보낼 길이 없다).
@@ -319,6 +416,8 @@ struct Verified<'a> {
     ctx: &'a Ctx,
     base: &'a str,
     token: &'a str,
+    /// 확인한 연결이 들어 있는 손잡이(같은 연결로 보낸다).
+    agent: ureq::Agent,
 }
 
 /// URL(`http://<호스트>[:<포트>]`, [`daemon_url`]이 거른 꼴)의 포트. 없으면 80.
@@ -368,8 +467,8 @@ fn hello(ctx: &Ctx) -> Option<Verified<'_>> {
     let port = port_of(base)?;
     let n = nonce()?;
     let left = ctx.remaining()?;
-    let mut resp = agent_for(left)
-        .get(&format!("{base}/v1/hello?n={n}"))
+    let agent = http_agent();
+    let mut resp = timed(agent.get(&format!("{base}/v1/hello?n={n}")), left)
         .call()
         .ok()?;
     if resp.status() != 200 {
@@ -386,22 +485,35 @@ fn hello(ctx: &Ctx) -> Option<Verified<'_>> {
         return None;
     }
     let proof = v.get("proof").and_then(Value::as_str)?;
-    proof_ok(token, port, &n, proof).then_some(Verified { ctx, base, token })
+    proof_ok(token, port, &n, proof).then_some(Verified {
+        ctx,
+        base,
+        token,
+        agent,
+    })
 }
 
 fn post(v: &Verified<'_>, source: &str, body: &[u8]) -> bool {
     let Some(left) = v.ctx.remaining() else {
         return false;
     };
-    let agent = agent_for(left);
     let url = format!("{}/v1/ingest/{source}", v.base);
-    match agent
+    let req = v
+        .agent
         .post(&url)
         .header("Authorization", &format!("Bearer {}", v.token))
-        .header("Content-Type", "application/json")
-        .send(body)
-    {
-        Ok(resp) => resp.status().is_success(),
+        .header("Content-Type", "application/json");
+    match timed(req, left).send(body) {
+        Ok(mut resp) => {
+            let ok = resp.status().is_success();
+            // 본문을 끝까지 읽어야 연결이 손잡이로 돌아가 다음 요청이 같은 연결을 쓴다.
+            let _ = resp
+                .body_mut()
+                .with_config()
+                .limit(HELLO_BODY_MAX)
+                .read_to_vec();
+            ok
+        }
         Err(_) => false,
     }
 }
@@ -631,27 +743,60 @@ mod tests {
         assert_eq!(clean["last_assistant_message"], "끝\n할까요?");
         // 이름이 없으면 버린다
         assert_eq!(payload_from_bytes(br#"{"session_id":"abc"#, true), None);
+        // 건진 것에는 잘렸다는 표시를 붙인다(§14.2). 줄여도 남는다
+        assert_eq!(p["gyeot_partial"], true);
+        assert_eq!(clean["gyeot_partial"], true);
+    }
+
+    /// R3 회귀 N4(계약 §14.2): 건지기는 최상위 필드만 본다(중괄호·대괄호·따옴표 깊이를 센다).
+    #[test]
+    fn salvage_reads_top_level_fields_only() {
+        // 중첩된 tool_calls[0].tool_name을 최상위처럼 잡지 않는다. agent_id가 잘린 뒤쪽에 있으면 없다
+        let mut s = String::from(
+            r#"{"session_id":"s1","cwd":"/w","hook_event_name":"PostToolBatch","tool_calls":[{"tool_name":"Bash","tool_input":{"command":"echo \"}{[\" x"},"tool_response":"#,
+        );
+        s.push_str(&"\"y".repeat(10));
+        s.push_str(&"z".repeat(5000));
+        let p = payload_from_bytes(s.as_bytes(), true).unwrap();
+        assert_eq!(p["hook_event_name"], "PostToolBatch");
+        assert_eq!(p["session_id"], "s1");
+        assert!(p.get("tool_name").is_none(), "{p}");
+        assert!(p.get("agent_id").is_none(), "{p}");
+        assert_eq!(p["gyeot_partial"], true);
+        // 최상위의 것은 중첩된 같은 이름보다 뒤에 있어도 잡는다
+        let s = r#"{"tool_input":{"hook_event_name":"Fake","session_id":"inner","agent_id":"inner","x":[1,{"cwd":"in"}]},"session_id":"outer","agent_id":"a7","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_response":"aaaa"#;
+        let p = payload_from_bytes(s.as_bytes(), true).unwrap();
+        assert_eq!(p["hook_event_name"], "PermissionRequest");
+        assert_eq!(p["session_id"], "outer");
+        assert_eq!(p["agent_id"], "a7");
+        assert_eq!(p["tool_name"], "Bash");
+        assert!(p.get("cwd").is_none(), "{p}");
+        // 숫자·참거짓·null 값, 공백, 이스케이프를 건너뛴다
+        let s = r#"{ "n" : 12.5e3 , "b":true,"z":null, "message" : "a\u0041\n\"q\"" ,"hook_event_name":"Notification","notification_type":"permission_prompt","tool_input":{"#;
+        let p = payload_from_bytes(s.as_bytes(), true).unwrap();
+        assert_eq!(p["message"], "aA\n\"q\"");
+        assert_eq!(p["notification_type"], "permission_prompt");
+        // 최상위가 객체가 아니면 버린다
+        assert_eq!(
+            payload_from_bytes(br#"[{"hook_event_name":"Stop"#, true),
+            None
+        );
+        // 닫히지 않은 문자열 값은 건지지 않는다
+        let p = payload_from_bytes(
+            br#"{"hook_event_name":"Stop","last_assistant_message":"abc"#,
+            true,
+        )
+        .unwrap();
+        assert!(p.get("last_assistant_message").is_none(), "{p}");
     }
 
     /// 연결 단계는 100ms(남은 시간이 더 짧으면 그만큼)까지만 기다린다.
     #[test]
     fn connect_phase_has_its_own_budget() {
         assert_eq!(CONNECT_BUDGET, Duration::from_millis(100));
-        let t = agent_for(NET_BUDGET).config().timeouts();
-        assert_eq!(t.connect, Some(CONNECT_BUDGET));
-        assert_eq!(t.global, Some(NET_BUDGET));
-        let t = agent_for(Duration::from_millis(30)).config().timeouts();
-        assert_eq!(t.connect, Some(Duration::from_millis(30)));
-        assert_eq!(t.global, Some(Duration::from_millis(30)));
-    }
-
-    #[test]
-    fn find_fields() {
-        let t = r#"{"a":"x\"y","b" : "z","c":1}"#;
-        assert_eq!(find_string_field(t, "a").as_deref(), Some("x\"y"));
-        assert_eq!(find_string_field(t, "b").as_deref(), Some("z"));
-        assert_eq!(find_string_field(t, "c"), None);
-        assert_eq!(find_string_field(t, "d"), None);
+        assert_eq!(budget(NET_BUDGET), (NET_BUDGET, CONNECT_BUDGET));
+        let ms30 = Duration::from_millis(30);
+        assert_eq!(budget(ms30), (ms30, ms30));
     }
 
     #[test]
