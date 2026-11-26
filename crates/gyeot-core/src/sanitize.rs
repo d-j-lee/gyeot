@@ -724,7 +724,7 @@ mod tests {
                 cc,
                 hook(
                     "PostToolUseFailure",
-                    json!({"tool_name": "mcp__x__y", "error": "e", "tool_input": {"a": 1, "key": format!("{SECRET}")}}),
+                    json!({"tool_name": "mcp__x__y", "error": "e", "tool_input": {"a": 1, "key": SECRET}}),
                 ),
             ),
             (
