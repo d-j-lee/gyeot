@@ -49,13 +49,14 @@ if (Test-Path $doctor) { & (Join-Path $env:LOCALAPPDATA "gyeot\bin\gyeotd.exe") 
 ### 2. bootstrap 받기·무결성 확인
 
 ```powershell
+$ErrorActionPreference = "Stop"
 $d = Join-Path $env:TEMP "gyeot-boot"; New-Item -ItemType Directory -Force -Path $d | Out-Null
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; $ProgressPreference = "SilentlyContinue"
 $base = "https://github.com/d-j-lee/gyeot/releases/latest/download"
 foreach ($f in @("bootstrap.ps1", "SHA256SUMS.txt")) { Invoke-WebRequest -UseBasicParsing -Uri "$base/$f" -OutFile (Join-Path $d $f) }
 $want = ((Select-String -Path (Join-Path $d "SHA256SUMS.txt") -Pattern "  bootstrap\.ps1$").Line -split "\s+")[0]
 $got = (Get-FileHash -Algorithm SHA256 (Join-Path $d "bootstrap.ps1")).Hash.ToLowerInvariant()
-if ($got -eq $want) { "bootstrap.ps1 SHA-256 일치" } else { throw "bootstrap.ps1 SHA-256 이 맞지 않아요: $got / $want" }
+if ($want -and $got -eq $want) { "bootstrap.ps1 SHA-256 일치" } else { throw "bootstrap.ps1 SHA-256 이 맞지 않아요: $got / $want" }
 ```
 
 - `gh`가 로그인돼 있으면 이어서 출처도 본다: `$env:GH_HOST = "github.com"; gh attestation verify (Join-Path $env:TEMP "gyeot-boot\bootstrap.ps1") --repo d-j-lee/gyeot`. 실패하면 멈추고 알린다.

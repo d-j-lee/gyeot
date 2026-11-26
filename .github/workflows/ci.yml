@@ -454,6 +454,7 @@ jobs:
 
   # 올린 릴리스를 사람이 받는 길 그대로 받아 Windows 에 설치·업데이트·점검·지우기까지 해 본다.
   # 5.1 은 gh 로그인 없이 HTTPS 로(처음 설치), 7 은 gh 로그인으로(출처 증명 확인, 같은 폴더 위 업데이트).
+  # bootstrap 은 Write-Host 로 쓰므로 같은 프로세스에서 부를 때 6>&1 로 받아야 출력 검사가 된다.
   release-check:
     name: release-check (Windows, 받은 릴리스로)
     if: startsWith(github.ref, 'refs/tags/v')
@@ -480,14 +481,14 @@ jobs:
       - name: 미리보기(5.1, HTTPS) — 아무것도 바꾸지 않는다
         shell: powershell
         run: |
-          & "$env:RUNNER_TEMP\gyeot-boot\bootstrap.ps1" -Tag $env:GITHUB_REF_NAME -ApplyClaudeHooks -RegisterStartup | Tee-Object -Variable out | Out-Host
+          & "$env:RUNNER_TEMP\gyeot-boot\bootstrap.ps1" -Tag $env:GITHUB_REF_NAME -ApplyClaudeHooks -RegisterStartup 6>&1 | Tee-Object -Variable out | Out-Host
           if ($LASTEXITCODE -ne 0) { exit 1 }
           if (-not (($out | Out-String) -match '미리보기만 했어요')) { Write-Host '미리보기 끝 줄이 없어요'; exit 1 }
           if (Test-Path "$env:LOCALAPPDATA\gyeot\bin") { Write-Host '미리보기가 설치했어요'; exit 1 }
       - name: 설치·점검(5.1, HTTPS, 기본 폴더)
         shell: powershell
         run: |
-          & "$env:RUNNER_TEMP\gyeot-boot\bootstrap.ps1" -Tag $env:GITHUB_REF_NAME -ApplyClaudeHooks -RegisterStartup -Install | Tee-Object -Variable out | Out-Host
+          & "$env:RUNNER_TEMP\gyeot-boot\bootstrap.ps1" -Tag $env:GITHUB_REF_NAME -ApplyClaudeHooks -RegisterStartup -Install 6>&1 | Tee-Object -Variable out | Out-Host
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $t = $out | Out-String
           foreach ($want in @('SHA-256 일치', '점검 통과', '내 곁 데몬', '설치·점검을 마쳤어요')) { if ($t -notmatch [regex]::Escape($want)) { Write-Host "출력에 '$want' 가 없어요"; exit 1 } }
@@ -496,7 +497,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          & "$env:LOCALAPPDATA\gyeot\scripts\bootstrap.ps1" -Tag $env:GITHUB_REF_NAME -ApplyClaudeHooks -RegisterStartup -Install | Tee-Object -Variable out | Out-Host
+          & "$env:LOCALAPPDATA\gyeot\scripts\bootstrap.ps1" -Tag $env:GITHUB_REF_NAME -ApplyClaudeHooks -RegisterStartup -Install 6>&1 | Tee-Object -Variable out | Out-Host
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $t = $out | Out-String
           foreach ($want in @('출처 증명 일치', '점검 통과', '내 곁 데몬')) { if ($t -notmatch [regex]::Escape($want)) { Write-Host "출력에 '$want' 가 없어요"; exit 1 } }
